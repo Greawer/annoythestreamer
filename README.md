@@ -61,23 +61,23 @@ The app as-is lets you set the server on your machine, but to share it you need 
 
 6. Run OBS Studio
     - add new source, choose "Browser" and name it "Face Meme"
-    - URL: http://localhost:2137/FaceMeme
+    - URL: http://localhost:80/FaceMeme
     - position it on top of your camera
     - add new source, choose "Browser" and name it "Normal Meme"
-    - URL: http://localhost:2137/NormalMeme
+    - URL: http://localhost:80/NormalMeme
     - position it wherever you want the meme to be displayed
     - add new source, choose "Browser" and name it "Source Meme"
-    - URL: http://localhost:2137/SoundMeme
+    - URL: http://localhost:80/SoundMeme
     - check "Control audio via OBS"
     - you might need to interact with the site if OBS doesn't do that itself, to do that right press on TTS Meme on the sources list and choose "Interact", then interact with the page
     - push it behind the scene
     - add new source, choose "Browser" and name it "TTS Meme"
-    - URL: http://localhost:2137/TTSMeme
+    - URL: http://localhost:80/TTSMeme
     - check "Control audio via OBS"
     - you might need to interact with the site if OBS doesn't do that itself, to do that right press on TTS Meme on the sources list and choose "Interact", then interact with the page
     - position it wherever you want the TTS to be displayed
     - add new source, choose "Browser" and name it "Chat"
-    - URL: http://localhost:2137/ChatCapture
+    - URL: http://localhost:80/ChatCapture
     - position it wherever you want the chat to be displayed
 
 7. Add your own sounds for the soundboard
@@ -105,7 +105,7 @@ The app as-is lets you set the server on your machine, but to share it you need 
     - make sure the names have no spaces and special characters
     - after restarting the server typing :emojiname: will send it to the chat (without extensions)
 
-9. Open http://localhost:2137 in your browser
+9. Open http://localhost:80 in your browser
     - choose whether you want to use the "Face Meme", "Normal Meme",  form
     - fill in the form and click "submit"
     - to send the photo you need to input an URL

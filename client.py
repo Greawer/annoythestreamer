@@ -93,3 +93,4 @@ def last_chat_messages(limit=50):
     except Exception as e:
         logging.error(f"Error fetching last chat messages: {e}")
         return []
+

@@ -17,3 +17,4 @@ def start_caddy():
     except Exception as e:
         logging.error(f"Failed to start Caddy: {e}")
         return None
+

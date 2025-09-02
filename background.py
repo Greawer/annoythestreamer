@@ -88,3 +88,4 @@ def start_tts_worker(socketio, max_files_keep=25, poll_sleep=2.0):
 
     # Start worker as a SocketIO background task (correct context for emit)
     socketio.start_background_task(worker)
+

@@ -194,3 +194,4 @@ def register_routes(app, socketio: SocketIO):
             online_users.remove(username)
             socketio.emit("update_users", list(online_users))
 
+
