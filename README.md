@@ -1,117 +1,101 @@
-# AnnoyTheStreamer
+# AnnoyTheStreamer 2.0
 
-## Description
+The current 2.0 alpha is an interactive streamer website built with Next.js,
+Flask, MongoDB, and Socket.IO. Development status and planned work are tracked
+in the [roadmap](./ROADMAP.md).
 
-Python Flask web application allowing viewers to use a soundboard or interact with the stream using one of three forms.
-One of them sends top and bottom text to be diplayed on top of the streamer's camera to make it look like a meme.
-The second one allows for passing top and bottom text along with an image to create a full meme.
-The last one creates a text-to-speech message to be played and displayed during the stream.
-Last part of the app is a live chat with emojis and tagging users with @ sign.
-All the memes and chat messages will be queued in the database and displayed in order of being submitted.
-TTSMessages start auto-deleting the oldest one after reaching a treshhold of 25 files.
+## Architecture
 
-## Additional information
-
-The app as-is lets you set the server on your machine, but to share it you need to share your public IP. It is possible to bypass this restriction by aquiring a domain name and using other app, for example Caddy.
+- **Next.js, React, and TypeScript** serve the main website and OBS browser
+  views on port `2137`. The Next.js server proxies API and static-file requests
+  to Flask and forwards Socket.IO traffic.
+- **Flask** provides the application API, authentication and authorization,
+  MongoDB-backed accounts and point accounting, media queues, and Socket.IO
+  events. It listens on `127.0.0.1:420` by default and should remain private.
+- **MongoDB** stores application data in the `annoythestreamer` database and
+  listens on `127.0.0.1:27017` in the default local setup.
 
 ## Requirements
 
-- For library requirements refer to requirements.txt
-- MongoDB Community Server
-- OBS Studio
-- [xObsBrowserAutoRefresh](https://github.com/YorVeX/xObsBrowserAutoRefresh)
-- MongoDBCompass (optional)
-- Caddy (optional)
+- Node.js and npm, for the Next.js application.
+- Python, for the Flask backend.
+- MongoDB Community Server, running locally or at the configured database
+  address.
 
-## Instructions
- 
-1. Install the following
-    - required libraries from requirements.txt.
-    - MongoDB Community Server
-    - OBS Studio
-    - [xObsBrowserAutoRefresh](https://github.com/YorVeX/xObsBrowserAutoRefresh)
+Install from the repository root in PowerShell:
 
-2. Run MongoDB
-    - add new connection
-    - just set the name
-        - if you want to edit connection string make sure to copy the URI and update the following line in the client.py file
-        ```
-        CONNECTION_STRING = "mongodb://localhost:27017"
-        ```
-    - create a new database and name it "annoythestreamer"
-        - if you want to use a differnt name, be sure to update the following line in the client.py file
-        ```
-        return client['annoythestreamer']
-        ```
+```powershell
+npm ci
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r backend\requirements.txt
+```
 
-3. Be sure to open port 2137 (also 80 and 443 if you plan on using Caddy) on both your Windows firewall and router
-    - If you don't want to open the port, update the following line in the annoythestreamer.py file and steps 5.2, 5.8, 6, 7 to an open port of your choosing
-    ```
-    app.run(host='0.0.0.0', debug=True, port=2137)    
-    ```
+## Configuration
 
-4. Open the console in the application directory or navigate to it
-    - run the command
-    ```
-    python annoythestreamer.py
-    ```
-    - to stop the server click Ctrl+C in the console
+The defaults support local development. The optional root `.env.local` can
+override the Next.js backend URL using `ATS_BACKEND_URL`; see
+`.env.example`. Flask settings must be provided in the Flask process
+environment:
 
-5. (Optional) If you plan on using Caddy, replace the uncommented __main__ portion in annoythestreamer.py and replace it with the commented part, then configure your Caddyfile properly and add Caddy.exe and Caddyfile paths to caddy.py
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ATS_BACKEND_URL` | `http://127.0.0.1:420` | Flask target for Next.js API, static, and Socket.IO proxies |
+| `ATS_BACKEND_HOST` | `127.0.0.1` | Flask bind address |
+| `ATS_BACKEND_PORT` | `420` | Flask port |
+| `ATS_FRONTEND_HOST` | `0.0.0.0` | Next.js bind address |
+| `PORT` | `2137` | Next.js port |
+| `ATS_SECRET_KEY` | Generated at startup if omitted | Set a private, persistent value to keep Flask sessions valid across restarts |
+| `ATS_COOKIE_SECURE` | `false` | Set to `true` when serving over HTTPS |
+| `ATS_ALLOWED_ORIGINS` | `*` | Flask CORS and Socket.IO origins; restrict this for a public deployment |
 
-6. Run OBS Studio
-    - add new source, choose "Browser" and name it "Face Meme"
-    - URL: http://localhost:80/FaceMeme
-    - position it on top of your camera
-    - add new source, choose "Browser" and name it "Normal Meme"
-    - URL: http://localhost:80/NormalMeme
-    - position it wherever you want the meme to be displayed
-    - add new source, choose "Browser" and name it "Source Meme"
-    - URL: http://localhost:80/SoundMeme
-    - check "Control audio via OBS"
-    - you might need to interact with the site if OBS doesn't do that itself, to do that right press on TTS Meme on the sources list and choose "Interact", then interact with the page
-    - push it behind the scene
-    - add new source, choose "Browser" and name it "TTS Meme"
-    - URL: http://localhost:80/TTSMeme
-    - check "Control audio via OBS"
-    - you might need to interact with the site if OBS doesn't do that itself, to do that right press on TTS Meme on the sources list and choose "Interact", then interact with the page
-    - position it wherever you want the TTS to be displayed
-    - add new source, choose "Browser" and name it "Chat"
-    - URL: http://localhost:80/ChatCapture
-    - position it wherever you want the chat to be displayed
+Never commit `.env.local` or secret values. Keep Flask private behind the
+Next.js proxy; do not expose its port publicly.
 
-7. Add your own sounds for the soundboard
-    - put the sounds into /static/sounds/soundboard
-    - make sure the sounds have no spaces and special characters
-    - edit templates/SoundMeme.html under this section by replacing for example sound1 with the name of your file (without extension)
-    ```
-    <!-- Configure your buttons and sounds, data-sound should be the same as filename without extension. -->
-    <button class="btn btn-secondary sound-btn" data-sound="sound1">Sound 1</button>
-    <button class="btn btn-secondary sound-btn" data-sound="sound2">Sound 2</button>
-    <button class="btn btn-secondary sound-btn" data-sound="sound3">Sound 3</button>
-    <button class="btn btn-secondary sound-btn" data-sound="sound4">Sound 4</button>
-    <button class="btn btn-secondary sound-btn" data-sound="sound5">Sound 5</button>
-    <button class="btn btn-secondary sound-btn" data-sound="sound6">Sound 6</button>
-    <button class="btn btn-secondary sound-btn" data-sound="sound7">Sound 7</button>
-    <button class="btn btn-secondary sound-btn" data-sound="sound8">Sound 8</button>
-    <button class="btn btn-secondary sound-btn" data-sound="sound9">Sound 9</button>
-    <button class="btn btn-secondary sound-btn" data-sound="sound10">Sound 10</button>
-    <button class="btn btn-secondary sound-btn" data-sound="sound11">Sound 11</button>
-    <button class="btn btn-secondary sound-btn" data-sound="sound12">Sound 12</button>
-    ```
+## Media files
 
-8. Add your own emojis
-    - put the emojis into /static/img/emoji
-    - make sure the names have no spaces and special characters
-    - after restarting the server typing :emojiname: will send it to the chat (without extensions)
+User-provided emoji and soundboard files are not included in the repository.
+Add PNG emoji images under `public/img/emoji/` and soundboard audio
+(`.mp3`, `.m4a`, or `.wav`) under `backend/static/sounds/soundboard/`.
+Generated TTS audio is runtime output and is not versioned.
 
-9. Open http://localhost:80 in your browser
-    - choose whether you want to use the "Face Meme", "Normal Meme",  form
-    - fill in the form and click "submit"
-    - to send the photo you need to input an URL
+## Run locally
 
-10. To share the form with other people you have to replace "localhost" in the address with either your local IP address (for people using your WiFi network) or public IP address (for people not using your WiFi network)
-    (WARNING: Never share your public address with people you don't trust!)
-    - to check your local IP address open the command prompt, type "ipconfig" and look for "IPv4 Address"
-    - to check your public IP address visit https://www.whatismyip.com/
-    - suggestion: using Caddy as a server with https
+Start MongoDB first. Run each application service in its own PowerShell
+terminal from the repository root:
+
+```powershell
+npm run backend
+```
+
+```powershell
+npm run dev
+```
+
+Open <http://localhost:2137/>. The backend and frontend ports are intentionally
+different: `420` is the internal Flask port and `2137` is the website port.
+
+For a production build, run `npm run build` and then `npm run start`, with the
+Flask backend running separately. This describes how to build and start the
+application; deployment is not part of this repository setup guide.
+
+## Checks
+
+Run the frontend production build:
+
+```powershell
+npm run build
+```
+
+Run the backend test suite:
+
+```powershell
+python -m unittest discover -s backend/tests -v
+```
+
+## Development status
+
+This is **AnnoyTheStreamer 2.0**, currently on the `2.0.0-alpha.1` development
+version. The stable `2.0.0` release is reserved for the first stable release.
+See [ROADMAP.md](./ROADMAP.md) for verified features, work in progress, and
+planned follow-up features.

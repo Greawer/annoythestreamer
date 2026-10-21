@@ -1,0 +1,43 @@
+/* --- MEME VIEW --- */
+.meme-view, .meme-view html, .meme-view body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100vh;
+    overflow: hidden;
+    background-color: transparent;
+}
+
+.meme-view #image {
+    position: relative;
+    width: 100%;
+    height: 100%;
+    background-size: 100% 100%;
+    background-repeat: no-repeat;
+    background-position: center;
+}
+
+.meme-view #top-text,
+.meme-view #bottom-text {
+    position: absolute;
+    width: 100%;
+    text-align: center;
+    color: white;
+    -webkit-text-stroke: 2px black;
+    word-wrap: break-word;
+    margin: 0;
+    padding: 10px;
+    box-sizing: border-box;
+    font-size: clamp(2rem, 6vw, 4rem);
+    font-family: 'Impact', 'Arial Black', sans-serif;
+    font-weight: 900;
+    text-transform: uppercase;
+}
+
+.meme-view #top-text {
+    top: 0;
+}
+
+.meme-view #bottom-text {
+    bottom: 10px;
+}

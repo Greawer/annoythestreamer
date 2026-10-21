@@ -1,0 +1,7 @@
+eventlet==0.40.3
+Flask==3.1.2
+flask_cors==6.0.1
+Flask_SocketIO==5.5.1
+gTTS==2.5.4
+pymongo==4.14.1
+mutagen==1.47.0

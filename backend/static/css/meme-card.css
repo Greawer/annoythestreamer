@@ -1,0 +1,117 @@
+/* --- MEME CARDS --- */
+.meme-card {
+    position: relative;
+    width: 18rem;
+    height: 33rem;
+    display: flex;
+    flex-direction: column;
+    display: none;
+}
+
+.meme-img {
+    height: 12rem;
+    object-fit: cover;
+}
+
+.meme-title {
+    min-height: 2rem;
+}
+
+.meme-desc {
+    min-height: 2rem;
+}
+
+.meme-card .card-body {
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-start;
+    padding-bottom: 0;
+}
+
+/* --- MEME FORMS --- */
+.meme-form {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.5rem;
+    margin-right: 20px;
+}
+
+.meme-form {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    width: 100%;
+    align-items: center;
+    margin-right: 20px;
+}
+
+.meme-form .form-row {
+    width: 90%;
+    display: flex;
+    flex-direction: column;
+}
+
+.meme-form input,
+.meme-form select,
+.meme-form textarea {
+    width: 100%;
+    box-sizing: border-box;
+    margin: 0;
+}
+
+.meme-form label {
+    margin-bottom: 0.25rem;
+}
+
+.meme-submit {
+    margin-bottom: 1rem;
+}
+
+/* --- SOUND BUTTONS --- */
+.meme-card#soundmeme .card-body {
+    display: flex;
+    flex-direction: column;
+    padding: 0.5rem;
+    box-sizing: border-box;
+    flex: 1 1 auto;
+}
+
+.sound-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    grid-auto-rows: 2.8rem;
+    gap: 0.5rem;
+    width: 100%;
+    overflow-y: auto;
+    box-sizing: border-box;
+    padding: 0.25rem;
+}
+
+.sound-btn {
+    width: 100%;
+    min-width: 0;
+    padding: 0.5rem;
+    font-size: 12px;
+    border-radius: 0.25rem;
+    border: none;
+    background-color: #444;
+    color: white;
+
+    white-space: normal;
+    overflow: visible;
+    text-overflow: clip;
+
+    /* Center text */
+    display: flex;
+    align-items: center;   /* vertical centering */
+    justify-content: center; /* horizontal centering */
+    text-align: center;    /* wrap text nicely */
+
+    box-sizing: border-box;
+}

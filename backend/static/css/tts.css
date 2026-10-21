@@ -1,0 +1,29 @@
+/* --- TTS MESSAGES --- */
+body.tts-page {
+    background-color: transparent !important;
+    margin: 0;
+    padding: 0;
+    height: 100vh;
+    overflow: hidden;
+    color: white;
+    font-family: Arial, sans-serif;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    text-align: center;
+}
+
+body.tts-page #ttsMessage {
+    font-size: 2em;
+    color: white;
+    -webkit-text-stroke: 2px black;
+    margin: 0.5em 0;
+}
+
+body.tts-page #ttsUser {
+    font-size: 3em;
+    color: #ffb6c1;
+    -webkit-text-stroke: 2px black;
+    margin: 0.5em 0;
+}
