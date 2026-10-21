@@ -37,15 +37,20 @@ env/
 .pytest_cache/
 .coverage*
 
-# User-provided media and generated TTS output
-/public/img/*
-!/public/img/emoji/
-/public/img/emoji/*
+# User-provided emoji images
+/public/img/emoji/*.png
+/public/img/emoji/*.jpg
 !/public/img/emoji/.gitkeep
-/public/sounds/
-/backend/static/img/emoji/*
-!/backend/static/img/emoji/.gitkeep
-/backend/static/sounds/soundboard/*
-!/backend/static/sounds/soundboard/.gitkeep
-/backend/static/sounds/tts/*
-!/backend/static/sounds/tts/.gitkeep
+
+# User-provided soundboard audio
+/public/sounds/soundboard/*.[mM][pP]3
+/public/sounds/soundboard/*.[mM]4[aA]
+/public/sounds/soundboard/*.[wW][aA][vV]
+
+# Local legacy soundboard configuration
+/public/sounds/soundboard/_sound-list.txt
+
+# Runtime-generated TTS audio and temporary output
+/public/sounds/tts/*.mp3
+/public/sounds/tts/*.tmp
+/public/sounds/tts/*.part

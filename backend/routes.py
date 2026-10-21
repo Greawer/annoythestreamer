@@ -1,4 +1,4 @@
-from flask import render_template, request, jsonify, send_from_directory, session
+from flask import request, jsonify, send_from_directory, session
 from functools import wraps
 from flask_socketio import SocketIO
 from bson.json_util import dumps
@@ -55,7 +55,9 @@ DEFAULT_POINT_PRICING = {
 }
 lastmessages = deque(maxlen=MAX_MESSAGES)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-SOUNDDIR = os.path.join(BASE_DIR, 'static', 'sounds', 'soundboard')
+PUBLIC_DIR = os.path.abspath(os.path.join(BASE_DIR, '..', 'public'))
+SOUNDDIR = os.path.join(PUBLIC_DIR, 'sounds', 'soundboard')
+EMOJIDIR = os.path.join(PUBLIC_DIR, 'img', 'emoji')
 onlineusers = set()  # GLOBAL FIXED
 socket_users = {}  # sid -> {'user_id': str, 'username': str}, verified at connect
 
@@ -1593,31 +1595,6 @@ def registerroutes(app, socketio: SocketIO):
         user = colusers.find_one({'username': username})
         return jsonify({'user': serialize_user(user)})
 
-    # HTML PAGES
-    @app.route('/')
-    def index():
-        return render_template('AnnoyTheStreamer.html')
-
-    @app.route('/FaceMeme')
-    def facememe():
-        return render_template('FaceMeme.html')
-
-    @app.route('/NormalMeme')
-    def normalmeme():
-        return render_template('NormalMeme.html')
-
-    @app.route('/TTSMeme')
-    def ttsmeme():
-        return render_template('TTSMeme.html')
-
-    @app.route('/SoundMeme')
-    def soundmeme():
-        return render_template('SoundMeme.html')
-
-    @app.route('/chatcapture')  # FIXED ROUTE NAME
-    def chatcapture():
-        return render_template('ChatCapture.html')
-
     # MEME NEXT ROUTES
     @app.route('/facememe/next', methods=['GET', 'POST', 'OPTIONS', 'PUT'])
     def facememenext():
@@ -1754,33 +1731,23 @@ def registerroutes(app, socketio: SocketIO):
             logger.error(f"/tts done error: {e}")
             return jsonify({'status': 'bad id'}), 400
 
-    # STATIC FILES
-    @app.route('/static/img/<path:filename>')
-    def serveimg(filename):
-        return send_from_directory(os.path.join(BASE_DIR, 'static', 'img'), filename)
-
-    @app.route('/static/sounds/tts/<path:filename>')
-    def servetts(filename):
-        return send_from_directory(os.path.join(BASE_DIR, 'static', 'sounds', 'tts'), filename)
-
-    @app.route('/static/sounds/soundboard/<path:filename>')
-    def servesoundboard(filename):
-        return send_from_directory(SOUNDDIR, filename)
+    # Preserve existing URLs while serving shared files from Next.js's public directory.
+    @app.route('/static/<path:filename>')
+    def servepublicasset(filename):
+        return send_from_directory(PUBLIC_DIR, filename)
 
     @app.route('/emoji/<name>')
     def emojiname(name):
-        folder = os.path.join(BASE_DIR, 'static', 'img', 'emoji')
         for ext in ['.jpg', '.png']:
-            path = os.path.join(folder, f"{name}{ext}")
+            path = os.path.join(EMOJIDIR, f"{name}{ext}")
             if os.path.isfile(path):
                 return jsonify({'url': f"/static/img/emoji/{name}{ext}"})
         return jsonify({'url': None})
 
     @app.route('/api/list-emojis')
     def listemojis():
-        folder = os.path.join(BASE_DIR, 'static', 'img', 'emoji')
-        if os.path.exists(folder):
-            emojis = [os.path.splitext(f)[0] for f in os.listdir(folder)
+        if os.path.exists(EMOJIDIR):
+            emojis = [os.path.splitext(f)[0] for f in os.listdir(EMOJIDIR)
                       if os.path.splitext(f)[1].lower() in ['.jpg', '.png']]
             return jsonify(emojis)
         return jsonify([])

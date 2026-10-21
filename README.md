@@ -54,10 +54,25 @@ Next.js proxy; do not expose its port publicly.
 
 ## Media files
 
-User-provided emoji and soundboard files are not included in the repository.
-Add PNG emoji images under `public/img/emoji/` and soundboard audio
-(`.mp3`, `.m4a`, or `.wav`) under `backend/static/sounds/soundboard/`.
-Generated TTS audio is runtime output and is not versioned.
+All shared website images and media have one physical home under root
+`public/`: images and emoji in `public/img/`, and audio in `public/sounds/`.
+Next.js serves these files directly. Flask's `/static/<path>` compatibility
+route serves from the same `public/` tree for its APIs and existing media
+clients. Website pages, including OBS browser views, are implemented in the
+Next.js `app/` directory; Flask no longer renders legacy HTML templates.
+
+Put user-provided soundboard audio (`.mp3`, `.m4a`, or `.wav`) in
+`public/sounds/soundboard/`; keep generated TTS audio in
+`public/sounds/tts/`. The worker retains the five newest generated files in
+MongoDB message-ID order, marking evicted records done and removing their
+filepaths while preserving records for request deduplication. Stored
+`/static/sounds/tts/...` playback URLs are unchanged for retained messages.
+Emoji images belong in `public/img/emoji/`. User media and generated TTS output
+are local runtime assets and are not versioned.
+
+`public/sounds/soundboard/_sound-list.txt` is a local-only legacy title list.
+The current soundboard obtains its list and titles from Flask's file scan and
+audio metadata; it does not read this text file.
 
 ## Run locally
 

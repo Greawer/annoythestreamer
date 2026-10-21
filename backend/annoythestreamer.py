@@ -21,7 +21,7 @@ logging.getLogger("werkzeug").setLevel(logging.WARNING)
 logging.getLogger("socketio").setLevel(logging.WARNING)
 logging.getLogger("engineio").setLevel(logging.WARNING)
 
-app = Flask(__name__, template_folder="templates")
+app = Flask(__name__, static_folder=None)
 app.secret_key = os.getenv("ATS_SECRET_KEY") or secrets.token_hex(32)
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,

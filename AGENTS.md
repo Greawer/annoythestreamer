@@ -36,8 +36,9 @@ Previously observed files and locations include:
 - `app/page.tsx` — main website interface.
 - `backend/routes.py` — Flask routes, authentication, administration, and chat-related backend behavior.
 - `backend/client.py` — MongoDB client and collection setup.
-- `annoythestreamer.py` — streaming-related worker and/or backend entry point; inspect its current responsibilities before editing.
+- `backend/annoythestreamer.py` and `backend/background.py` — Flask entry point and background workers; inspect their current responsibilities before editing.
 - `server.mjs`, `next.config.mjs`, and `route.ts` — existing server and frontend routing/configuration.
+- `public/` — canonical physical home for Next.js and Flask-shared images and media; Flask preserves `/static/...` URLs by serving from this directory.
 - `.env.example`, `.env.local`, and other environment files — configuration.
 - `archive/stream-feature.md` — previously identified archived Stream panel reference.
 - `package.json` and applicable Python dependency files — scripts and dependencies.
@@ -288,6 +289,39 @@ Finish with:
 Then stop. Do not continue making improvements while waiting for the user's manual verification or approval.
 
 ## 8. Git, backups, and recovery
+
+### Asset and generated-file exclusions
+
+The root `public/` directory is the canonical physical location for website
+images in `public/img/`, soundboard files in `public/sounds/soundboard/`, and
+generated TTS output in `public/sounds/tts/`. Next.js serves these files
+directly. Flask's `/static/<path>` compatibility route serves the same files
+from `public/`; do not maintain copies under `backend/static/`.
+
+Do not commit user-provided emoji images, soundboard audio, generated TTS audio,
+or temporary output. Ignore only those media files and the exact local-only
+`public/sounds/soundboard/_sound-list.txt` configuration; do not ignore
+required source code, tests, or configuration templates. A `.gitkeep` may be
+retained only for a canonical asset directory that needs to exist in a fresh
+checkout.
+
+The TTS worker retains the five newest generated audio files by MongoDB
+message ID. When audio is evicted or missing, its queue record remains for
+request deduplication, is marked done, and has its `filepath` removed; these
+records do not requeue audio generation.
+
+No Jupyter notebook or notebook configuration exists in the current
+repository. The local sound-to-title list at
+`public/sounds/soundboard/_sound-list.txt` remains in the canonical soundboard
+directory for local use; the current application does not read it. Do not add
+a blanket notebook or asset-directory rule.
+
+The `normalmeme` JPG archive feature is not implemented. Its future snapshots
+must remain local, but no archive path or naming convention is defined yet, so
+add a precise ignore pattern only after the feature defines one.
+
+`AGENTS.md` and `ROADMAP.md` are tracked project documentation and must remain
+tracked. Do not add either file to `.gitignore` or untrack them.
 
 - Never run `git reset --hard`, `git clean`, or destructive checkout/restore commands without explicit approval.
 - Do not assume untracked files are disposable. Previous work may exist entirely in untracked files.
