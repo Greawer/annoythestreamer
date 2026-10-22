@@ -185,12 +185,23 @@ function parsePointPrice(value: string): number | null {
 
 export default function AnnoyTheStreamer() {
   const [username, setUsername] = useState<string>("")
-  const [showUsernamePrompt, setShowUsernamePrompt] = useState(true)
+  const [sessionRestored, setSessionRestored] = useState(false)
   const [usernameInput, setUsernameInput] = useState("")
   const [emailInput, setEmailInput] = useState("")
   const [passwordInput, setPasswordInput] = useState("")
   const [passwordConfirmation, setPasswordConfirmation] = useState("")
-  const [passwordMode, setPasswordMode] = useState<"login" | "create">("login")
+  const [registrationUsername, setRegistrationUsername] = useState("")
+  const [registrationPassword, setRegistrationPassword] = useState("")
+  const [showRegistrationForm, setShowRegistrationForm] = useState(false)
+  const [passwordResetMode, setPasswordResetMode] = useState(false)
+  const [passwordResetUsername, setPasswordResetUsername] = useState("")
+  const [passwordResetToken, setPasswordResetToken] = useState("")
+  const [passwordResetAccount, setPasswordResetAccount] = useState<{
+    username: string
+    email: string | null
+  } | null>(null)
+  const [resetPasswordInput, setResetPasswordInput] = useState("")
+  const [resetPasswordConfirmation, setResetPasswordConfirmation] = useState("")
   const [authError, setAuthError] = useState("")
   const [logoutError, setLogoutError] = useState("")
   const [isLoggingOut, setIsLoggingOut] = useState(false)
@@ -201,9 +212,7 @@ export default function AnnoyTheStreamer() {
   const [actionError, setActionError] = useState("")
   const [pointsLoading, setPointsLoading] = useState(true)
   const [pointsError, setPointsError] = useState(false)
-  const [showPasswordPrompt, setShowPasswordPrompt] = useState(false)
-  const [adminView, setAdminView] = useState<"users" | "admin" | "pricing">("users")
-  const [adminLoginUsername, setAdminLoginUsername] = useState("")
+  const [adminView, setAdminView] = useState<"users" | "admin" | "pricing" | "soundboard" | "emoji">("users")
   const [lookupUsername, setLookupUsername] = useState("")
   const [managedUser, setManagedUser] = useState<ManagedUser | null>(null)
   const [currentModerationStatus, setCurrentModerationStatus] = useState<{
@@ -217,7 +226,9 @@ export default function AnnoyTheStreamer() {
   const [adminError, setAdminError] = useState("")
   const [adminNotice, setAdminNotice] = useState("")
   const [confirmingPasswordReset, setConfirmingPasswordReset] = useState(false)
+  const [adminIssuedPasswordResetToken, setAdminIssuedPasswordResetToken] = useState("")
   const [pointPricing, setPointPricing] = useState<PointPricing | null>(null)
+  const [editedCatalogPrices, setEditedCatalogPrices] = useState<Record<string, string>>({})
   const [pricingLoading, setPricingLoading] = useState(false)
   const [pricingSaving, setPricingSaving] = useState(false)
   const [pricingError, setPricingError] = useState("")
@@ -226,22 +237,6 @@ export default function AnnoyTheStreamer() {
   const [newEmojiItemPrice, setNewEmojiItemPrice] = useState("100")
   const [newSoundItem, setNewSoundItem] = useState("")
   const [newSoundItemPrice, setNewSoundItemPrice] = useState("100")
-
-  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
-  const [hoveredChatMessage, setHoveredChatMessage] = useState<number | null>(null)
-  const [chatInput, setChatInput] = useState("")
-  const [editedCatalogPrices, setEditedCatalogPrices] = useState<Record<string, string>>({})
-  const [onlineUsers, setOnlineUsers] = useState<string[]>([])
-  const [onlineUserRanks, setOnlineUserRanks] = useState<Record<string, { rank: string; rank_color: string | null }>>({})
-  const [showEmojiPanel, setShowEmojiPanel] = useState(false)
-  const [emojiUrls, setEmojiUrls] = useState<Record<string, string>>({})
-  const [usableEmojis, setUsableEmojis] = useState<EmojiAsset[]>([])
-  const [assetListsLoading, setAssetListsLoading] = useState(false)
-  const [sounds, setSounds] = useState<SoundAsset[]>([])
-  const [assetLoadError, setAssetLoadError] = useState("")
-  const [soundSearch, setSoundSearch] = useState("");
-  const [activeTab, setActiveTab] = useState("facememe")
-  const [theme, setTheme] = useState<"light" | "dark">("dark")
   const [newSoundPlayItem, setNewSoundPlayItem] = useState("")
   const [newSoundPlayItemPrice, setNewSoundPlayItemPrice] = useState("")
   const [newEmojiProposalItem, setNewEmojiProposalItem] = useState("")
@@ -300,11 +295,26 @@ export default function AnnoyTheStreamer() {
   const [shopError, setShopError] = useState("")
   const [shopNotice, setShopNotice] = useState("")
   const [purchasingAssetId, setPurchasingAssetId] = useState<string | null>(null)
+
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
+  const [hoveredChatMessage, setHoveredChatMessage] = useState<number | null>(null)
+  const [chatInput, setChatInput] = useState("")
+  const [chatError, setChatError] = useState("")
+  const [onlineUsers, setOnlineUsers] = useState<string[]>([])
+  const [onlineUserRanks, setOnlineUserRanks] = useState<Record<string, { rank: string; rank_color: string | null }>>({})
+  const [showEmojiPanel, setShowEmojiPanel] = useState(false)
+  const [emojiUrls, setEmojiUrls] = useState<Record<string, string>>({})
+  const [usableEmojis, setUsableEmojis] = useState<EmojiAsset[]>([])
+  const [assetListsLoading, setAssetListsLoading] = useState(false)
+  const [sounds, setSounds] = useState<SoundAsset[]>([])
+  const [assetLoadError, setAssetLoadError] = useState("")
+  const [soundSearch, setSoundSearch] = useState("");
+  const [activeTab, setActiveTab] = useState("facememe")
+  const [theme, setTheme] = useState<"light" | "dark">("dark")
   const [showOnlineList, setShowOnlineList] = useState(false)
   const [isStreaming, setIsStreaming] = useState(false)
   const isActiveTimeout = (timeoutUntil: string | null) => {
     if (!timeoutUntil) return false
-  const [chatError, setChatError] = useState("")
     const expiresAt = Date.parse(timeoutUntil)
     return Number.isFinite(expiresAt) && expiresAt > timeoutClock
   }
@@ -322,6 +332,8 @@ export default function AnnoyTheStreamer() {
   const socketRef = useRef<Socket | null>(null)
   const chatBoxRef = useRef<HTMLDivElement>(null)
   const chatInputRef = useRef<HTMLInputElement>(null)
+  const previewAudioRef = useRef<HTMLAudioElement | null>(null)
+  const pendingShopRequestIds = useRef<Record<string, string>>({})
   const pendingUseRequestIds = useRef<Record<string, string>>({})
   const pendingPointAdjustment = useRef<{
     username: string
@@ -334,8 +346,6 @@ export default function AnnoyTheStreamer() {
       setPointsError(true)
       setPointsLoading(false)
       return
-  const previewAudioRef = useRef<HTMLAudioElement | null>(null)
-  const pendingShopRequestIds = useRef<Record<string, string>>({})
     }
     setCurrentPoints(value)
     setPointsError(false)
@@ -380,6 +390,9 @@ export default function AnnoyTheStreamer() {
     const cost = displayedUsageCost(action)
     return cost < 0 ? `${label} · Unavailable` : `${label} · ${cost}❖`
   }
+  const canAffordSound = (sound: SoundAsset) =>
+    isFreeAction("soundmeme") ||
+    (currentPoints !== null && sound.play_cost >= 0 && currentPoints >= sound.play_cost)
 
   const updateActionPrice = (action: string, value: number) => {
     setPointPricing((current) => current
@@ -392,9 +405,6 @@ export default function AnnoyTheStreamer() {
       ? {
           ...current,
           catalog: {
-  const canAffordSound = (sound: SoundAsset) =>
-    isFreeAction("soundmeme") ||
-    (currentPoints !== null && sound.play_cost >= 0 && currentPoints >= sound.play_cost)
             ...current.catalog,
             [assetType]: { ...current.catalog[assetType], default: value },
           },
@@ -402,18 +412,6 @@ export default function AnnoyTheStreamer() {
       : current)
   }
 
-  const updateCatalogItemPrice = (
-    assetType: "emoji" | "sound",
-    key: string,
-    value: number,
-  ) => {
-    setPointPricing((current) => current
-      ? {
-          ...current,
-          catalog: {
-            ...current.catalog,
-            [assetType]: {
-              ...current.catalog[assetType],
   const updateSoundPlayDefault = (value: number) => {
     setPointPricing((current) => current
       ? {
@@ -471,6 +469,18 @@ export default function AnnoyTheStreamer() {
     })
   }
 
+  const updateCatalogItemPrice = (
+    assetType: "emoji" | "sound",
+    key: string,
+    value: number,
+  ) => {
+    setPointPricing((current) => current
+      ? {
+          ...current,
+          catalog: {
+            ...current.catalog,
+            [assetType]: {
+              ...current.catalog[assetType],
               items: { ...current.catalog[assetType].items, [key]: value },
             },
           },
@@ -478,18 +488,6 @@ export default function AnnoyTheStreamer() {
       : current)
   }
 
-  const removeCatalogItemPrice = (assetType: "emoji" | "sound", key: string) => {
-    setPointPricing((current) => {
-      if (!current) return current
-      const items = { ...current.catalog[assetType].items }
-      delete items[key]
-      return {
-        ...current,
-        catalog: {
-          ...current.catalog,
-          [assetType]: { ...current.catalog[assetType], items },
-        },
-      }
   const updateEditedCatalogItemPrice = (
     assetType: "emoji" | "sound",
     key: string,
@@ -503,24 +501,24 @@ export default function AnnoyTheStreamer() {
     updateCatalogItemPrice(assetType, key, price)
   }
 
-    })
+  const removeCatalogItemPrice = (assetType: "emoji" | "sound", key: string) => {
     setEditedCatalogPrices((current) => {
       const updated = { ...current }
       delete updated[`${assetType}:${key}`]
       return updated
     })
-  }
-
-  const updateProposalDefault = (proposalType: "sound" | "emoji", value: number) => {
-    setPointPricing((current) => current
-      ? {
-          ...current,
-          proposal_rewards: {
-            ...current.proposal_rewards,
-            [proposalType]: { ...current.proposal_rewards[proposalType], default: value },
-          },
-        }
-      : current)
+    setPointPricing((current) => {
+      if (!current) return current
+      const items = { ...current.catalog[assetType].items }
+      delete items[key]
+      return {
+        ...current,
+        catalog: {
+          ...current.catalog,
+          [assetType]: { ...current.catalog[assetType], items },
+        },
+      }
+    })
   }
 
   const loadAdminAssets = useCallback(async (assetType: "sound" | "emoji") => {
@@ -979,18 +977,18 @@ export default function AnnoyTheStreamer() {
     )
   }
 
-  const loadPointPricing = useCallback(async () => {
-    setPricingLoading(true)
-    setPricingError("")
-    try {
-      const response = await fetch("/api/admin/pricing")
-      const result = await response.json()
-      if (!response.ok || !result.pricing) {
-        throw new Error(result.message || "Could not load pricing")
-      }
-      setPointPricing(result.pricing)
-    } catch (error) {
-      setPricingError(error instanceof Error ? error.message : "Could not load pricing")
+  const updateProposalDefault = (proposalType: "sound" | "emoji", value: number) => {
+    setPointPricing((current) => current
+      ? {
+          ...current,
+          proposal_rewards: {
+            ...current.proposal_rewards,
+            [proposalType]: { ...current.proposal_rewards[proposalType], default: value },
+          },
+        }
+      : current)
+  }
+
   const updateProposalExclusive = (proposalType: "sound" | "emoji", value: number) => {
     setPointPricing((current) => current
       ? {
@@ -1073,6 +1071,18 @@ export default function AnnoyTheStreamer() {
       : current)
   }
 
+  const loadPointPricing = useCallback(async () => {
+    setPricingLoading(true)
+    setPricingError("")
+    try {
+      const response = await fetch("/api/admin/pricing")
+      const result = await response.json()
+      if (!response.ok || !result.pricing) {
+        throw new Error(result.message || "Could not load pricing")
+      }
+      setPointPricing(result.pricing)
+    } catch (error) {
+      setPricingError(error instanceof Error ? error.message : "Could not load pricing")
     } finally {
       setPricingLoading(false)
     }
@@ -1080,6 +1090,14 @@ export default function AnnoyTheStreamer() {
 
   const savePointPricing = async () => {
     if (!pointPricing) return
+    if (Object.entries(editedCatalogPrices).some(([key, value]) =>
+      key.startsWith("sound-play:")
+        ? !/^\d+$/.test(value) || !Number.isSafeInteger(Number(value))
+        : parsePointPrice(value) === null,
+    )) {
+      setPricingError("Enter a valid price of -1 or a non-negative whole number.")
+      return
+    }
     setPricingSaving(true)
     setPricingError("")
     setPricingNotice("")
@@ -1092,16 +1110,9 @@ export default function AnnoyTheStreamer() {
       const result = await response.json()
       if (!response.ok || !result.pricing) {
         throw new Error(result.message || "Could not save pricing")
-    if (Object.entries(editedCatalogPrices).some(([key, value]) =>
-      key.startsWith("sound-play:")
-        ? !/^\d+$/.test(value) || !Number.isSafeInteger(Number(value))
-        : parsePointPrice(value) === null,
-    )) {
-      setPricingError("Enter a valid price of -1 or a non-negative whole number.")
-      return
-    }
       }
       setPointPricing(result.pricing)
+      setEditedCatalogPrices({})
       setPricingNotice("Pricing saved.")
     } catch (error) {
       setPricingError(error instanceof Error ? error.message : "Could not save pricing")
@@ -1110,19 +1121,6 @@ export default function AnnoyTheStreamer() {
     }
   }
 
-  // Utility: cookies
-  const getCookie = (name: string) => {
-    const value = `; ${document.cookie}`
-    const parts = value.split(`; ${name}=`)
-      setEditedCatalogPrices({})
-    if (parts.length === 2) return parts.pop()?.split(";").shift()
-    return ""
-  }
-
-  const setCookie = (name: string, value: string, days: number) => {
-    const d = new Date()
-    d.setTime(d.getTime() + days * 24 * 60 * 60 * 1000)
-    document.cookie = `${name}=${value};expires=${d.toUTCString()};path=/`
   const fetchShopCatalog = useCallback(async (): Promise<ShopCatalog> => {
     const response = await fetch("/api/shop/catalog")
     const result = await response.json()
@@ -1161,6 +1159,18 @@ export default function AnnoyTheStreamer() {
     setAssetLoadError("")
   }, [])
 
+  // Utility: cookies
+  const getCookie = (name: string) => {
+    const value = `; ${document.cookie}`
+    const parts = value.split(`; ${name}=`)
+    if (parts.length === 2) return parts.pop()?.split(";").shift()
+    return ""
+  }
+
+  const setCookie = (name: string, value: string, days: number) => {
+    const d = new Date()
+    d.setTime(d.getTime() + days * 24 * 60 * 60 * 1000)
+    document.cookie = `${name}=${value};expires=${d.toUTCString()};path=/`
   }
 
   // THEME HANDLER
@@ -1190,13 +1200,13 @@ export default function AnnoyTheStreamer() {
         setCurrentRank(result.rank)
         setCurrentPermissions(result.permissions ?? null)
         setUsageCosts(result.usage_costs || {})
-        setShowUsernamePrompt(false)
       })
       .catch(() => {
         setCurrentPoints(null)
         setPointsError(true)
         setPointsLoading(false)
       })
+      .finally(() => setSessionRestored(true))
   }, [acceptPointBalance])
 
   useEffect(() => {
@@ -1289,6 +1299,9 @@ useEffect(() => {
   });
 
   socket.on('usage_costs_changed', () => {
+    void refreshOwnedAssetLists().catch((error) => {
+      console.error("Could not refresh soundboard prices:", error)
+    })
     void fetch("/api/auth/session")
       .then((response) => {
         if (!response.ok) throw new Error(`Session request failed (${response.status})`)
@@ -1298,21 +1311,6 @@ useEffect(() => {
         if (result.authenticated === true) setUsageCosts(result.usage_costs || {})
       })
       .catch((error) => console.error("Could not refresh action prices:", error))
-  });
-
-  socket.on('chat_message', (msg: ChatMessage) => {
-    void refreshOwnedAssetLists().catch((error) => {
-      console.error("Could not refresh soundboard prices:", error)
-    })
-    setChatMessages(prev => [...prev, msg]);
-  });
-
-  socket.on('chat_history', (msgs: ChatMessage[]) => {
-    setChatMessages(msgs);
-  });
-
-  socket.on('rank_changed', (change: {
-    username: string
 
     if (!isAdmin) {
       setShopLoading(true)
@@ -1325,21 +1323,21 @@ useEffect(() => {
         })
         .finally(() => setShopLoading(false))
     }
-    rank: string
-    rank_color: string | null
-    permissions?: RolePermissions | null
-    usage_costs?: Record<string, number>
-  }) => {
-    setChatMessages((messages) =>
+  });
+
+  socket.on('chat_message', (msg: ChatMessage) => {
+    setChatMessages(prev => [...prev, msg]);
+  });
+
   socket.on('chat_message_rejected', (result: { message: string; text?: string }) => {
     if (result.text) setChatInput((current) => current || result.text || "")
     setChatError(result.message || "Your message could not be sent")
   });
 
-      messages.map((message) => message.user === change.username ? { ...message, rank: change.rank, rank_color: change.rank_color } : message)
-    );
-    setOnlineUserRanks((ranks) => ({
-      ...ranks,
+  socket.on('chat_history', (msgs: ChatMessage[]) => {
+    setChatMessages(msgs);
+  });
+
   socket.on('asset_catalog_changed', (event: { asset_type: "sound" | "emoji" }) => {
     void refreshOwnedAssetLists().catch((error) => {
       console.error("Could not refresh usable assets:", error)
@@ -1351,6 +1349,18 @@ useEffect(() => {
     }
   })
 
+  socket.on('rank_changed', (change: {
+    username: string
+    rank: string
+    rank_color: string | null
+    permissions?: RolePermissions | null
+    usage_costs?: Record<string, number>
+  }) => {
+    setChatMessages((messages) =>
+      messages.map((message) => message.user === change.username ? { ...message, rank: change.rank, rank_color: change.rank_color } : message)
+    );
+    setOnlineUserRanks((ranks) => ({
+      ...ranks,
       [change.username]: { rank: change.rank, rank_color: change.rank_color },
     }));
     if (change.username === username) {
@@ -1522,6 +1532,17 @@ useEffect(() => {
   const [ttsLanguage, setTtsLanguage] = useState("en")
 
   const filteredSounds = sounds.filter((s) => s.title.toLowerCase().includes(soundSearch.toLowerCase()))
+  const filteredShopAssets = (category: "emoji" | "sound") => {
+    const query = (category === "emoji" ? emojiShopSearch : soundShopSearch).trim().toLowerCase()
+    const statusOrder = { available: 0, owned: 1, unavailable: 2 }
+    return shopAssets[category]
+      .filter((asset) => `${asset.title ?? ""} ${asset.name}`.toLowerCase().includes(query))
+      .sort((left, right) =>
+        statusOrder[left.status] - statusOrder[right.status]
+        || left.name.localeCompare(right.name, undefined, { sensitivity: "base" })
+        || left.name.localeCompare(right.name),
+      )
+  }
   const editableStaffRoleIds = currentPermissions?.capabilities.edit_staff_role_ids
   const canChangeManagedUserRank = Boolean(
     managedUser
@@ -1534,17 +1555,6 @@ useEffect(() => {
     && (
       managedUser.username.toLowerCase() !== username.toLowerCase()
       || permission("edit_self")
-  const filteredShopAssets = (category: "emoji" | "sound") => {
-    const query = (category === "emoji" ? emojiShopSearch : soundShopSearch).trim().toLowerCase()
-    const statusOrder = { available: 0, owned: 1, unavailable: 2 }
-    return shopAssets[category]
-      .filter((asset) => `${asset.title ?? ""} ${asset.name}`.toLowerCase().includes(query))
-      .sort((left, right) =>
-        statusOrder[left.status] - statusOrder[right.status]
-        || left.name.localeCompare(right.name, undefined, { sensitivity: "base" })
-        || left.name.localeCompare(right.name),
-      )
-  }
     ),
   )
   const timeoutStaffRoleIds = currentPermissions?.capabilities.timeout_staff_role_ids
@@ -1560,51 +1570,67 @@ useEffect(() => {
     if (!isAdmin) setAdminView("users")
   }, [isAdmin])
 
-  // --- Username + Admin logic ---
+  // --- Authentication + Admin logic ---
   const joinAsUsername = (name: string, rank: string, permissions: RolePermissions | null) => {
-    setUsername(name)
-    setCurrentModerationStatus(null)
-    setCookie("ats_username", name, 7)
-    setCurrentRank(rank)
-    setCurrentPermissions(permissions)
-    setShowUsernamePrompt(false)
-  }
-
-  const handleUsernameSubmit = async () => {
-    const name = usernameInput.trim()
-    if (!name) return
-    setAuthError("")
     setSounds([])
     setUsableEmojis([])
     setAssetLoadError("")
     setAssetListsLoading(true)
     setShowEmojiPanel(false)
+    setUsername(name)
+    setCurrentModerationStatus(null)
+    setCookie("ats_username", name, 7)
+    setCurrentRank(rank)
+    setCurrentPermissions(permissions)
+  }
+
+  const handleLoginSubmit = async () => {
+    const name = usernameInput.trim()
+    setAuthError("")
+    if (!name) {
+      setAuthError("Enter your username.")
+      return
+    }
+    if (!passwordInput) {
+      setAuthError("Enter your password.")
+      return
+    }
     try {
-      const response = await fetch("/api/auth/lookup", {
+      const response = await fetch("/api/auth/login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username: name }),
+        body: JSON.stringify({ username: name, password: passwordInput }),
       })
       const result = await response.json()
-      if (!response.ok) throw new Error(result.message || "Could not check account")
-      setAdminLoginUsername(name)
-      setPasswordMode(result.requires_password_creation ? "create" : "login")
-      setEmailInput("")
+      if (!response.ok) throw new Error(result.message || "Login failed")
+      if (document.activeElement instanceof HTMLElement) document.activeElement.blur()
+      joinAsUsername(result.username, result.rank, result.permissions ?? null)
+      acceptPointBalance(result.points)
+      setUsageCosts(result.usage_costs || {})
       setPasswordInput("")
-      setPasswordConfirmation("")
-      setShowPasswordPrompt(true)
+      setAuthError("")
     } catch (error) {
-      setAuthError(error instanceof Error ? error.message : "Could not check account")
+      setAuthError(error instanceof Error ? error.message : "Login failed")
     }
   }
 
-  const handlePasswordSubmit = async () => {
+  const handleRegistrationSubmit = async (event: React.FormEvent) => {
+    event.preventDefault()
+    const name = registrationUsername.trim()
     setAuthError("")
-    if (passwordMode === "create" && !isValidEmail(emailInput)) {
+    if (!name) {
+      setAuthError("Enter a username.")
+      return
+    }
+    if (!isValidEmail(emailInput)) {
       setAuthError("Enter a valid email address.")
       return
     }
-    if (passwordMode === "create" && passwordInput !== passwordConfirmation) {
+    if (registrationPassword.length < 8 || registrationPassword.length > 256) {
+      setAuthError("Password must be between 8 and 256 characters.")
+      return
+    }
+    if (registrationPassword !== passwordConfirmation) {
       setAuthError("Passwords do not match.")
       return
     }
@@ -1613,23 +1639,90 @@ useEffect(() => {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          username: adminLoginUsername,
-          email: passwordMode === "create" ? emailInput.trim() : undefined,
-          password: passwordInput,
+          intent: "register",
+          username: name,
+          email: emailInput.trim(),
+          password: registrationPassword,
           confirmation: passwordConfirmation,
         }),
       })
       const result = await response.json()
-      if (!response.ok) throw new Error(result.message || "Login failed")
+      if (!response.ok) throw new Error(result.message || "Account creation failed")
+      if (document.activeElement instanceof HTMLElement) document.activeElement.blur()
       joinAsUsername(result.username, result.rank, result.permissions ?? null)
       acceptPointBalance(result.points)
       setUsageCosts(result.usage_costs || {})
       setEmailInput("")
+      setUsernameInput("")
       setPasswordInput("")
+      setRegistrationUsername("")
+      setRegistrationPassword("")
       setPasswordConfirmation("")
-      setShowPasswordPrompt(false)
+      setPasswordResetUsername("")
+      setPasswordResetToken("")
+      setPasswordResetAccount(null)
+      setResetPasswordInput("")
+      setResetPasswordConfirmation("")
+      setShowRegistrationForm(false)
+      setPasswordResetMode(false)
     } catch (error) {
-      setAuthError(error instanceof Error ? error.message : "Login failed")
+      setAuthError(error instanceof Error ? error.message : "Account creation failed")
+    }
+  }
+
+  const handlePasswordResetSubmit = async (event: React.FormEvent) => {
+    event.preventDefault()
+    setAuthError("")
+    if (!passwordResetAccount) {
+      if (!passwordResetToken.trim()) {
+        setAuthError("Enter the one-time reset code provided by an Admin.")
+        return
+      }
+      try {
+        const response = await fetch("/api/auth/password-reset", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            action: "verify",
+            reset_token: passwordResetToken,
+          }),
+        })
+        const result = await response.json()
+        if (!response.ok) throw new Error(result.message || "Could not verify reset code")
+        setPasswordResetUsername(result.username)
+        setPasswordResetAccount({
+          username: result.username,
+          email: typeof result.email === "string" ? result.email : null,
+        })
+      } catch (error) {
+        setAuthError(error instanceof Error ? error.message : "Could not verify reset code")
+      }
+      return
+    }
+    if (resetPasswordInput.length < 8 || resetPasswordInput.length > 256) {
+      setAuthError("Password must be between 8 and 256 characters.")
+      return
+    }
+    if (resetPasswordInput !== resetPasswordConfirmation) {
+      setAuthError("Passwords do not match.")
+      return
+    }
+    try {
+      const response = await fetch("/api/auth/password-reset", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          username: passwordResetAccount.username,
+          reset_token: passwordResetToken,
+          password: resetPasswordInput,
+          confirmation: resetPasswordConfirmation,
+        }),
+      })
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.message || "Password reset failed")
+      window.location.replace("/")
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : "Password reset failed")
     }
   }
 
@@ -1658,6 +1751,11 @@ useEffect(() => {
       document.cookie = "ats_username=; Max-Age=0; path=/"
       setUsername("")
       setUsernameInput("")
+      setEmailInput("")
+      setRegistrationUsername("")
+      setRegistrationPassword("")
+      setPasswordInput("")
+      setPasswordConfirmation("")
       setCurrentRank("User")
       setCurrentPermissions(null)
       setCurrentPoints(null)
@@ -1665,10 +1763,18 @@ useEffect(() => {
       setPointsError(false)
       setUsageCosts({})
       setActionError("")
-      setShowPasswordPrompt(false)
-      setPasswordInput("")
-      setPasswordConfirmation("")
-      setShowUsernamePrompt(true)
+      setAdminIssuedPasswordResetToken("")
+      setShowRegistrationForm(false)
+      setPasswordResetMode(false)
+      setPasswordResetUsername("")
+      setPasswordResetToken("")
+      setPasswordResetAccount(null)
+      setResetPasswordInput("")
+      setResetPasswordConfirmation("")
+      setSounds([])
+      setUsableEmojis([])
+      setAssetLoadError("")
+      setAssetListsLoading(false)
       window.location.replace("/")
     } catch (error) {
       setLogoutError(error instanceof Error ? error.message : "Logout failed")
@@ -1679,6 +1785,7 @@ useEffect(() => {
   const loadManagedUserByUsername = async (targetUsername: string) => {
     setAdminError("")
     setAdminNotice("")
+    setAdminIssuedPasswordResetToken("")
     try {
       const response = await fetch(`/api/admin/users/${encodeURIComponent(targetUsername.trim())}`)
       const result = await response.json()
@@ -1709,6 +1816,7 @@ useEffect(() => {
     if (!managedUser) return
     setAdminError("")
     setAdminNotice("")
+    if (operation === "reset-password") setAdminIssuedPasswordResetToken("")
     try {
       const response = await fetch(`/api/admin/users/${encodeURIComponent(managedUser.username)}/${operation}`, {
         method: "POST",
@@ -1743,7 +1851,14 @@ useEffect(() => {
         if (result.usage_costs) setUsageCosts(result.usage_costs)
       }
       setConfirmingPasswordReset(false)
-      setAdminNotice(operation === "reset-password" ? "Password reset." : "User updated.")
+      if (operation === "reset-password") {
+        setAdminIssuedPasswordResetToken(
+          typeof result.reset_token === "string" ? result.reset_token : "",
+        )
+        setAdminNotice("One-time reset code generated. Share it with the user; it expires in 30 minutes.")
+      } else {
+        setAdminNotice("User updated.")
+      }
     } catch (error) {
       setAdminError(error instanceof Error ? error.message : "User update failed")
     }
@@ -1802,6 +1917,7 @@ useEffect(() => {
     messageUser?: string,
   ) => {
 	  const parts = message.split(/(:\w+:)/g)
+    const ownedEmojiNames = new Set(usableEmojis.map((emoji) => emoji.name))
 	  return parts.map((part, idx) => {
 		const emojiName = part.replace(/:/g, "")
 		const senderNowOwnsEmoji = messageUser === username && ownedEmojiNames.has(emojiName)
@@ -1923,7 +2039,6 @@ useEffect(() => {
 		return
 	  }
 	  const formData = new FormData()
-    const ownedEmojiNames = new Set(usableEmojis.map((emoji) => emoji.name))
 	  formData.append('user', username)
 	  formData.append('text_ttsmeme', trimmedTts)
 	  formData.append('language', ttsLanguage)
@@ -1970,123 +2085,6 @@ useEffect(() => {
       },
     )
 	};
-
-  const handleUsernameClick = (clickedUsername: string) => {
-    const safeUsername = clickedUsername.trim()
-    if (!safeUsername) return
-    setChatInput((prev) => (prev.trim() ? `${prev} @${safeUsername} ` : `@${safeUsername} `))
-    chatInputRef.current?.focus()
-  }
-
-  const getUserColor = (user: string, messageRank?: string) => {
-    const rank = messageRank || (user === username ? currentRank : "User")
-    return rankOptions.find((option) => option.rank.toLowerCase() === rank.toLowerCase())?.color
-  }
-
-  const isValidEmail = (value: string) => {
-    const email = value.trim()
-    if (email.length > 254 || email.split("@").length !== 2) return false
-
-    const [local, domain] = email.split("@")
-    const localAtom = "[A-Z0-9!#$%&'*+/=?^_`{|}~-]+"
-    const domainLabel = "[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?"
-    return (
-      local.length <= 64 &&
-      new RegExp(`^${localAtom}(?:\\.${localAtom})*$`, "i").test(local) &&
-      domain.includes(".") &&
-      domain.split(".").every((label) => new RegExp(`^${domainLabel}$`, "i").test(label))
-    )
-  }
-
-if (showUsernamePrompt) {
-    return (
-      <div className="min-h-screen gradient-bg flex items-center justify-center p-4">
-        <Card className="w-full max-w-md glow-primary">
-          <CardHeader className="text-center">
-            <CardTitle className="text-3xl font-bold bg-gradient-to-r from-primary to-accent bg-clip-text text-transparent">
-              Annoy the Streamer
-            </CardTitle>
-            <CardDescription>
-              {showPasswordPrompt
-                ? passwordMode === "create" ? "Create your account" : "Enter your password"
-                : "Enter your username to join the chaos"}
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            {!showPasswordPrompt ? (
-              <>
-                <Input
-                  placeholder="Your username..."
-                  value={usernameInput}
-                  onChange={(e) => setUsernameInput(e.target.value)}
-                  onKeyDown={(e) => e.key === "Enter" && handleUsernameSubmit()}
-                  className="text-lg"
-                />
-                <Button onClick={handleUsernameSubmit} className="w-full" size="lg">
-                  Join the Fun
-                </Button>
-              </>
-            ) : (
-              <>
-                {passwordMode === "create" && (
-                  <Input
-                    type="email"
-                    placeholder="Email address..."
-                    value={emailInput}
-                    onChange={(e) => setEmailInput(e.target.value)}
-                    onKeyDown={(e) => e.key === "Enter" && handlePasswordSubmit()}
-                    className="text-lg"
-                    autoComplete="email"
-                    required
-                  />
-                )}
-                <Input
-                  type="password"
-                  placeholder={passwordMode === "create" ? "Create password..." : "Password..."}
-                  value={passwordInput}
-                  onChange={(e) => setPasswordInput(e.target.value)}
-                  onKeyDown={(e) => e.key === "Enter" && handlePasswordSubmit()}
-                  className="text-lg"
-                  autoFocus
-                />
-                {passwordMode === "create" && (
-                  <Input
-                    type="password"
-                    placeholder="Confirm password..."
-                    value={passwordConfirmation}
-                    onChange={(e) => setPasswordConfirmation(e.target.value)}
-                    onKeyDown={(e) => e.key === "Enter" && handlePasswordSubmit()}
-                    className="text-lg"
-                  />
-                )}
-                {authError && <p role="alert" className="text-sm text-destructive">{authError}</p>}
-                <div className="flex gap-2">
-                  <Button
-                    onClick={() => {
-                      setShowPasswordPrompt(false)
-                      setPasswordInput("")
-                      setPasswordConfirmation("")
-                      setAuthError("")
-                    }}
-                    variant="outline"
-                    className="flex-1"
-                  >
-                    Back
-                  </Button>
-                  <Button onClick={handlePasswordSubmit} className="flex-1" size="lg">
-                    {passwordMode === "create" ? "Create account" : "Login"}
-                  </Button>
-                </div>
-              </>
-            )}
-            {!showPasswordPrompt && authError && <p role="alert" className="text-sm text-destructive">{authError}</p>}
-          </CardContent>
-        </Card>
-      </div>
-    )
-  }
-
-
 
   const toggleSoundFavorite = async (sound: SoundAsset) => {
     setActionError("")
@@ -2241,6 +2239,283 @@ if (showUsernamePrompt) {
     }
   }
 
+  const handleUsernameClick = (clickedUsername: string) => {
+    const safeUsername = clickedUsername.trim()
+    if (!safeUsername) return
+    setChatInput((prev) => (prev.trim() ? `${prev} @${safeUsername} ` : `@${safeUsername} `))
+    chatInputRef.current?.focus()
+  }
+
+  const getUserColor = (user: string, messageRank?: string) => {
+    const rank = messageRank || (user === username ? currentRank : "User")
+    return rankOptions.find((option) => option.rank.toLowerCase() === rank.toLowerCase())?.color
+  }
+
+  const isValidEmail = (value: string) => {
+    const email = value.trim()
+    if (email.length > 254 || email.split("@").length !== 2) return false
+
+    const [local, domain] = email.split("@")
+    const localAtom = "[A-Z0-9!#$%&'*+/=?^_`{|}~-]+"
+    const domainLabel = "[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?"
+    return (
+      local.length <= 64 &&
+      new RegExp(`^${localAtom}(?:\\.${localAtom})*$`, "i").test(local) &&
+      domain.includes(".") &&
+      domain.split(".").every((label) => new RegExp(`^${domainLabel}$`, "i").test(label))
+    )
+  }
+
+if (!sessionRestored) {
+  return (
+    <div className="min-h-screen gradient-bg flex items-center justify-center p-4">
+      <p role="status" className="text-sm text-muted-foreground">Checking your session...</p>
+    </div>
+  )
+}
+
+if (!username) {
+    return (
+      <div className="min-h-screen gradient-bg flex items-center justify-center p-4">
+        <Card className="w-full max-w-md glow-primary">
+          <CardHeader className="text-center">
+            <CardTitle className="text-3xl font-bold bg-gradient-to-r from-primary to-accent bg-clip-text text-transparent">
+              Annoy the Streamer
+            </CardTitle>
+            <CardDescription>Log in or create an account to join the chaos.</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            {!showRegistrationForm && !passwordResetMode && <form
+              id="login-form"
+              data-bwignore="true"
+              autoComplete="on"
+              className="space-y-3"
+              onSubmit={(event) => {
+                event.preventDefault()
+                void handleLoginSubmit()
+              }}
+            >
+              <label className="sr-only" htmlFor="login-username">Username</label>
+              <Input
+                id="login-username"
+                data-bwignore="true"
+                placeholder="Username"
+                name="username"
+                autoComplete="username"
+                value={usernameInput}
+                onChange={(event) => setUsernameInput(event.target.value)}
+                className="text-lg"
+                required
+              />
+              <label className="sr-only" htmlFor="login-password">Password</label>
+              <Input
+                id="login-password"
+                data-bwignore="true"
+                type="password"
+                name="password"
+                placeholder="Password"
+                autoComplete="current-password"
+                value={passwordInput}
+                onChange={(event) => setPasswordInput(event.target.value)}
+                className="text-lg"
+              />
+              <Button type="submit" className="w-full" size="lg">
+                Login
+              </Button>
+            </form>}
+
+            {!showRegistrationForm && !passwordResetMode && (
+              <div className="flex gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="flex-1"
+                  onClick={() => {
+                    setRegistrationUsername((current) => current || usernameInput)
+                    setShowRegistrationForm(true)
+                    setAuthError("")
+                  }}
+                >
+                  Create account
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="flex-1"
+                  onClick={() => {
+                    setPasswordResetUsername(usernameInput || registrationUsername)
+                    setShowRegistrationForm(false)
+                    setPasswordResetMode(true)
+                    setAuthError("")
+                  }}
+                >
+                  Reset password
+                </Button>
+              </div>
+            )}
+
+            {showRegistrationForm && (
+              <section aria-label="Create account" className="space-y-3 border-t pt-3">
+                <h2 className="text-sm font-semibold">Create account</h2>
+                <form
+                  id="registration-form"
+                  data-bwignore="true"
+                  autoComplete="on"
+                  className="space-y-3"
+                  onSubmit={(event) => void handleRegistrationSubmit(event)}
+                >
+                <Input
+                  placeholder="Username"
+                  name="username"
+                  autoComplete="username"
+                  value={registrationUsername}
+                  onChange={(event) => setRegistrationUsername(event.target.value)}
+                  className="text-lg"
+                  required
+                />
+                <Input
+                  type="email"
+                  name="email"
+                  placeholder="Email address"
+                  value={emailInput}
+                  onChange={(event) => setEmailInput(event.target.value)}
+                  className="text-lg"
+                  autoComplete="email"
+                  required
+                />
+                <Input
+                  type="password"
+                  data-bwignore="true"
+                  name="new-password"
+                  placeholder="Create password"
+                  value={registrationPassword}
+                  onChange={(event) => setRegistrationPassword(event.target.value)}
+                  className="text-lg"
+                  autoComplete="new-password"
+                  required
+                />
+                <Input
+                  type="password"
+                  name="password-confirmation"
+                  placeholder="Confirm password"
+                  value={passwordConfirmation}
+                  onChange={(event) => setPasswordConfirmation(event.target.value)}
+                  className="text-lg"
+                  autoComplete="new-password"
+                  required
+                />
+                <Button type="submit" className="w-full" size="lg">
+                  Register
+                </Button>
+                </form>
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="w-full"
+                  onClick={() => {
+                    setShowRegistrationForm(false)
+                    setAuthError("")
+                  }}
+                >
+                  Back to login
+                </Button>
+              </section>
+            )}
+
+            {passwordResetMode && (
+              <section aria-label="Set a new password" className="space-y-3 border-t pt-3">
+                <h2 className="text-sm font-semibold">
+                  {passwordResetAccount ? "Set a new password" : "Verify password reset"}
+                </h2>
+                <p className="text-xs text-muted-foreground">
+                  Enter the one-time reset code provided by an Admin to securely access this reset.
+                </p>
+                <p className="text-sm">
+                  Account: <span className="font-medium">
+                    {passwordResetAccount?.username || passwordResetUsername}
+                  </span>
+                </p>
+                {passwordResetAccount && (
+                  <p className="text-sm">
+                    Email on file: <span className="font-medium">
+                      {passwordResetAccount.email || "No email address on file"}
+                    </span>
+                  </p>
+                )}
+                <form
+                  id="password-reset-form"
+                  data-bwignore="true"
+                  autoComplete="off"
+                  className="space-y-3"
+                  onSubmit={(event) => void handlePasswordResetSubmit(event)}
+                >
+                  <Input
+                    name="reset-token"
+                    placeholder="One-time reset code"
+                    data-bwignore="true"
+                    autoComplete="off"
+                    value={passwordResetToken}
+                    onChange={(event) => {
+                      setPasswordResetToken(event.target.value)
+                      setPasswordResetAccount(null)
+                      setResetPasswordInput("")
+                      setResetPasswordConfirmation("")
+                    }}
+                    className="text-lg"
+                    required
+                  />
+                  {passwordResetAccount && (
+                    <>
+                      <Input
+                        type="password"
+                        name="new-password"
+                        placeholder="New password"
+                        autoComplete="new-password"
+                        value={resetPasswordInput}
+                        onChange={(event) => setResetPasswordInput(event.target.value)}
+                        className="text-lg"
+                        required
+                      />
+                      <Input
+                        type="password"
+                        data-bwignore="true"
+                        name="new-password-confirmation"
+                        placeholder="Confirm new password"
+                        autoComplete="new-password"
+                        value={resetPasswordConfirmation}
+                        onChange={(event) => setResetPasswordConfirmation(event.target.value)}
+                        className="text-lg"
+                        required
+                      />
+                    </>
+                  )}
+                  <Button type="submit" className="w-full" size="lg">
+                    {passwordResetAccount ? "Set new password" : "Verify reset code"}
+                  </Button>
+                </form>
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="w-full"
+                  onClick={() => {
+                    setPasswordResetMode(false)
+                    setAuthError("")
+                  }}
+                >
+                  Back to login
+                </Button>
+              </section>
+            )}
+
+            {authError && <p role="alert" className="text-sm text-destructive">{authError}</p>}
+          </CardContent>
+        </Card>
+      </div>
+    )
+  }
+
+
+
   // ----------------------------
   // Main Page Render (chat + memes + stream)
   // ----------------------------
@@ -2328,7 +2603,7 @@ if (showUsernamePrompt) {
 
                   {/* --- Face Meme Tab --- */}
                   <TabsContent value="facememe" className="space-y-2 sm:space-y-3 mt-0 flex flex-col lg:flex-1 lg:min-h-0">
-                    <form onSubmit={handleFaceMemeSubmit} className="flex flex-col lg:h-full">
+                    <form autoComplete="off" onSubmit={handleFaceMemeSubmit} className="flex flex-col lg:h-full">
                       <div className="flex-1 space-y-2 sm:space-y-3">
                         <div>
                           <label className="text-xs font-medium mb-1 block">Top Text</label>
@@ -2357,7 +2632,7 @@ if (showUsernamePrompt) {
 
                   {/* --- Normal Meme Tab --- */}
                   <TabsContent value="normalmeme" className="space-y-2 sm:space-y-3 mt-0 flex flex-col lg:flex-1 lg:min-h-0">
-                    <form onSubmit={handleNormalMemeSubmit} className="flex flex-col lg:h-full">
+                    <form autoComplete="off" onSubmit={handleNormalMemeSubmit} className="flex flex-col lg:h-full">
                       <div className="flex-1 space-y-2 sm:space-y-3">
                         <div>
                           <label className="text-xs font-medium mb-1 block">Image</label>
@@ -2425,7 +2700,7 @@ if (showUsernamePrompt) {
 
                   {/* --- TTS Tab --- */}
                   <TabsContent value="tts" className="space-y-2 sm:space-y-3 mt-0 flex flex-col lg:flex-1 lg:min-h-0">
-                    <form onSubmit={handleTTSSubmit} className="flex flex-col lg:h-full">
+                    <form autoComplete="off" onSubmit={handleTTSSubmit} className="flex flex-col lg:h-full">
                       <div className="flex-1 space-y-2 sm:space-y-3">
                         <div>
                           <label className="text-xs font-medium mb-1 block">TTS Message</label>
@@ -2551,17 +2826,31 @@ if (showUsernamePrompt) {
                         ❖ Pricing
                       </TabsTrigger>
                     )}
+                    {permission("admin_console") && (
+                      <TabsTrigger value="soundboard" className="col-start-2 col-span-2 gap-1 text-[10px] sm:text-xs px-1">
+                        <Music className="h-3 w-3" /> Soundboard
+                      </TabsTrigger>
+                    )}
+                    {permission("admin_console") && (
+                      <TabsTrigger value="emoji" className="col-start-4 col-span-2 gap-1 text-[10px] sm:text-xs px-1">
+                        <Smile className="h-3 w-3" /> Emoji
+                      </TabsTrigger>
+                    )}
                   </TabsList>
                   <TabsContent value="users" className="mt-0 space-y-3 lg:flex-1 lg:min-h-0 lg:overflow-y-auto">
                     <div className="space-y-3">
                   {adminView === "users" ? (
                     <>
-                      <form onSubmit={loadManagedUser} className="flex gap-2">
+                      <form data-bwignore="true" autoComplete="off" onSubmit={loadManagedUser} className="flex gap-2">
                         <Input
+                          data-bwignore="true"
+                          type="search"
+                          name="admin-user-lookup"
+                          autoComplete="off"
                           value={lookupUsername}
                           onChange={(event) => setLookupUsername(event.target.value)}
-                          placeholder="Username"
-                          aria-label="Username to look up"
+                          placeholder="Find account"
+                          aria-label="Account to look up"
                         />
                         <Button type="submit" variant="outline" disabled={!lookupUsername.trim()}>
                           Confirm
@@ -2581,6 +2870,7 @@ if (showUsernamePrompt) {
                             </p>
                           </div>
                           {permission("adjust_points") && <form
+                            autoComplete="off"
                             className="flex items-end gap-2"
                             onSubmit={(event) => {
                               event.preventDefault()
@@ -2661,6 +2951,7 @@ if (showUsernamePrompt) {
                           {canManageTimeouts && canTimeoutManagedUser && (
                             <>
                               <form
+                                autoComplete="off"
                                 className="flex flex-nowrap items-end gap-2"
                                 onSubmit={(event) => {
                                   event.preventDefault()
@@ -2714,7 +3005,17 @@ if (showUsernamePrompt) {
                   ) : <p className="text-sm text-muted-foreground">Admin tools are open for testing.</p>}
                     </div>
                     {adminError && <p role="alert" className="text-sm text-destructive">{adminError}</p>}
-                    {adminNotice && <p role="status" className="text-sm text-muted-foreground">{adminNotice}</p>}
+                    {adminNotice && (
+                      <div role="status" className="space-y-1 text-sm text-muted-foreground">
+                        <p>{adminNotice}</p>
+                        {adminIssuedPasswordResetToken && (
+                          <p className="break-all">
+                            Reset code (shown once):{" "}
+                            <code className="select-all">{adminIssuedPasswordResetToken}</code>
+                          </p>
+                        )}
+                      </div>
+                    )}
                   </TabsContent>
                   {permission("admin_console") && <TabsContent value="admin" className="mt-0 lg:flex-1 lg:min-h-0 lg:overflow-y-auto">
                     <div className="flex items-center gap-3">
@@ -2770,6 +3071,7 @@ if (showUsernamePrompt) {
                             </summary>
                             <div className="space-y-2 pt-2">
                               <form
+                                autoComplete="off"
                                 className="flex flex-col gap-2"
                                 onSubmit={(event) => {
                                   event.preventDefault()
@@ -2819,196 +3121,6 @@ if (showUsernamePrompt) {
                               step={1}
                               value={pointPricing.proposal_rewards.emoji.default}
                               onChange={(event) => updateProposalDefault("emoji", event.target.valueAsNumber)}
-                              className="[appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
-                            />
-                          </label>
-                          <label className="block space-y-1 text-xs">
-                            <span>Add your own (exclusive)</span>
-                            <Input
-                              aria-label="Add your own exclusive sound price"
-                              type="number"
-                              min={-1}
-                              step={1}
-                              value={pointPricing.proposal_rewards.sound.exclusive}
-                              onChange={(event) => updateProposalExclusive("sound", event.target.valueAsNumber)}
-                            />
-                          </label>
-                          <details className="rounded-md border px-3 py-2">
-                            <summary className="cursor-pointer text-xs font-medium">
-                              Proposal reward exceptions ({Object.keys(pointPricing.proposal_rewards.sound.items).length})
-                            </summary>
-                            <div className="space-y-2 pt-2">
-                              <form
-                                autoComplete="off"
-                                className="flex flex-col gap-2"
-                                onSubmit={(event) => {
-                                  event.preventDefault()
-                                  const item = normalizeProposalItemName(newSoundProposalItem)
-                                  const price = parsePointPrice(newSoundProposalItemPrice)
-                                  if (!item || Object.prototype.hasOwnProperty.call(pointPricing.proposal_rewards.sound.items, item) || price === null) {
-                                    setPricingError("Enter a new sound name and a valid proposal reward of -1 or a non-negative whole number.")
-                                    return
-                                  }
-                                  updateProposalItemReward("sound", item, price)
-                                  setNewSoundProposalItem("")
-                                  setNewSoundProposalItemPrice("")
-                                }}
-                              >
-                                <Input
-                                  value={newSoundProposalItem}
-                                  onChange={(event) => setNewSoundProposalItem(event.target.value)}
-                                  placeholder="Sound name"
-                                  aria-label="New sound proposal reward name"
-                                  className="w-full"
-                                />
-                                <div className="flex items-center gap-2">
-                                  <Input
-                                    type="number"
-                                    min={-1}
-                                    step={1}
-                                    value={newSoundProposalItemPrice}
-                                    onChange={(event) => setNewSoundProposalItemPrice(event.target.value)}
-                                    aria-label="New sound proposal reward"
-                                    className="w-full [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
-                                  />
-                                  <Button type="submit" variant="outline">Add</Button>
-                                </div>
-                              </form>
-                              {Object.entries(pointPricing.proposal_rewards.sound.items).map(([item, price]) => (
-                                <div key={item} className="flex items-center gap-2">
-                                  <span className="min-w-0 flex-1 truncate text-xs">{item}</span>
-                                  <Input
-                                    aria-label={`${item} sound proposal reward`}
-                                    type="number"
-                                    min={-1}
-                                    step={1}
-                                    value={editedCatalogPrices[`proposal-sound:${item}`] ?? String(price)}
-                                    onChange={(event) => updateEditedProposalItemReward("sound", item, event.target.value)}
-                                    className="w-24 [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
-                                  />
-                                  <Button
-                                    type="button"
-                                    variant="ghost"
-                                    size="icon"
-                                    aria-label={`Remove ${item} sound proposal reward`}
-                                    onClick={() => removeProposalItemReward("sound", item)}
-                                  >
-                                    <Trash2 className="h-3 w-3" />
-                                  </Button>
-                                </div>
-                              ))}
-                            </div>
-                          </details>
-                          <div className="grid grid-cols-2 gap-2">
-                            <label className="space-y-1 text-xs">
-                              <span>Max length (seconds)</span>
-                              <Input
-                                aria-label="Sound max length"
-                                type="number"
-                                min={1}
-                                max={180}
-                                step={1}
-                                value={pointPricing.asset_limits.sound.max_length}
-                                onChange={(event) => updateAssetLimit("sound", "max_length", event.target.valueAsNumber)}
-                              />
-                            </label>
-                            <label className="space-y-1 text-xs">
-                              <span>Max length (admin)</span>
-                              <Input
-                                aria-label="Sound max length admin"
-                                type="number"
-                                min={1}
-                                max={180}
-                                step={1}
-                                value={pointPricing.asset_limits.sound.max_length_admin}
-                                onChange={(event) => updateAssetLimit("sound", "max_length_admin", event.target.valueAsNumber)}
-                              />
-                            </label>
-                          </div>
-                          </section>
-                        </details>
-
-                        <details className="border-t pt-3">
-                          <summary className="cursor-pointer text-sm font-semibold">Soundboard</summary>
-                          <section className="space-y-2 pt-3">
-                          <label className="block space-y-1 text-xs">
-                            <span>Default price</span>
-                            <Input
-                              aria-label="Default sound price"
-                              type="number"
-                    {permission("admin_console") && (
-                      <TabsTrigger value="soundboard" className="col-start-2 col-span-2 gap-1 text-[10px] sm:text-xs px-1">
-                        <Music className="h-3 w-3" /> Soundboard
-                      </TabsTrigger>
-                    )}
-                    {permission("admin_console") && (
-                      <TabsTrigger value="emoji" className="col-start-4 col-span-2 gap-1 text-[10px] sm:text-xs px-1">
-                        <Smile className="h-3 w-3" /> Emoji
-                      </TabsTrigger>
-                    )}
-                              min={-1}
-                              step={1}
-                              value={pointPricing.catalog.sound.default}
-                              onChange={(event) => updateCatalogDefault("sound", event.target.valueAsNumber)}
-                              className="[appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
-                            />
-                          </label>
-
-                          <details className="rounded-md border px-3 py-2">
-                            <summary className="cursor-pointer text-xs font-medium">
-                              Exceptions ({Object.keys(pointPricing.catalog.sound.items).length})
-                            </summary>
-                            <div className="space-y-2 pt-2">
-                              <form
-                                className="flex flex-col gap-2"
-                                onSubmit={(event) => {
-                                  event.preventDefault()
-                                  const item = newSoundItem.trim()
-                                  const price = parsePointPrice(newSoundItemPrice)
-                                  if (!item || Object.prototype.hasOwnProperty.call(pointPricing.catalog.sound.items, item) || price === null) {
-                                    setPricingError("Enter a sound filename and a valid price of -1 or a non-negative whole number.")
-                                    return
-                                  }
-                                  updateCatalogItemPrice("sound", item, price)
-                                  setNewSoundItem("")
-                                }}
-                              >
-                                <Input value={newSoundItem} onChange={(event) => setNewSoundItem(event.target.value)} placeholder="Sound filename (e.g. 21.mp3)" aria-label="New sound exception filename" className="w-full" />
-                                <div className="flex items-center gap-2">
-                                  <Input type="number" min={-1} step={1} value={newSoundItemPrice} onChange={(event) => setNewSoundItemPrice(event.target.value)} aria-label="New sound exception price" className="w-full [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none" />
-                                  <Button type="submit" variant="outline">Add</Button>
-                                </div>
-                              </form>
-                              {Object.entries(pointPricing.catalog.sound.items).map(([item, price]) => (
-                                <div key={item} className="flex items-center gap-2">
-                                  <span className="min-w-0 flex-1 truncate text-xs">{item}</span>
-                                  <Input
-                                    aria-label={`${item} sound price`}
-                                    type="number"
-                                    min={-1}
-                                    step={1}
-                                    inputMode="decimal"
-                                    value={editedCatalogPrices[`sound:${item}`] ?? String(price)}
-                                    onChange={(event) => updateEditedCatalogItemPrice("sound", item, event.target.value)}
-                                    className="w-24 [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
-                                  />
-                                  <Button type="button" variant="ghost" size="icon" aria-label={`Remove ${item} sound exception`} onClick={() => removeCatalogItemPrice("sound", item)}>
-                                    <Trash2 className="h-3 w-3" />
-                                  </Button>
-                                </div>
-                              ))}
-                            </div>
-                          </details>
-
-                          <label className="block space-y-1 text-xs">
-                            <span>Add your own</span>
-                            <Input
-                              aria-label="Add your own sound price"
-                              type="number"
-                              min={-1}
-                              step={1}
-                              value={pointPricing.proposal_rewards.sound.default}
-                              onChange={(event) => updateProposalDefault("sound", event.target.valueAsNumber)}
                               className="[appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
                             />
                           </label>
@@ -3118,6 +3230,273 @@ if (showUsernamePrompt) {
                           </section>
                         </details>
 
+                        <details className="border-t pt-3">
+                          <summary className="cursor-pointer text-sm font-semibold">Soundboard</summary>
+                          <section className="space-y-2 pt-3">
+                          <label className="block space-y-1 text-xs">
+                            <span>Default price</span>
+                            <Input
+                              aria-label="Default sound price"
+                              type="number"
+                              min={-1}
+                              step={1}
+                              value={pointPricing.catalog.sound.default}
+                              onChange={(event) => updateCatalogDefault("sound", event.target.valueAsNumber)}
+                              className="[appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                            />
+                          </label>
+
+                          <details className="rounded-md border px-3 py-2">
+                            <summary className="cursor-pointer text-xs font-medium">
+                              Exceptions ({Object.keys(pointPricing.catalog.sound.items).length})
+                            </summary>
+                            <div className="space-y-2 pt-2">
+                              <form
+                                autoComplete="off"
+                                className="flex flex-col gap-2"
+                                onSubmit={(event) => {
+                                  event.preventDefault()
+                                  const item = newSoundItem.trim()
+                                  const price = parsePointPrice(newSoundItemPrice)
+                                  if (!item || Object.prototype.hasOwnProperty.call(pointPricing.catalog.sound.items, item) || price === null) {
+                                    setPricingError("Enter a sound filename and a valid price of -1 or a non-negative whole number.")
+                                    return
+                                  }
+                                  updateCatalogItemPrice("sound", item, price)
+                                  setNewSoundItem("")
+                                }}
+                              >
+                                <Input value={newSoundItem} onChange={(event) => setNewSoundItem(event.target.value)} placeholder="Sound filename (e.g. 21.mp3)" aria-label="New sound exception filename" className="w-full" />
+                                <div className="flex items-center gap-2">
+                                  <Input type="number" min={-1} step={1} value={newSoundItemPrice} onChange={(event) => setNewSoundItemPrice(event.target.value)} aria-label="New sound exception price" className="w-full [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none" />
+                                  <Button type="submit" variant="outline">Add</Button>
+                                </div>
+                              </form>
+                              {Object.entries(pointPricing.catalog.sound.items).map(([item, price]) => (
+                                <div key={item} className="flex items-center gap-2">
+                                  <span className="min-w-0 flex-1 truncate text-xs">{item}</span>
+                                  <Input
+                                    aria-label={`${item} sound price`}
+                                    type="number"
+                                    min={-1}
+                                    step={1}
+                                    inputMode="decimal"
+                                    value={editedCatalogPrices[`sound:${item}`] ?? String(price)}
+                                    onChange={(event) => updateEditedCatalogItemPrice("sound", item, event.target.value)}
+                                    className="w-24 [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                                  />
+                                  <Button type="button" variant="ghost" size="icon" aria-label={`Remove ${item} sound exception`} onClick={() => removeCatalogItemPrice("sound", item)}>
+                                    <Trash2 className="h-3 w-3" />
+                                  </Button>
+                                </div>
+                              ))}
+                            </div>
+                          </details>
+
+                          <label className="block space-y-1 text-xs">
+                            <span>Default play price</span>
+                            <Input
+                              aria-label="Default sound play price"
+                              type="number"
+                              min={0}
+                              step={1}
+                              value={pointPricing.catalog.sound.play_default}
+                              onChange={(event) => updateSoundPlayDefault(event.target.valueAsNumber)}
+                              className="[appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                            />
+                          </label>
+
+                          <details className="rounded-md border px-3 py-2">
+                            <summary className="cursor-pointer text-xs font-medium">
+                              Play exceptions ({Object.keys(pointPricing.catalog.sound.play_items).length})
+                            </summary>
+                            <div className="space-y-2 pt-2">
+                              <form
+                                autoComplete="off"
+                                className="flex flex-col gap-2"
+                                onSubmit={(event) => {
+                                  event.preventDefault()
+                                  const item = newSoundPlayItem.trim()
+                                  const rawPrice = newSoundPlayItemPrice
+                                  const price = /^\d+$/.test(rawPrice) ? Number(rawPrice) : NaN
+                                  if (
+                                    !item ||
+                                    Object.prototype.hasOwnProperty.call(pointPricing.catalog.sound.play_items, item) ||
+                                    !Number.isSafeInteger(price)
+                                  ) {
+                                    setPricingError("Enter a sound filename and a non-negative whole-number play price.")
+                                    return
+                                  }
+                                  updateSoundPlayItemPrice(item, price)
+                                  setNewSoundPlayItem("")
+                                  setNewSoundPlayItemPrice("")
+                                }}
+                              >
+                                <Input
+                                  value={newSoundPlayItem}
+                                  onChange={(event) => setNewSoundPlayItem(event.target.value)}
+                                  placeholder="Sound filename (e.g. 21.mp3)"
+                                  aria-label="New sound play exception filename"
+                                  className="w-full"
+                                />
+                                <div className="flex items-center gap-2">
+                                  <Input
+                                    type="number"
+                                    min={0}
+                                    step={1}
+                                    value={newSoundPlayItemPrice}
+                                    placeholder={String(pointPricing.catalog.sound.play_default)}
+                                    onChange={(event) => setNewSoundPlayItemPrice(event.target.value)}
+                                    aria-label="New sound play exception price"
+                                    className="w-full [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                                  />
+                                  <Button type="submit" variant="outline">Add</Button>
+                                </div>
+                              </form>
+                              {Object.entries(pointPricing.catalog.sound.play_items).map(([item, price]) => (
+                                <div key={item} className="flex items-center gap-2">
+                                  <span className="min-w-0 flex-1 truncate text-xs">{item}</span>
+                                  <Input
+                                    aria-label={`${item} sound play price`}
+                                    type="number"
+                                    min={0}
+                                    step={1}
+                                    value={editedCatalogPrices[`sound-play:${item}`] ?? String(price)}
+                                    onChange={(event) => updateEditedSoundPlayItemPrice(item, event.target.value)}
+                                    className="w-24 [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                                  />
+                                  <Button
+                                    type="button"
+                                    variant="ghost"
+                                    size="icon"
+                                    aria-label={`Remove ${item} sound play exception`}
+                                    onClick={() => removeSoundPlayItemPrice(item)}
+                                  >
+                                    <Trash2 className="h-3 w-3" />
+                                  </Button>
+                                </div>
+                              ))}
+                            </div>
+                          </details>
+
+                          <label className="block space-y-1 text-xs">
+                            <span>Add your own</span>
+                            <Input
+                              aria-label="Add your own sound price"
+                              type="number"
+                              min={-1}
+                              step={1}
+                              value={pointPricing.proposal_rewards.sound.default}
+                              onChange={(event) => updateProposalDefault("sound", event.target.valueAsNumber)}
+                              className="[appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                            />
+                          </label>
+                          <label className="block space-y-1 text-xs">
+                            <span>Add your own (exclusive)</span>
+                            <Input
+                              aria-label="Add your own exclusive sound price"
+                              type="number"
+                              min={-1}
+                              step={1}
+                              value={pointPricing.proposal_rewards.sound.exclusive}
+                              onChange={(event) => updateProposalExclusive("sound", event.target.valueAsNumber)}
+                            />
+                          </label>
+                          <details className="rounded-md border px-3 py-2">
+                            <summary className="cursor-pointer text-xs font-medium">
+                              Proposal reward exceptions ({Object.keys(pointPricing.proposal_rewards.sound.items).length})
+                            </summary>
+                            <div className="space-y-2 pt-2">
+                              <form
+                                autoComplete="off"
+                                className="flex flex-col gap-2"
+                                onSubmit={(event) => {
+                                  event.preventDefault()
+                                  const item = normalizeProposalItemName(newSoundProposalItem)
+                                  const price = parsePointPrice(newSoundProposalItemPrice)
+                                  if (!item || Object.prototype.hasOwnProperty.call(pointPricing.proposal_rewards.sound.items, item) || price === null) {
+                                    setPricingError("Enter a new sound name and a valid proposal reward of -1 or a non-negative whole number.")
+                                    return
+                                  }
+                                  updateProposalItemReward("sound", item, price)
+                                  setNewSoundProposalItem("")
+                                  setNewSoundProposalItemPrice("")
+                                }}
+                              >
+                                <Input
+                                  value={newSoundProposalItem}
+                                  onChange={(event) => setNewSoundProposalItem(event.target.value)}
+                                  placeholder="Sound name"
+                                  aria-label="New sound proposal reward name"
+                                  className="w-full"
+                                />
+                                <div className="flex items-center gap-2">
+                                  <Input
+                                    type="number"
+                                    min={-1}
+                                    step={1}
+                                    value={newSoundProposalItemPrice}
+                                    onChange={(event) => setNewSoundProposalItemPrice(event.target.value)}
+                                    aria-label="New sound proposal reward"
+                                    className="w-full [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                                  />
+                                  <Button type="submit" variant="outline">Add</Button>
+                                </div>
+                              </form>
+                              {Object.entries(pointPricing.proposal_rewards.sound.items).map(([item, price]) => (
+                                <div key={item} className="flex items-center gap-2">
+                                  <span className="min-w-0 flex-1 truncate text-xs">{item}</span>
+                                  <Input
+                                    aria-label={`${item} sound proposal reward`}
+                                    type="number"
+                                    min={-1}
+                                    step={1}
+                                    value={editedCatalogPrices[`proposal-sound:${item}`] ?? String(price)}
+                                    onChange={(event) => updateEditedProposalItemReward("sound", item, event.target.value)}
+                                    className="w-24 [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                                  />
+                                  <Button
+                                    type="button"
+                                    variant="ghost"
+                                    size="icon"
+                                    aria-label={`Remove ${item} sound proposal reward`}
+                                    onClick={() => removeProposalItemReward("sound", item)}
+                                  >
+                                    <Trash2 className="h-3 w-3" />
+                                  </Button>
+                                </div>
+                              ))}
+                            </div>
+                          </details>
+                          <div className="grid grid-cols-2 gap-2">
+                            <label className="space-y-1 text-xs">
+                              <span>Max length (seconds)</span>
+                              <Input
+                                aria-label="Sound max length"
+                                type="number"
+                                min={1}
+                                max={180}
+                                step={1}
+                                value={pointPricing.asset_limits.sound.max_length}
+                                onChange={(event) => updateAssetLimit("sound", "max_length", event.target.valueAsNumber)}
+                              />
+                            </label>
+                            <label className="space-y-1 text-xs">
+                              <span>Max length (admin)</span>
+                              <Input
+                                aria-label="Sound max length admin"
+                                type="number"
+                                min={1}
+                                max={180}
+                                step={1}
+                                value={pointPricing.asset_limits.sound.max_length_admin}
+                                onChange={(event) => updateAssetLimit("sound", "max_length_admin", event.target.valueAsNumber)}
+                              />
+                            </label>
+                          </div>
+                          </section>
+                        </details>
+
                         <div className="space-y-2 border-t pt-3">
                           <Button type="button" onClick={() => void savePointPricing()} disabled={pricingSaving || pricingLoading}>
                             {pricingSaving ? "Saving..." : "Save"}
@@ -3134,185 +3513,22 @@ if (showUsernamePrompt) {
                       </div>
                     )}
                   </TabsContent>}
+                  {permission("admin_console") && (
+                    <TabsContent value="soundboard" className="mt-0 lg:flex-1 lg:min-h-0 lg:overflow-y-auto lg:pr-3">
+                      {renderAdminAssetManagement("sound")}
+                    </TabsContent>
+                  )}
+                  {permission("admin_console") && (
+                    <TabsContent value="emoji" className="mt-0 lg:flex-1 lg:min-h-0 lg:overflow-y-auto lg:pr-3">
+                      {renderAdminAssetManagement("emoji")}
+                    </TabsContent>
+                  )}
                 </Tabs>
               </CardContent>
             </Card>
           </div>
           )}
 
-
-
-          {/* --- Right Column: Chat + Online Users --- */}
-          <div className="order-2 md:order-2 lg:order-4 flex flex-col gap-3 sm:gap-4 lg:h-[calc(100dvh_-_18rem)]">
-            <Card className="card-hover flex max-h-[80dvh] flex-col overflow-hidden lg:flex-1 lg:min-h-0 lg:max-h-none lg:!transition-[transform,box-shadow]">
-              <CardHeader className="flex flex-row items-center justify-between pb-1 sm:pb-2 flex-shrink-0">
-                <CardTitle className="flex items-center gap-2 text-base sm:text-lg">
-                  <MessageSquare className="h-3 w-3 sm:h-4 sm:w-4 text-primary" /> Chat
-                </CardTitle>
-                <span className="flex items-center gap-2 text-xs text-muted-foreground" title={isStreaming ? "Streaming on" : "Streaming off"}>
-                  <span className={`h-2.5 w-2.5 rounded-full ${isStreaming ? "bg-green-500 shadow-[0_0_8px_2px_rgba(34,197,94,0.75)]" : "bg-red-500"}`} />
-                  <span className="sr-only">{isStreaming ? "Streaming on" : "Streaming off"}</span>
-                </span>
-              </CardHeader>
-              <CardContent className="flex min-h-0 flex-1 flex-col space-y-2 overflow-hidden p-3 sm:p-4 lg:max-h-full">
-                <div
-			  className="min-h-0 flex-1 overflow-y-auto pr-2"
-			  ref={chatBoxRef}
-			  style={{ display: "flex", flexDirection: "column" }}
-			>
-			  <div className="space-y-1.5 sm:space-y-2">
-				{Array.isArray(chatMessages) && chatMessages.length > 0 ? (
-				  [...chatMessages].map((msg, idx) => {
-					const isMentioned = new RegExp(`@${username}\\b`, "i").test(msg.message)
-
-					return (
-					  <div
-						key={idx} // Add stable key
-						className={`group text-[11px] sm:text-sm p-1.5 sm:p-2 rounded flex items-start justify-between gap-2 ${
-						  isMentioned ? "mention-highlight-self" : ""
-						}`}
-					  >
-						<div className="flex-1 min-w-0 break-words">
-						  <span
-                className="relative"
-                onMouseEnter={() => setHoveredChatMessage(idx)}
-                onMouseLeave={() => setHoveredChatMessage(null)}
-              >
-                <span style={{ color: msg.rank_color ?? undefined }} className="font-semibold">
-                  {msg.user}:
-                </span>
-                <span className={`absolute bottom-full left-0 z-20 inline-flex items-baseline gap-1 whitespace-nowrap ${hoveredChatMessage === idx ? "pointer-events-auto" : "pointer-events-none"}`}>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    className={`h-5 px-1 py-0 text-[10px] transition-opacity ${hoveredChatMessage === idx ? "opacity-100" : "opacity-0"} focus-visible:opacity-100`}
-                    onClick={() => handleUsernameClick(msg.user)}
-                  >
-                    Reply
-                  </Button>
-                  {canInspectUsers && (
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      className={`h-5 px-1 py-0 text-[10px] transition-opacity ${hoveredChatMessage === idx ? "opacity-100" : "opacity-0"} focus-visible:opacity-100`}
-                      onClick={() => inspectChatUser(msg.user)}
-                    >
-                      Inspect
-                    </Button>
-                  )}
-                </span>
-              </span>{" "}
-						  <span className="text-foreground break-words">{renderMessageWithEmojis(msg.message, msg.literal_emojis, msg.user)}</span>
-						</div>
-
-            {msg.id && (
-						  <Button
-							variant="ghost"
-							size="icon"
-							className="h-4 w-4 sm:h-5 sm:w-5 flex-shrink-0 opacity-0 group-hover:opacity-100 hover:text-red-500 transition-opacity"
-							onClick={() => deleteMessage(msg.id!)}
-						  >
-							<Trash2 className="h-2.5 w-2.5 sm:h-3 sm:w-3" />
-						  </Button>
-						)}
-					  </div>
-					)
-				  })
-				) : (
-				  <div className="text-center text-muted-foreground text-[10px] sm:text-xs py-4 sm:py-8 flex-1 flex items-center justify-center">
-					No messages yet. Start the conversation!
-				  </div>
-				)}
-			  </div>
-			</div>
-
-                <fieldset
-                  disabled={isChatRestricted}
-                  className={`flex flex-col gap-2 border-0 p-0 ${isChatRestricted ? "opacity-50 grayscale pointer-events-none" : ""}`}
-                >
-                  {showEmojiPanel && (
-                    <div className="relative">
-                      <Card className="absolute bottom-full left-0 right-0 mb-2 z-10 gap-0 py-1">
-                        <CardContent className="p-2">
-                          <div className="flex items-center justify-between mb-2">
-                            <span className="text-xs font-medium">Emojis (A-Z)</span>
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              onClick={() => setShowEmojiPanel(false)}
-                              className="h-6 w-6 p-0"
-                            >
-                              <X className="h-3 w-3" />
-                            </Button>
-                          </div>
-                          {assetLoadError && <p role="alert" className="mb-2 text-xs text-destructive">{assetLoadError}</p>}
-<div className="max-h-[108px] overflow-y-auto pr-2 sm:max-h-[116px]">
-  {assetListsLoading ? (
-    <p role="status" className="py-2 text-xs text-muted-foreground">Loading usable emojis...</p>
-  ) : usableEmojis.length > 0 ? (
-    <div
-      aria-label="Usable emojis"
-      data-testid="usable-emoji-picker"
-      className="flex flex-wrap items-start gap-0.5 sm:gap-1 emoji-panel"
-    >
-      {usableEmojis.map((emoji) => (
-        <button
-          key={emoji.asset_id}
-          type="button"
-          onClick={() => insertEmoji(emoji.name)}
-          className="p-0 m-0 flex items-center justify-center"
-          title={emoji.name}
-        >
-          <img src={emoji.url} alt={emoji.name} className="h-5 w-5" />
-        </button>
-      ))}
-    </div>
-  ) : (
-    <p className="py-2 text-xs text-muted-foreground">
-      {assetLoadError ? "Usable emojis are unavailable." : "No usable emojis yet."}
-    </p>
-  )}
-</div>
-
-
-                        </CardContent>
-                      </Card>
-                    </div>
-                  )}
-
-                <div className="flex gap-2">
-                  <Button
-                    variant="outline"
-                    size="icon"
-                    disabled={isChatRestricted}
-                    onClick={() => setShowEmojiPanel(!showEmojiPanel)}
-                    className="h-7 w-7 sm:h-8 sm:w-8"
-                  >
-                    <Smile className="h-3 w-3" />
-                  </Button>
-                  <Input
-                    ref={chatInputRef}
-                    value={chatInput}
-                    onChange={(e) => {
-                      setChatInput(e.target.value)
-                      setChatError("")
-                    }}
-                    onKeyDown={(e) => e.key === "Enter" && sendChatMessage()}
-                    placeholder="Type a message..."
-                    maxLength={100}
-                    disabled={isChatRestricted}
-                                autoComplete="off"
-                    className="flex-1 h-7 sm:h-8 text-xs sm:text-sm"
-                  />
-                  <Button disabled={isChatRestricted} onClick={sendChatMessage} size="icon" className="h-7 w-7 sm:h-8 sm:w-8">
-                    <Send className="h-3 w-3" />
-                  </Button>
-                </div>
-                </fieldset>
-              </CardContent>
-            </Card>
           {username && !isAdmin && (
             <div className="order-4 md:order-4 lg:order-2">
               <Card className="card-hover flex flex-col h-auto max-h-[80dvh] overflow-hidden lg:h-[calc(100dvh_-_18rem)] lg:max-h-none lg:overflow-visible lg:!transition-[transform,box-shadow]">
@@ -3569,6 +3785,181 @@ if (showUsernamePrompt) {
               </Card>
             </div>
           )}
+
+          {/* --- Right Column: Chat + Online Users --- */}
+          <div className="order-2 md:order-2 lg:order-4 flex flex-col gap-3 sm:gap-4 lg:h-[calc(100dvh_-_18rem)]">
+            <Card className="card-hover flex max-h-[80dvh] flex-col overflow-hidden lg:flex-1 lg:min-h-0 lg:max-h-none lg:!transition-[transform,box-shadow]">
+              <CardHeader className="flex flex-row items-center justify-between pb-1 sm:pb-2 flex-shrink-0">
+                <CardTitle className="flex items-center gap-2 text-base sm:text-lg">
+                  <MessageSquare className="h-3 w-3 sm:h-4 sm:w-4 text-primary" /> Chat
+                </CardTitle>
+                <span className="flex items-center gap-2 text-xs text-muted-foreground" title={isStreaming ? "Streaming on" : "Streaming off"}>
+                  <span className={`h-2.5 w-2.5 rounded-full ${isStreaming ? "bg-green-500 shadow-[0_0_8px_2px_rgba(34,197,94,0.75)]" : "bg-red-500"}`} />
+                  <span className="sr-only">{isStreaming ? "Streaming on" : "Streaming off"}</span>
+                </span>
+              </CardHeader>
+              <CardContent className="flex min-h-0 flex-1 flex-col space-y-2 overflow-hidden p-3 sm:p-4 lg:max-h-full">
+                <div
+			  className="min-h-0 flex-1 overflow-y-auto pr-2"
+			  ref={chatBoxRef}
+			  style={{ display: "flex", flexDirection: "column" }}
+			>
+			  <div className="space-y-1.5 sm:space-y-2">
+				{Array.isArray(chatMessages) && chatMessages.length > 0 ? (
+				  [...chatMessages].map((msg, idx) => {
+					const isMentioned = new RegExp(`@${username}\\b`, "i").test(msg.message)
+
+					return (
+					  <div
+						key={idx} // Add stable key
+						className={`group text-[11px] sm:text-sm p-1.5 sm:p-2 rounded flex items-start justify-between gap-2 ${
+						  isMentioned ? "mention-highlight-self" : ""
+						}`}
+					  >
+						<div className="flex-1 min-w-0 break-words">
+						  <span
+                className="relative"
+                onMouseEnter={() => setHoveredChatMessage(idx)}
+                onMouseLeave={() => setHoveredChatMessage(null)}
+              >
+                <span style={{ color: msg.rank_color ?? undefined }} className="font-semibold">
+                  {msg.user}:
+                </span>
+                <span className={`absolute bottom-full left-0 z-20 inline-flex items-baseline gap-1 whitespace-nowrap ${hoveredChatMessage === idx ? "pointer-events-auto" : "pointer-events-none"}`}>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className={`h-5 px-1 py-0 text-[10px] transition-opacity ${hoveredChatMessage === idx ? "opacity-100" : "opacity-0"} focus-visible:opacity-100`}
+                    onClick={() => handleUsernameClick(msg.user)}
+                  >
+                    Reply
+                  </Button>
+                  {canInspectUsers && (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      className={`h-5 px-1 py-0 text-[10px] transition-opacity ${hoveredChatMessage === idx ? "opacity-100" : "opacity-0"} focus-visible:opacity-100`}
+                      onClick={() => inspectChatUser(msg.user)}
+                    >
+                      Inspect
+                    </Button>
+                  )}
+                </span>
+              </span>{" "}
+						  <span className="text-foreground break-words">{renderMessageWithEmojis(msg.message, msg.literal_emojis, msg.user)}</span>
+						</div>
+
+            {msg.id && (
+						  <Button
+							variant="ghost"
+							size="icon"
+							className="h-4 w-4 sm:h-5 sm:w-5 flex-shrink-0 opacity-0 group-hover:opacity-100 hover:text-red-500 transition-opacity"
+							onClick={() => deleteMessage(msg.id!)}
+						  >
+							<Trash2 className="h-2.5 w-2.5 sm:h-3 sm:w-3" />
+						  </Button>
+						)}
+					  </div>
+					)
+				  })
+				) : (
+				  <div className="text-center text-muted-foreground text-[10px] sm:text-xs py-4 sm:py-8 flex-1 flex items-center justify-center">
+					No messages yet. Start the conversation!
+				  </div>
+				)}
+			  </div>
+			</div>
+
+                <fieldset
+                  disabled={isChatRestricted}
+                  className={`flex flex-col gap-2 border-0 p-0 ${isChatRestricted ? "opacity-50 grayscale pointer-events-none" : ""}`}
+                >
+                  {showEmojiPanel && (
+                    <div className="relative">
+                      <Card className="absolute bottom-full left-0 right-0 mb-2 z-10 gap-0 py-1">
+                        <CardContent className="p-2">
+                          <div className="flex items-center justify-between mb-2">
+                            <span className="text-xs font-medium">Emojis (A-Z)</span>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              onClick={() => setShowEmojiPanel(false)}
+                              className="h-6 w-6 p-0"
+                            >
+                              <X className="h-3 w-3" />
+                            </Button>
+                          </div>
+                          {assetLoadError && <p role="alert" className="mb-2 text-xs text-destructive">{assetLoadError}</p>}
+<div className="max-h-[108px] overflow-y-auto pr-2 sm:max-h-[116px]">
+  {assetListsLoading ? (
+    <p role="status" className="py-2 text-xs text-muted-foreground">Loading usable emojis...</p>
+  ) : usableEmojis.length > 0 ? (
+    <div
+      aria-label="Usable emojis"
+      data-testid="usable-emoji-picker"
+      className="flex flex-wrap items-start gap-0.5 sm:gap-1 emoji-panel"
+    >
+      {usableEmojis.map((emoji) => (
+        <button
+          key={emoji.asset_id}
+          type="button"
+          onClick={() => insertEmoji(emoji.name)}
+          className="p-0 m-0 flex items-center justify-center"
+          title={emoji.name}
+        >
+          <img src={emoji.url} alt={emoji.name} className="h-5 w-5" />
+        </button>
+      ))}
+    </div>
+  ) : (
+    <p className="py-2 text-xs text-muted-foreground">
+      {assetLoadError ? "Usable emojis are unavailable." : "No usable emojis yet."}
+    </p>
+  )}
+</div>
+
+
+                        </CardContent>
+                      </Card>
+                    </div>
+                  )}
+
+                <div className="flex gap-2">
+                  <Button
+                    variant="outline"
+                    size="icon"
+                    disabled={isChatRestricted}
+                    onClick={() => setShowEmojiPanel(!showEmojiPanel)}
+                    className="h-7 w-7 sm:h-8 sm:w-8"
+                    aria-label={showEmojiPanel ? "Close emoji picker" : "Open emoji picker"}
+                  >
+                    <Smile className="h-3 w-3" />
+                  </Button>
+                  <Input
+                    ref={chatInputRef}
+                    autoComplete="off"
+                    value={chatInput}
+                    onChange={(e) => {
+                      setChatInput(e.target.value)
+                      setChatError("")
+                    }}
+                    onKeyDown={(e) => e.key === "Enter" && sendChatMessage()}
+                    placeholder="Type a message..."
+                    maxLength={100}
+                    disabled={isChatRestricted}
+                    className="flex-1 h-7 sm:h-8 text-xs sm:text-sm"
+                  />
+                  <Button disabled={isChatRestricted} onClick={sendChatMessage} size="icon" className="h-7 w-7 sm:h-8 sm:w-8">
+                    <Send className="h-3 w-3" />
+                  </Button>
+                </div>
+                </fieldset>
+                {chatError && <p role="alert" className="mt-1 text-xs text-destructive">{chatError}</p>}
+              </CardContent>
+            </Card>
+
             {/* Online Users */}
             <Card className="card-hover flex flex-col lg:flex-shrink-0 lg:max-h-[250px] lg:!transition-[transform,box-shadow]">
               <CardHeader
@@ -3582,6 +3973,8 @@ if (showUsernamePrompt) {
                 <Button variant="ghost" size="icon" className="h-5 w-5 sm:h-6 sm:w-6">
                   {showOnlineList ? (
                     <ChevronDown className="h-2.5 w-2.5 sm:h-3 sm:w-3" />
+                  ) : (
+                    <ChevronUp className="h-2.5 w-2.5 sm:h-3 sm:w-3" />
                   )}
                 </Button>
               </CardHeader>
@@ -3615,104 +4008,4 @@ if (showUsernamePrompt) {
       </div>
     </div>
   )
-}                                autoComplete="off"
-                          <label className="block space-y-1 text-xs">
-                            <span>Default play price</span>
-                            <Input
-                              aria-label="Default sound play price"
-                              type="number"
-                              min={0}
-                              step={1}
-                              value={pointPricing.catalog.sound.play_default}
-                              onChange={(event) => updateSoundPlayDefault(event.target.valueAsNumber)}
-                              className="[appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
-                            />
-                          </label>
-
-                          <details className="rounded-md border px-3 py-2">
-                            <summary className="cursor-pointer text-xs font-medium">
-                              Play exceptions ({Object.keys(pointPricing.catalog.sound.play_items).length})
-                            </summary>
-                            <div className="space-y-2 pt-2">
-                              <form
-                                autoComplete="off"
-                                className="flex flex-col gap-2"
-                                onSubmit={(event) => {
-                                  event.preventDefault()
-                                  const item = newSoundPlayItem.trim()
-                                  const rawPrice = newSoundPlayItemPrice
-                                  const price = /^\d+$/.test(rawPrice) ? Number(rawPrice) : NaN
-                                  if (
-                                    !item ||
-                                    Object.prototype.hasOwnProperty.call(pointPricing.catalog.sound.play_items, item) ||
-                                    !Number.isSafeInteger(price)
-                                  ) {
-                                    setPricingError("Enter a sound filename and a non-negative whole-number play price.")
-                                    return
-                                  }
-                                  updateSoundPlayItemPrice(item, price)
-                                  setNewSoundPlayItem("")
-                                  setNewSoundPlayItemPrice("")
-                                }}
-                              >
-                                <Input
-                                  value={newSoundPlayItem}
-                                  onChange={(event) => setNewSoundPlayItem(event.target.value)}
-                                  placeholder="Sound filename (e.g. 21.mp3)"
-                                  aria-label="New sound play exception filename"
-                                  className="w-full"
-                                />
-                                <div className="flex items-center gap-2">
-                                  <Input
-                                    type="number"
-                                    min={0}
-                                    step={1}
-                                    value={newSoundPlayItemPrice}
-                                    placeholder={String(pointPricing.catalog.sound.play_default)}
-                                    onChange={(event) => setNewSoundPlayItemPrice(event.target.value)}
-                                    aria-label="New sound play exception price"
-                                    className="w-full [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
-                                  />
-                                  <Button type="submit" variant="outline">Add</Button>
-                                </div>
-                              </form>
-                              {Object.entries(pointPricing.catalog.sound.play_items).map(([item, price]) => (
-                                <div key={item} className="flex items-center gap-2">
-                                  <span className="min-w-0 flex-1 truncate text-xs">{item}</span>
-                                  <Input
-                                    aria-label={`${item} sound play price`}
-                                    type="number"
-                                    min={0}
-                                    step={1}
-                                    value={editedCatalogPrices[`sound-play:${item}`] ?? String(price)}
-                                    onChange={(event) => updateEditedSoundPlayItemPrice(item, event.target.value)}
-                                    className="w-24 [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
-                                  />
-                                  <Button
-                                    type="button"
-                                    variant="ghost"
-                                    size="icon"
-                                    aria-label={`Remove ${item} sound play exception`}
-                                    onClick={() => removeSoundPlayItemPrice(item)}
-                                  >
-                                    <Trash2 className="h-3 w-3" />
-                                  </Button>
-                                </div>
-                              ))}
-                            </div>
-                          </details>
-
-                  {permission("admin_console") && (
-                    <TabsContent value="soundboard" className="mt-0 lg:flex-1 lg:min-h-0 lg:overflow-y-auto lg:pr-3">
-                      {renderAdminAssetManagement("sound")}
-                    </TabsContent>
-                  )}
-                  {permission("admin_console") && (
-                    <TabsContent value="emoji" className="mt-0 lg:flex-1 lg:min-h-0 lg:overflow-y-auto lg:pr-3">
-                      {renderAdminAssetManagement("emoji")}
-                    </TabsContent>
-                  )}
-                    aria-label={showEmojiPanel ? "Close emoji picker" : "Open emoji picker"}
-                {chatError && <p role="alert" className="mt-1 text-xs text-destructive">{chatError}</p>}
-                  ) : (
-                    <ChevronUp className="h-2.5 w-2.5 sm:h-3 sm:w-3" />
+}

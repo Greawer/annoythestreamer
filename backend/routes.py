@@ -34,6 +34,7 @@ import re
 import uuid
 import copy
 import hashlib
+import secrets
 import tempfile
 import ipaddress
 import http.client
@@ -42,8 +43,8 @@ import socket
 import urllib.parse
 from collections import deque
 from mutagen import File as MutagenFile
-
 from werkzeug.datastructures import FileStorage
+
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
@@ -55,8 +56,9 @@ ACTION_COSTS = {
     'tts': 5,
 }
 MAX_POINT_PRICE = 9_007_199_254_740_991
-POINT_PRICING_ID = 'point_pricing'
+PASSWORD_RESET_TOKEN_TTL = timedelta(minutes=30)
 ASSET_PRICE_UNCHANGED = object()
+POINT_PRICING_ID = 'point_pricing'
 DEFAULT_POINT_PRICING = {
     'send_your_chaos': dict(ACTION_COSTS),
     'catalog': {
@@ -320,8 +322,6 @@ def validate_price_map(value, label, allow_filename=False):
     return normalized
 
 
-def validate_point_pricing(value):
-    if not isinstance(value, dict):
 def validate_play_price(value, label):
     if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MAX_POINT_PRICE:
         raise ValueError(f'{label} must be a whole number from 0 to {MAX_POINT_PRICE}')
@@ -350,6 +350,8 @@ def validate_play_price_map(value, label, allow_filename=False):
     return normalized
 
 
+def validate_point_pricing(value):
+    if not isinstance(value, dict):
         raise ValueError('Pricing must be an object')
     required_sections = {'send_your_chaos', 'catalog', 'proposal_rewards'}
     if not required_sections.issubset(value) or set(value) - required_sections - {'asset_limits'}:
@@ -388,8 +390,6 @@ def validate_play_price_map(value, label, allow_filename=False):
                 allow_filename=asset_type == 'sound',
             ),
         }
-
-    proposals = value['proposal_rewards']
         if asset_type == 'sound':
             normalized_catalog[asset_type].update({
                 'play_default': validate_play_price(
@@ -402,6 +402,8 @@ def validate_play_price_map(value, label, allow_filename=False):
                     allow_filename=True,
                 ),
             })
+
+    proposals = value['proposal_rewards']
     if not isinstance(proposals, dict) or set(proposals) != {'sound', 'emoji'}:
         raise ValueError('Proposal rewards must include sound and emoji')
     normalized_proposals = {}
@@ -414,18 +416,16 @@ def validate_play_price_map(value, label, allow_filename=False):
             raise ValueError(f'{proposal_type} proposal prices must include default, exclusive, and items')
         normalized_proposals[proposal_type] = {
             'default': validate_price(rewards['default'], f'{proposal_type} proposal reward'),
-            'items': validate_price_map(
-                rewards['items'],
             'exclusive': validate_price(
                 rewards.get('exclusive', DEFAULT_POINT_PRICING['proposal_rewards'][proposal_type]['exclusive']),
                 f'{proposal_type} exclusive submission price',
             ),
+            'items': validate_price_map(
+                rewards['items'],
                 f'{proposal_type} proposal item',
             ),
         }
 
-    return {
-        'send_your_chaos': normalized_chaos,
     limits = value.get('asset_limits', DEFAULT_POINT_PRICING['asset_limits'])
     if not isinstance(limits, dict) or set(limits) != {'emoji', 'sound'}:
         raise ValueError('Asset limits must include emoji and sound')
@@ -445,11 +445,13 @@ def validate_play_price_map(value, label, allow_filename=False):
                 raise ValueError(f'{asset_type} {field} must be a positive whole number no greater than {maximum}')
             normalized_limits[asset_type][field] = limit
 
+    return {
+        'send_your_chaos': normalized_chaos,
         'catalog': normalized_catalog,
         'proposal_rewards': normalized_proposals,
+        'asset_limits': normalized_limits,
     }
 
-        'asset_limits': normalized_limits,
 
 def load_point_pricing():
     document = colpricing.find_one({'_id': POINT_PRICING_ID})
@@ -461,8 +463,6 @@ def load_point_pricing():
     except ValueError as error:
         logger.error('Stored point pricing is invalid: %s', error)
         raise ValueError('Stored point pricing is invalid; an administrator must correct it') from error
-
-
     if isinstance(pricing, dict):
         if 'asset_limits' not in pricing:
             colpricing.update_one(
@@ -504,6 +504,8 @@ def resolve_catalog_asset_price(asset_type, asset, pricing=None):
     if item_key is not None:
         return settings['catalog'][asset_type]['items'][item_key]
     return settings['catalog'][asset_type]['default']
+
+
 def resolve_catalog_price(asset_type, item_id=None, category=None, pricing=None):
     settings = pricing if pricing is not None else load_point_pricing()
     catalog = settings['catalog'].get(asset_type)
@@ -516,8 +518,6 @@ def resolve_catalog_price(asset_type, item_id=None, category=None, pricing=None)
     return catalog['default']
 
 
-def resolve_proposal_reward(proposal_type, item_id=None, pricing=None):
-    settings = pricing if pricing is not None else load_point_pricing()
 def resolve_sound_play_price(asset, pricing):
     sound_pricing = pricing['catalog']['sound']
     item_key = catalog_asset_exception_key('sound', asset, pricing, 'play_items')
@@ -1335,6 +1335,8 @@ def _finish_catalog_purchase(purchase, account, socketio=None):
     }, 200
 
 
+def resolve_proposal_reward(proposal_type, item_id=None, pricing=None):
+    settings = pricing if pricing is not None else load_point_pricing()
     rewards = settings['proposal_rewards'].get(proposal_type)
     if rewards is None:
         raise ValueError(f'Unsupported proposal type: {proposal_type}')
@@ -1858,9 +1860,9 @@ def registersocketiohandlers(socketio: SocketIO):
             return {'status': 'error', 'message': 'Login required'}
 
         request_id = normalize_request_id(data.get('request_id'))
+        asset_id = data.get('asset_id')
         sound_name = data.get('file')
         if not request_id:
-        asset_id = data.get('asset_id')
             return {'status': 'error', 'message': 'A valid request ID is required'}
         if isinstance(asset_id, str) and ObjectId.is_valid(asset_id):
             asset = colsounds.find_one({'_id': ObjectId(asset_id)})
@@ -1912,13 +1914,13 @@ def registersocketiohandlers(socketio: SocketIO):
                 'timestamp': datetime.now(timezone.utc),
             },
             socketio,
-        )
-        if status != 200 or result.get('duplicate'):
             point_cost_override=get_action_cost(
                 'soundmeme',
                 account,
                 sound_asset=asset,
             ),
+        )
+        if status != 200 or result.get('duplicate'):
             return result
         try:
             socketio.emit(
@@ -1973,8 +1975,6 @@ def registersocketiohandlers(socketio: SocketIO):
             if active_chat_timeout_until(account):
                 logger.info("Blocked chat message from timed-out user %s", user)
                 return
-            rank = account.get('rank', 'User')
-            color = get_rank_color(rank)
             literal_emojis = []
             for emoji_name in set(re.findall(r':(\w+):', message)):
                 emoji = colemojis.find_one({'name': emoji_name})
@@ -1984,12 +1984,14 @@ def registersocketiohandlers(socketio: SocketIO):
                     or (is_unregistered_asset and not has_permission(account, 'admin_console'))
                 ):
                     literal_emojis.append(emoji_name)
+            rank = account.get('rank', 'User')
+            color = get_rank_color(rank)
             msgobj = {
                 'user': user,
                 'message': message,
+                'literal_emojis': literal_emojis,
                 'rank': rank,
                 'rank_color': color,
-                'literal_emojis': literal_emojis,
                 'timestamp': datetime.now(timezone.utc)
             }
             try:
@@ -2203,6 +2205,22 @@ def registerroutes(app, socketio: SocketIO):
             'requires_password_creation': not user or not user.get('password_hash'),
         })
 
+    def complete_authentication(user):
+        session.clear()
+        session['user_id'] = str(user['_id'])
+        permissions = public_role_permissions(user)
+        capabilities = permissions.get('capabilities', {}) if permissions else {}
+        if capabilities.get('panel_access') is True:
+            session['admin_user_id'] = str(user['_id'])
+        return {
+            'status': 'ok',
+            'username': user['username'],
+            'rank': user.get('rank', 'User'),
+            'points': user.get('points', 0),
+            'permissions': permissions,
+            **public_usage_cost_fields(user),
+        }
+
     @app.route('/auth/login', methods=['POST'])
     def authlogin():
         data = request.get_json(silent=True) or {}
@@ -2215,6 +2233,14 @@ def registerroutes(app, socketio: SocketIO):
             return jsonify({'message': 'Enter a valid password'}), 400
         username = username.strip()
         user = colusers.find_one({'username': username})
+        is_registration = (
+            data.get('intent') == 'register'
+            or ('email' in data and 'confirmation' in data)
+        )
+        if user and user.get('password_reset_token_hash'):
+            return jsonify({'message': 'Incorrect username or password'}), 401
+        if not is_registration and (not user or not user.get('password_hash')):
+            return jsonify({'message': 'Incorrect username or password'}), 401
         created_account = False
         if not user or not user.get('password_hash'):
             if password != confirmation:
@@ -2236,6 +2262,14 @@ def registerroutes(app, socketio: SocketIO):
                     'banned': False,
                     'registered_at': datetime.now(timezone.utc),
                 }
+                stream_state = colsettings.find_one({'_id': 'stream_points'})
+                started_at = stream_state.get('stream_started_at') if stream_state else None
+                if stream_state and stream_state.get('streaming') is True and isinstance(started_at, datetime):
+                    if started_at.tzinfo is None:
+                        started_at = started_at.replace(tzinfo=timezone.utc)
+                    interval = max(0, int((datetime.now(timezone.utc) - started_at).total_seconds() // 60))
+                    document['last_stream_award_started_at'] = started_at
+                    document['last_stream_award_interval'] = interval
                 try:
                     inserted = colusers.insert_one(document)
                     user = colusers.find_one({'_id': inserted.inserted_id})
@@ -2264,21 +2298,95 @@ def registerroutes(app, socketio: SocketIO):
                 user.get('points', 0),
                 user.get('points', 0),
             )
-        session.clear()
-        session['user_id'] = str(user['_id'])
-        permissions = public_role_permissions(user)
-        capabilities = permissions.get('capabilities', {}) if permissions else {}
-        if capabilities.get('panel_access') is True:
-            session['admin_user_id'] = str(user['_id'])
-        response = {
-            'status': 'ok',
-            'username': username,
-            'rank': user.get('rank', 'User'),
-            'points': user.get('points', 0),
-            'permissions': permissions,
-            **public_usage_cost_fields(user),
+        return jsonify(complete_authentication(user))
+
+    @app.route('/auth/password-reset', methods=['POST'])
+    def authpasswordreset():
+        data = request.get_json(silent=True) or {}
+        username = data.get('username')
+        reset_token = data.get('reset_token')
+        password = data.get('password')
+        confirmation = data.get('confirmation')
+        action = data.get('action')
+        if username is not None and (
+            not isinstance(username, str) or not username.strip() or len(username.strip()) > 64
+        ):
+            return jsonify({'message': 'Enter a valid username'}), 400
+        if action not in (None, 'verify'):
+            return jsonify({'message': 'Invalid password reset request'}), 400
+        verification_only = action == 'verify'
+        if not verification_only and (
+            not isinstance(password, str)
+            or len(password) < 8
+            or len(password) > 256
+            or password != confirmation
+        ):
+            return jsonify({'message': 'Enter matching passwords of at least 8 characters'}), 400
+        if not isinstance(reset_token, str) or not reset_token or len(reset_token) > 256:
+            return jsonify({'message': 'Invalid or expired password reset token'}), 401
+
+        token_lookup = hashlib.sha256(reset_token.encode('utf-8')).hexdigest()
+        user = colusers.find_one({'password_reset_token_lookup': token_lookup})
+        if user is None:
+            for candidate in colusers.find({
+                'password_hash': None,
+                'password_reset_token_hash': {'$exists': True},
+            }):
+                candidate_hash = candidate.get('password_reset_token_hash')
+                if isinstance(candidate_hash, str) and check_password_hash(candidate_hash, reset_token):
+                    user = candidate
+                    break
+        if user is None and isinstance(username, str):
+            user = colusers.find_one({'username': username.strip()})
+        token_hash = user.get('password_reset_token_hash') if user else None
+        expires_at = user.get('password_reset_token_expires_at') if user else None
+        if isinstance(expires_at, datetime) and expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if (
+            not user
+            or user.get('password_hash')
+            or not isinstance(token_hash, str)
+            or not isinstance(expires_at, datetime)
+            or expires_at <= datetime.now(timezone.utc)
+            or not check_password_hash(token_hash, reset_token)
+        ):
+            return jsonify({'message': 'Invalid or expired password reset token'}), 401
+
+        if verification_only:
+            return jsonify({
+                'status': 'verified',
+                'username': user['username'],
+                'email': user.get('email'),
+            })
+
+        new_password_hash = generate_password_hash(password)
+        reset_query = {
+            '_id': user['_id'],
+            'password_hash': None,
+            'password_reset_token_hash': token_hash,
+            'password_reset_token_expires_at': user['password_reset_token_expires_at'],
         }
-        return jsonify(response)
+        if user.get('password_reset_token_lookup'):
+            reset_query['password_reset_token_lookup'] = token_lookup
+        changed = colusers.update_one(
+            reset_query,
+            {
+                '$set': {'password_hash': new_password_hash},
+                '$unset': {
+                    'password_reset_token_hash': '',
+                    'password_reset_token_lookup': '',
+                    'password_reset_token_expires_at': '',
+                },
+            },
+        )
+        if changed.matched_count != 1:
+            return jsonify({'message': 'Invalid or expired password reset token'}), 401
+
+        user['password_hash'] = new_password_hash
+        user.pop('password_reset_token_hash', None)
+        user.pop('password_reset_token_lookup', None)
+        user.pop('password_reset_token_expires_at', None)
+        return jsonify(complete_authentication(user))
 
     @app.route('/auth/session')
     def authsession():
@@ -2400,114 +2508,6 @@ def registerroutes(app, socketio: SocketIO):
             socketio.emit('usage_costs_changed')
         return jsonify({'pricing': pricing})
 
-    @app.route('/admin/logout', methods=['POST'])
-    def adminlogout():
-        session.clear()
-        return jsonify({'status': 'ok'})
-
-    @app.route('/admin/users/<username>')
-    @require_login
-    def admingetuser(username):
-        session_user = get_session_user()
-        if not has_permission(session_user, 'inspect_users') and (
-            not session_user or session_user.get('username') != username
-        ):
-            return jsonify({'message': 'Moderator or admin login required'}), 403
-        user = colusers.find_one({'username': username})
-        if not user:
-            return jsonify({'message': 'User not found'}), 404
-        return jsonify({'user': serialize_user(user)})
-
-    @app.route('/admin/users/<username>/points', methods=['POST'])
-    @require_login
-    def adminadjustpoints(username):
-        if not get_admin_user('adjust_points'):
-            return jsonify({'message': 'Admin login required'}), 403
-        data = request.get_json(silent=True) or {}
-        amount = data.get('amount')
-        if isinstance(amount, bool) or not isinstance(amount, int):
-            return jsonify({'message': 'Point adjustment must be an integer'}), 400
-        request_id = normalize_request_id(data.get('request_id'))
-        if not request_id:
-            return jsonify({'message': 'A valid request ID is required'}), 400
-        timestamp = datetime.now(timezone.utc)
-        next_balance = {'$max': [0, {'$add': [{'$ifNull': ['$points', 0]}, amount]}]}
-        actual_delta = {
-            '$let': {
-                'vars': {
-                    'previous': {'$ifNull': ['$points', 0]},
-                    'next': next_balance,
-                },
-                'in': {'$subtract': ['$$next', '$$previous']},
-            },
-        }
-        adjustment_record = {
-            'request_id': request_id,
-            'requested_amount': amount,
-            'amount': actual_delta,
-            'balance_after': next_balance,
-            'timestamp': timestamp,
-        }
-        user = colusers.find_one_and_update(
-            {'username': username, 'point_adjustment_ids': {'$ne': request_id}},
-            [{
-                '$set': {
-                    'points': next_balance,
-                    'point_adjustment_ids': {
-                        '$concatArrays': [{'$ifNull': ['$point_adjustment_ids', []]}, [request_id]],
-                    },
-                    'point_adjustment_records': {
-                        '$concatArrays': [
-                            {'$ifNull': ['$point_adjustment_records', []]},
-                            [adjustment_record],
-                        ],
-                    },
-                    'pending_point_transactions': {
-                        '$concatArrays': [
-                            {'$ifNull': ['$pending_point_transactions', []]},
-                            [{
-                                'request_id': request_id,
-                                'action_type': 'admin_adjustment',
-                                'amount': actual_delta,
-                                'balance_after': next_balance,
-                                'requested_amount': amount,
-                                'actor_user_id': ObjectId(session['user_id']),
-                                'timestamp': timestamp,
-                            }],
-                        ],
-                    },
-                },
-            }],
-            return_document=ReturnDocument.AFTER,
-        )
-        applied = user is not None
-        if not user:
-            user = colusers.find_one({'username': username})
-            if not user:
-                return jsonify({'message': 'User not found'}), 404
-            if request_id not in user.get('point_adjustment_ids', []):
-                return jsonify({'message': 'Point adjustment could not be applied'}), 409
-        adjustment = next(
-            (
-                item for item in user.get('point_adjustment_records', [])
-                if item.get('request_id') == request_id
-            ),
-            None,
-        )
-        if adjustment:
-            try:
-                if user.get('pending_point_transactions'):
-                    flush_pending_point_transactions(user)
-                else:
-                    record_point_transaction(
-                        user['_id'],
-                        request_id,
-                        'admin_adjustment',
-                        adjustment['amount'],
-                        adjustment['balance_after'],
-                        requested_amount=adjustment['requested_amount'],
-                        actor_user_id=ObjectId(session['user_id']),
-                        timestamp=adjustment.get('timestamp', timestamp),
     @app.route('/admin/assets/<asset_type>', methods=['GET', 'POST'])
     @require_login
     def adminassets(asset_type):
@@ -2812,6 +2812,114 @@ def registerroutes(app, socketio: SocketIO):
                     os.replace(staged_path, old_path)
             return jsonify({'message': 'Asset could not be updated'}), 503
 
+    @app.route('/admin/logout', methods=['POST'])
+    def adminlogout():
+        session.clear()
+        return jsonify({'status': 'ok'})
+
+    @app.route('/admin/users/<username>')
+    @require_login
+    def admingetuser(username):
+        session_user = get_session_user()
+        if not has_permission(session_user, 'inspect_users') and (
+            not session_user or session_user.get('username') != username
+        ):
+            return jsonify({'message': 'Moderator or admin login required'}), 403
+        user = colusers.find_one({'username': username})
+        if not user:
+            return jsonify({'message': 'User not found'}), 404
+        return jsonify({'user': serialize_user(user)})
+
+    @app.route('/admin/users/<username>/points', methods=['POST'])
+    @require_login
+    def adminadjustpoints(username):
+        if not get_admin_user('adjust_points'):
+            return jsonify({'message': 'Admin login required'}), 403
+        data = request.get_json(silent=True) or {}
+        amount = data.get('amount')
+        if isinstance(amount, bool) or not isinstance(amount, int):
+            return jsonify({'message': 'Point adjustment must be an integer'}), 400
+        request_id = normalize_request_id(data.get('request_id'))
+        if not request_id:
+            return jsonify({'message': 'A valid request ID is required'}), 400
+        timestamp = datetime.now(timezone.utc)
+        next_balance = {'$max': [0, {'$add': [{'$ifNull': ['$points', 0]}, amount]}]}
+        actual_delta = {
+            '$let': {
+                'vars': {
+                    'previous': {'$ifNull': ['$points', 0]},
+                    'next': next_balance,
+                },
+                'in': {'$subtract': ['$$next', '$$previous']},
+            },
+        }
+        adjustment_record = {
+            'request_id': request_id,
+            'requested_amount': amount,
+            'amount': actual_delta,
+            'balance_after': next_balance,
+            'timestamp': timestamp,
+        }
+        user = colusers.find_one_and_update(
+            {'username': username, 'point_adjustment_ids': {'$ne': request_id}},
+            [{
+                '$set': {
+                    'points': next_balance,
+                    'point_adjustment_ids': {
+                        '$concatArrays': [{'$ifNull': ['$point_adjustment_ids', []]}, [request_id]],
+                    },
+                    'point_adjustment_records': {
+                        '$concatArrays': [
+                            {'$ifNull': ['$point_adjustment_records', []]},
+                            [adjustment_record],
+                        ],
+                    },
+                    'pending_point_transactions': {
+                        '$concatArrays': [
+                            {'$ifNull': ['$pending_point_transactions', []]},
+                            [{
+                                'request_id': request_id,
+                                'action_type': 'admin_adjustment',
+                                'amount': actual_delta,
+                                'balance_after': next_balance,
+                                'requested_amount': amount,
+                                'actor_user_id': ObjectId(session['user_id']),
+                                'timestamp': timestamp,
+                            }],
+                        ],
+                    },
+                },
+            }],
+            return_document=ReturnDocument.AFTER,
+        )
+        applied = user is not None
+        if not user:
+            user = colusers.find_one({'username': username})
+            if not user:
+                return jsonify({'message': 'User not found'}), 404
+            if request_id not in user.get('point_adjustment_ids', []):
+                return jsonify({'message': 'Point adjustment could not be applied'}), 409
+        adjustment = next(
+            (
+                item for item in user.get('point_adjustment_records', [])
+                if item.get('request_id') == request_id
+            ),
+            None,
+        )
+        if adjustment:
+            try:
+                if user.get('pending_point_transactions'):
+                    flush_pending_point_transactions(user)
+                else:
+                    record_point_transaction(
+                        user['_id'],
+                        request_id,
+                        'admin_adjustment',
+                        adjustment['amount'],
+                        adjustment['balance_after'],
+                        requested_amount=adjustment['requested_amount'],
+                        actor_user_id=ObjectId(session['user_id']),
+                        timestamp=adjustment.get('timestamp', timestamp),
                     )
             except Exception:
                 logger.exception("Admin point adjustment transaction remains pending for %s", request_id)
@@ -2927,11 +3035,25 @@ def registerroutes(app, socketio: SocketIO):
     def adminresetpassword(username):
         if not get_admin_user('reset_password'):
             return jsonify({'message': 'Admin login required'}), 403
-        result = colusers.update_one({'username': username}, {'$set': {'password_hash': None}})
+        reset_token = secrets.token_urlsafe(32)
+        expires_at = datetime.now(timezone.utc) + PASSWORD_RESET_TOKEN_TTL
+        result = colusers.update_one(
+            {'username': username},
+            {'$set': {
+                'password_hash': None,
+                'password_reset_token_hash': generate_password_hash(reset_token),
+                'password_reset_token_lookup': hashlib.sha256(reset_token.encode('utf-8')).hexdigest(),
+                'password_reset_token_expires_at': expires_at,
+            }},
+        )
         if result.matched_count == 0:
             return jsonify({'message': 'User not found'}), 404
         user = colusers.find_one({'username': username})
-        return jsonify({'user': serialize_user(user)})
+        return jsonify({
+            'user': serialize_user(user),
+            'reset_token': reset_token,
+            'reset_token_expires_at': expires_at.isoformat(),
+        })
 
     # MEME NEXT ROUTES
     @app.route('/facememe/next', methods=['GET', 'POST', 'OPTIONS', 'PUT'])
@@ -3090,93 +3212,7 @@ def registerroutes(app, socketio: SocketIO):
             return jsonify(emojis)
         return jsonify([])
 
-    @app.route('/soundboardlist')
-    def soundboardlist():
-        account = get_session_user()
-        try:
-            pricing = load_point_pricing()
-            assets = list_usable_assets(account, 'sound')
-            favorite_documents = list(colsoundfavorites.find({'user_id': account['_id']}))
-            def favorite_added_order(item):
-                created_at = item.get('created_at')
-                if not isinstance(created_at, datetime):
-                    created_at = datetime.min.replace(tzinfo=timezone.utc)
-                elif created_at.tzinfo is None:
-                    created_at = created_at.replace(tzinfo=timezone.utc)
-                else:
-                    created_at = created_at.astimezone(timezone.utc)
-                return created_at, str(item.get('_id', ''))
-
-            favorite_documents.sort(key=favorite_added_order)
-            favorite_order = {
-                str(item['asset_id']): position
-                for position, item in enumerate(favorite_documents)
-            }
-            assets.sort(key=lambda asset: (
-                (0, favorite_order[str(asset['_id'])])
-                if str(asset['_id']) in favorite_order
-                else (
-                    1,
-                    str(asset.get('display_name') or asset['name']).casefold(),
-                    asset['name'].casefold(),
-                )
-            ))
-            result = []
-            for asset in assets:
-                item = serialize_asset(asset, 'sound', pricing)
-                item['favorite'] = str(asset['_id']) in favorite_order
-                item['play_cost'] = get_action_cost(
-                    'soundmeme',
-                    account,
-                    sound_asset=asset,
-                    pricing=pricing,
-                )
-                result.append(item)
-            return jsonify(result)
-        except ValueError as error:
-            return jsonify({'message': str(error)}), 503
-        except Exception:
-            logger.exception("Could not load usable sounds for account %s", account.get('_id'))
-            return jsonify({'message': 'Usable sounds could not be loaded'}), 503
-
-    @app.route('/soundboard/favorites', methods=['POST'])
-    @require_login
-    def soundboardfavorites():
-        account = get_session_user()
-        data = request.get_json(silent=True)
-        if not isinstance(data, dict):
-            return jsonify({'message': 'Request body must be an object'}), 400
-        asset_id = data.get('asset_id')
-        favorite = data.get('favorite')
-        if not isinstance(asset_id, str) or not ObjectId.is_valid(asset_id):
-            return jsonify({'message': 'Select a valid sound'}), 400
-        if not isinstance(favorite, bool):
-            return jsonify({'message': 'Favorite must be true or false'}), 400
-        try:
-            asset = colsounds.find_one({'_id': ObjectId(asset_id)})
-            if not asset:
-                return jsonify({'message': 'Sound is no longer available'}), 404
-            if not can_use_asset(account, 'sound', asset):
-                return jsonify({'message': 'You do not own this sound'}), 403
-            favorite_query = {'user_id': account['_id'], 'asset_id': asset['_id']}
-            if favorite:
-                try:
-                    colsoundfavorites.insert_one({
-                        **favorite_query,
-                        'created_at': datetime.now(timezone.utc),
-                    })
-                except DuplicateKeyError:
-                    pass
-            else:
-                colsoundfavorites.delete_one(favorite_query)
-            return jsonify({'favorite': favorite})
-        except Exception:
-            logger.exception("Could not update sound favorite for account %s", account.get('_id'))
-            return jsonify({'message': 'Sound favorite could not be updated'}), 503
-
-    @app.route('/debug/routes')
-    def debugroutes():
-        return jsonify([f"{rule.rule} {rule.methods}" for rule in app.url_map.iter_rules()])    @app.route('/public-emojis')
+    @app.route('/public-emojis')
     def publicemojis():
         if not os.path.isdir(EMOJIDIR):
             return jsonify([])
@@ -3586,4 +3622,91 @@ def registerroutes(app, socketio: SocketIO):
             if temp_path and os.path.exists(temp_path):
                 os.remove(temp_path)
 
+    @app.route('/soundboardlist')
     @require_login
+    def soundboardlist():
+        account = get_session_user()
+        try:
+            pricing = load_point_pricing()
+            assets = list_usable_assets(account, 'sound')
+            favorite_documents = list(colsoundfavorites.find({'user_id': account['_id']}))
+            def favorite_added_order(item):
+                created_at = item.get('created_at')
+                if not isinstance(created_at, datetime):
+                    created_at = datetime.min.replace(tzinfo=timezone.utc)
+                elif created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=timezone.utc)
+                else:
+                    created_at = created_at.astimezone(timezone.utc)
+                return created_at, str(item.get('_id', ''))
+
+            favorite_documents.sort(key=favorite_added_order)
+            favorite_order = {
+                str(item['asset_id']): position
+                for position, item in enumerate(favorite_documents)
+            }
+            assets.sort(key=lambda asset: (
+                (0, favorite_order[str(asset['_id'])])
+                if str(asset['_id']) in favorite_order
+                else (
+                    1,
+                    str(asset.get('display_name') or asset['name']).casefold(),
+                    asset['name'].casefold(),
+                )
+            ))
+            result = []
+            for asset in assets:
+                item = serialize_asset(asset, 'sound', pricing)
+                item['favorite'] = str(asset['_id']) in favorite_order
+                item['play_cost'] = get_action_cost(
+                    'soundmeme',
+                    account,
+                    sound_asset=asset,
+                    pricing=pricing,
+                )
+                result.append(item)
+            return jsonify(result)
+        except ValueError as error:
+            return jsonify({'message': str(error)}), 503
+        except Exception:
+            logger.exception("Could not load usable sounds for account %s", account.get('_id'))
+            return jsonify({'message': 'Usable sounds could not be loaded'}), 503
+
+    @app.route('/soundboard/favorites', methods=['POST'])
+    @require_login
+    def soundboardfavorites():
+        account = get_session_user()
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({'message': 'Request body must be an object'}), 400
+        asset_id = data.get('asset_id')
+        favorite = data.get('favorite')
+        if not isinstance(asset_id, str) or not ObjectId.is_valid(asset_id):
+            return jsonify({'message': 'Select a valid sound'}), 400
+        if not isinstance(favorite, bool):
+            return jsonify({'message': 'Favorite must be true or false'}), 400
+        try:
+            asset = colsounds.find_one({'_id': ObjectId(asset_id)})
+            if not asset:
+                return jsonify({'message': 'Sound is no longer available'}), 404
+            if not can_use_asset(account, 'sound', asset):
+                return jsonify({'message': 'You do not own this sound'}), 403
+            favorite_query = {'user_id': account['_id'], 'asset_id': asset['_id']}
+            if favorite:
+                try:
+                    colsoundfavorites.insert_one({
+                        **favorite_query,
+                        'created_at': datetime.now(timezone.utc),
+                    })
+                except DuplicateKeyError:
+                    pass
+            else:
+                colsoundfavorites.delete_one(favorite_query)
+            return jsonify({'favorite': favorite})
+        except Exception:
+            logger.exception("Could not update sound favorite for account %s", account.get('_id'))
+            return jsonify({'message': 'Sound favorite could not be updated'}), 503
+
+    @app.route('/debug/routes')
+    def debugroutes():
+        return jsonify([f"{rule.rule} {rule.methods}" for rule in app.url_map.iter_rules()])

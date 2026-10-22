@@ -1,5 +1,6 @@
 import sys
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -24,12 +25,15 @@ class RegistrationEmailTests(unittest.TestCase):
         self.permissions = Mock()
         self.pricing = Mock()
         self.pricing.find_one.return_value = None
+        self.settings = Mock()
+        self.settings.find_one.return_value = None
         self.chat = Mock()
         self.patches = [
             patch.object(routes, "colusers", self.users),
             patch.object(routes, "colranks", self.ranks),
             patch.object(routes, "colpermissions", self.permissions),
             patch.object(routes, "colpricing", self.pricing),
+            patch.object(routes, "colsettings", self.settings),
             patch.object(routes, "colchat", self.chat),
             patch.object(routes, "colpointtransactions", Mock()),
         ]
@@ -102,6 +106,57 @@ class RegistrationEmailTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.users.insert_one.assert_not_called()
 
+    def test_unknown_login_does_not_create_an_account(self):
+        self.users.find_one.return_value = None
+
+        response = self.client.post(
+            "/auth/login",
+            json={"username": "unknown-user", "password": "password123"},
+        )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.get_json()["message"], "Incorrect username or password")
+        self.users.insert_one.assert_not_called()
+        routes.colpointtransactions.update_one.assert_not_called()
+
+    def test_empty_password_login_is_not_a_password_reset_or_registration(self):
+        response = self.client.post(
+            "/auth/login",
+            json={"username": "existing-user", "password": ""},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json()["message"], "Enter a valid password")
+        self.users.insert_one.assert_not_called()
+        routes.colpointtransactions.update_one.assert_not_called()
+
+    def test_registration_during_stream_waits_for_next_stream_interval(self):
+        user_id = ObjectId()
+        account = {"_id": user_id, "username": "new-user", "rank": "User", "points": 1000}
+        started_at = datetime.now(timezone.utc) - timedelta(minutes=3)
+        self.settings.find_one.return_value = {
+            "_id": "stream_points",
+            "streaming": True,
+            "stream_started_at": started_at,
+        }
+        self.users.find_one.side_effect = [None, account]
+        self.users.insert_one.return_value = SimpleNamespace(inserted_id=user_id)
+        self.users.find_one_and_update.return_value = None
+        self.ranks.find_one.return_value = {"rank": "User"}
+
+        response = self.client.post("/auth/login", json=self._registration_payload())
+        document = self.users.insert_one.call_args.args[0]
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(document["last_stream_award_started_at"], started_at)
+        self.assertEqual(document["last_stream_award_interval"], 3)
+        with patch.object(routes, "onlineusers", {"new-user"}):
+            self.assertEqual(routes.award_stream_points(), 0)
+        self.assertEqual(
+            routes.colpointtransactions.update_one.call_args.args[1]["$setOnInsert"]["action_type"],
+            "registration_award",
+        )
+
     def test_existing_password_login_does_not_require_or_change_email(self):
         user_id = ObjectId()
         account = {
@@ -120,6 +175,7 @@ class RegistrationEmailTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.users.insert_one.assert_not_called()
         self.users.update_one.assert_not_called()
+        routes.colpointtransactions.update_one.assert_not_called()
 
     def test_passwordless_existing_account_receives_email_without_other_changes(self):
         user_id = ObjectId()

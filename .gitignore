@@ -40,6 +40,7 @@ env/
 # User-provided emoji images
 /public/img/emoji/*.png
 /public/img/emoji/*.jpg
+/public/img/emoji/*.jpeg
 !/public/img/emoji/.gitkeep
 
 # User-provided soundboard audio

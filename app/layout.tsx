@@ -14,7 +14,7 @@ const geistMono = Geist_Mono({
 })
 
 export const metadata: Metadata = {
-  title: "Annoy The Streamer",
+  title: "Annoy the Streamer",
   description: "Interactive streaming chaos platform",
     generator: 'v0.app'
 }
