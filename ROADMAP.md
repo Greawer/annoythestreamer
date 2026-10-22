@@ -207,10 +207,12 @@ Add one backend pricing model and a separate Admin pricing interface.
 
 The shared versioned MongoDB pricing document, capability-guarded API, Admin
 editor, server-side Send Your Chaos/TTS price resolution, unavailable-price
-handling, and focused tests are implemented. The pricing editor rendered in the
-browser with isolated mock responses, but its save interaction has not yet
-been verified in a signed-in Admin browser session. Shop purchases and
-proposal submissions remain downstream integrations.
+handling, and per-item catalog and proposal-reward exceptions are implemented.
+The pricing editor rendered in the browser with isolated mock responses.
+Focused tests cover saving and resolving item exceptions, including `-1`; a
+mocked Admin browser flow verified editing an existing exception to `-1` and
+reloading the saved value. A real signed-in Admin save remains unverified, so
+C3 is still awaiting that acceptance check.
 
 Acceptance criteria:
 
@@ -223,8 +225,8 @@ Acceptance criteria:
 - Validate all configured prices and enforce the saved price server-side.
 - Reflect saved changes in consuming interfaces without hardcoded frontend
   price updates. Existing action clients refresh their effective costs when an
-  administrator saves pricing; shop and proposal flows will consume the same
-  model when implemented.
+  administrator saves pricing; D4 shop clients refresh their catalog after the
+  pricing-save broadcast.
 
 ### C4. Database-driven rank permissions
 
@@ -259,89 +261,198 @@ account ownership, and usable items as distinct concepts.
 
 ### D1. Soundboard asset administration
 
-Status: `[ ]`
+Status: `[~]`
 
 Depends on: C1, C3, C4.
 
+Capability-guarded Admin endpoints and separate Soundboard/Emoji management
+tabs now support validated uploads, edits, normalized renames, shop
+availability, shared C3 price exceptions, and safe removal. Stable asset IDs
+and ownership are preserved on rename. Focused Flask tests cover authorization,
+validation, duplicate names, exception retention, and rename/removal. Browser
+upload and playback through a real OBS/browser session remain unverified, so
+the full acceptance criteria are not yet verified.
+New assets appear in the Shop as unavailable until an Admin explicitly enables
+shop availability, keeping upload separate from purchasability.
+
 Acceptance criteria:
 
-- Admins can upload/replace/remove sounds and edit display name and loudness.
-- Validate file type, maximum size, actual audio format, and required metadata
-  on the backend.
+- In the admin page, a new section "Soundboard" needs to be created (shown along with Users/Admin/Pricing)
+- If text becomes unreadable due to too many buttons in one row, two rows of buttons glued together are acceptable
+- Admins can upload/remove sounds and edit display name and loudness.
+- Upload is one section, update is another one, you insert the filename (without .mp3) and can edit all the important information.
+- Changing loudness is actually reflected on /soundmeme while the sound is being played
+- Changing display name should change the file name too, renaming it to lowercase letters and numbers only version (spaces and special characters removed) - follow the current naming scheme in public/sounds/soundboard.
+- Duplicate name does not let proceed, even if the display name is different, but the file name would be the same.
+- Validate file type (mp3 only), max length (max 10s for admins, users will be able to add them too in another part, for them 3s length max, just mentioning it if it changes the approach, but for now focus on 10s limit), gather all needed data (file (local upload), display name (file name applied automatically), price (if not set, is not an exception, if set, treat as an exception), loudness (by default 100% or 1))
+- Upload the file into the soundboard folder, update the database, make the file visible in the store
 - Reject unsafe or unsupported uploads; do not expose arbitrary server paths.
 - Safely replace/remove files without overwriting unrelated assets.
-- Preserve separate asset identity, metadata, shop availability, and ownership.
+- Preserve separate asset identity, metadata, shop availability, and ownership - change of name does not result in losing the item.
+- All changes should be reflected in the database collection.
 
-### D2. Emoji/icon asset administration
+### D2. Emoji asset administration
 
-Status: `[ ]`
+Status: `[~]`
 
 Depends on: C1, C3, C4.
 
+Emoji uploads validate image signatures and dimensions, support animated GIF
+files using their `.gif` extension, and use the shared C3 price model. Rename
+preserves asset identity and ownership while updating stored chat shortcodes
+and notifying connected clients to refresh emoji URLs. Focused Flask tests
+cover authorization, validation, cross-format duplicate names, rename, and
+removal. Real-account/browser rendering remains unverified, so the full
+acceptance criteria are not yet verified.
+
 Acceptance criteria:
 
-- Admins can upload/replace/remove emoji or icon assets and rename them.
-- Validate file type, size, image dimensions, and required metadata on the
-  backend.
-- Preserve asset identity and existing ownership when display names change.
+- In the admin page, a new section "Emoji" needs to be created (shown along with Users/Admin/Pricing)
+- If text becomes unreadable due to too many buttons in one row, two rows of buttons glued together are acceptable
+- Admins can upload/remove emoji assets and rename them.
+- Upload is one section, update is another one, you insert the filename (without .jpg/png) and can edit all the important information.
+- Changing name should also update the filename.
+- Duplicate name does not let proceed, even if the format is different (one name even if one is png and one is jpg).
+- Validate file type (jpg, jpeg, png, and animated gif), max size (2048x2048 for admins, 1024x1024 for users, but for now focus on admin), gather all needed data (file (local upload), name lowercase letters and numbers only, no special characters allowed, price (if not set, is not an exception, if set, treat as an exception))
+- Preserve asset identity and existing ownership when names change.
 - Do not expose arbitrary server paths or damage unrelated assets.
+- Change of name should update the chat history. Update the database entries and make sure chat looks the same (the emojis stay despite the different name).
+- All changes should be reflected in the database collection.
 
 ### D3. Per-account asset visibility and ownership
 
-Status: `[ ]`
+Status: `[~]`
+
+The database-backed catalogs, per-account ownership checks, C3 price
+integration, soundboard filtering, and emoji composer/chat-rendering split are
+implemented. Backend tests cover ownership filtering and admin capability
+access. A mocked browser DOM check verified that the picker rendered only the
+two usable emojis from a three-emoji public catalog, with a wrapping flex
+layout and no hidden item slots. Cross-viewer rendering, owned/unowned
+shortcode behavior with real accounts, and sound playback remain unverified;
+no chat message was sent, so end-to-end ownership visibility is still awaiting
+verification.
 
 Depends on: C1, C3, C4, D1, D2.
 
 Acceptance criteria:
 
-- Initially ordinary accounts have zero unlocked sounds and emojis for
-  purchase-flow testing.
-- Users can see/use only owned or otherwise entitled assets.
+- Sounds and Emojis should have their own mongodb collections.
+- For sounds we need an id, a name, a displayed name, loudness (percentage wise, but can be for example 0.5) and a price.
+- For emojis we need an id, a name and a price.
+- Possible "is exception" flag field if needed to adjust the price from the default one.
+- Changing price in admin console changes the price.
+- Initially ordinary accounts have zero unlocked sounds and emojis.
+- Tie ownership through ids on the database side.
+- Users can see/use only owned or otherwise entitled assets. For sounds this applies to the soundboard. For emojis this applies for the emoji panel in chat.
+- Users can hear/see assets used by other users. For example if user A buys emoji X and sends it in chat. User B can see it despite not being able to use it.
+- If user B tries to use the emoji by writing its name :emojiname:, no image gets loaded, because he doesn't have it purchased.
 - Admins can access every asset without purchase limits; enforce this on the
-  backend.
+  backend through database permissions collection.
 - Prevent users from claiming another account's ownership.
 - Renaming an asset does not break existing ownership.
 - Keep uploaded, available, owned, and usable states distinct.
+- VIP half price does not carry over to the shop, it stays tied to the "Send Your Chaos" usage.
 
 ### D4. Point Shop
 
-Status: `[ ]`
+Status: `[~]`
+
+The C3-backed catalog, idempotent backend purchase flow, and Point Shop
+interface are implemented. The approved 66 sound and 76 emoji registration
+overrides were removed narrowly; all registered assets now inherit their
+configured C3 defaults. Backend tests cover the purchasable, owned, and
+unavailable ordering; mocked browser checks verified that order and search
+filtering in both categories. A mocked Admin browser flow verified editing an
+existing exception to `-1` and reloading it. Purchase, local sound preview,
+and the Admin-save-to-Shop refresh have not been verified with real accounts.
+No live purchase was made, so the full acceptance criteria remain unverified.
 
 Depends on: C1, C3, C4, D1, D2, D3.
 
 Acceptance criteria:
 
-- Provide categories Emojis, Sounds, OBS, and Extra, using the existing
+- Create another panel, just like "Send Your Chaos", "Admin", "Chat.". Keep the same measurements.
+- Provide categories Emojis, Sounds, and Add (formerly Extra), using the existing
   joined-button/category-switching pattern where appropriate.
-- Show item name, applicable cost, preview, and owned/purchasable/unavailable
+- Show item name, applicable cost, and owned/purchasable/unavailable
   state.
 - Allow local sound preview before purchase.
-- Initial ordinary sound and emoji price is 100 points each.
+- Initial ordinary sound and emoji price is set by admin panel, stored by mongodb.
+- Exceptions are set in the admin panel, stored by mongodb.
 - Purchased sounds and emojis become usable by their owner and appear in the
   appropriate sound/emoji lists and chat UI.
 - Enforce ownership and price server-side; prevent duplicate purchase,
-  duplicate charge, and inconsistent balance updates.
-- Admins have unrestricted access without being charged.
-- OBS reward listings must not imply that a remote OBS integration exists;
-  optional OBS rewards are planned separately in Phase I.
+  duplicate charge, and inconsistent balance updates, solve through database.
+- Admins do not see the panel, since they have access to everything, enforce admin ownership through permissions rather than assigning every item to an admin. Solve through permissions collection.
+- Order for all 4 panels should be: Desktop (left to right): Admin, Point Shop, Send Your Chaos, Chat. Mobile (top to bottom): Send Your Chaos, Chat, Admin, Point Shop. Whenever a role does not see a panel because of permissions, it is skipped in the order.
 
-### D5. Extra asset proposals
+### D5. Add your own asset proposals
 
-Status: `[ ]`
+Status: `[~]`
+
+Backend validation, charging, ownership, exclusive availability, proposal UI,
+and focused regressions are implemented. Real-account proposal submission and
+resulting asset use have not been verified.
 
 Depends on: C1, C3, C4, D1, D2, D3, D4.
 
 Acceptance criteria:
 
-- Offer sound and emoji proposals in Extra, initially costing 100,000 points
-  each; permit explicitly configured lower test prices.
-- Require review metadata and validate files server-side.
-- Proposed emoji images are square; proposed audio is shorter than three
-  seconds.
-- Keep proposals separate from approved assets until an approval workflow
-  publishes them.
-- Apply configured per-item proposal rewards/prices using the shared pricing
-  model.
+- Offer custom sound and emoji adding in Add (renamed from Extra) in Point Shop
+- Fields the same as for admin except price, can be added from url or local file
+- Has an "exclusive" toggle, if toggled, sets price to -1, otherwise sets price to default
+- Cost based off of "Add your own" in Admin Panel -> Pricing
+- Admin Panel -> Pricing should have a separate field for exclusive item per category called "Add your own (exclusive)" and set to 100000 for now. (Database compatibile)
+- For exclusive the point is for the submitting user to pay more, but be the only one who can use the emoji (aside from Admin).
+- Limits for sounds: must be .mp3, must be under 3 minutes. Limits for emojis, must be 1024x1024px max and must meet the format requirements of D2
+- Proposed emoji images are square, non-square emojis are stretched
+- Make sure database writes only after the file has been received (make sure it's true also for D1, D2)
+- In the Add section of Point Shop make sure to keep these sub-sections one under another, emojis first, soundboard second.
+- Icon for this button can be something related to upload
+
+### D6. Admin custom assets limitations management
+
+Status: `[x]`
+
+Pricing-backed limits are implemented for Admin and Point Shop uploads, with
+focused validation and TypeScript checks. MongoDB defaults were verified.
+
+Depends on: C1, C3, C4, D1, D2, D3, D4, D5
+
+Acceptance criteria:
+
+- In admin panel -> pricing make Emoji and Soundboard sections hidden by default (The same as Exceptions), make them openable like exceptions
+- Add a field for limitations per category: emoji: max px side (show the current value being 1024, make sure it's db verified) and max px for edmin (2048) (names Max px, Max px (admin)), for sounds: Max length and Max length (admin) -> respectively 3s and 10s
+- Make sure changing these values updates the actual limits
+
+### D7. Pinning favorite sounds + separately priced sounds
+
+Status: `[~]`
+
+Favorites are stored per account in MongoDB, play pricing is independently
+configurable from purchase pricing, and focused regression tests pass. The
+favorite ordering and play-price flow have not been verified in a real browser
+session.
+
+Depends on: C1, C3, C4, D1, D2, D3, D4.
+
+Acceptance criteria:
+
+- Make the sound board in Send Your Chaos look like soundboard shop - one sound per row
+- Change the sound's purchase cost to sound play cost, remove the cost icon next to the search bar
+- Change "Buy" button to "Play"
+- Add an empty star icon befor the "Play" button, when pressed, it fills up (use the accent page color, here it would be the shade of pink being used), pressing again makes the star empty again - this is called "Adding to favorites"
+- When added to favorites by a specific user, appears on top of the list, all the favorite ones are kept in the order from added to favorites the longest time ago (top) to newest (bottom), the non-favorites stay in A-Z order
+- Make mongodb based, not frontend based
+- In database add a separate cost for a sound playing, handle it like with exceptions - if not specified, keep the current default cost (10 points), if default cost changes, update
+- Keep halved costs for VIP, even for exceptions
+- -1 values not allowed here
+- In admin panel in Pricing under soundboard under Default price add Default play price, set to 10 for now, make sure it's mongodb backed
+- In admin panel in Pricing under soundboard add Play exceptions ([number]) under normal Exceptions, make it openable as well
+- A sound can be either an exception for play price, exception for buy price or both, needs 2 flags
+- In admin panel in Soundboard after loading info about the item, add "Play price" under "Price" and let it be changed from there, behavior like in admin panel -> Pricing
+- Make Upload sound/Upload emoji sections hidable due to the amount of info available at once making it a scrollable element by default, while I'd rather make that optionable
 
 ## 7. Phase E — Chat activity and pop-out chat
 

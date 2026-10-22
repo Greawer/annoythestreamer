@@ -15,9 +15,11 @@ import {
   ImageIcon,
   Mic,
   Volume2,
+  Music,
   Users,
   Send,
   Smile,
+  Star,
   X,
   Sun,
   Moon,
@@ -31,6 +33,7 @@ import {
 interface ChatMessage {
   user: string
   message: string
+  literal_emojis?: string[]
   rank?: string
   rank_color?: string | null
   id?: string
@@ -64,16 +67,103 @@ interface RolePermissions {
 
 interface PointPricing {
   send_your_chaos: Record<string, number>
-  catalog: Record<string, {
-    default: number
-    categories: Record<string, number>
-    items: Record<string, number>
-  }>
+  catalog: {
+    emoji: {
+      default: number
+      categories: Record<string, number>
+      items: Record<string, number>
+    }
+    sound: {
+      default: number
+      categories: Record<string, number>
+      items: Record<string, number>
+      play_default: number
+      play_items: Record<string, number>
+    }
+  }
   proposal_rewards: Record<string, {
     default: number
+    exclusive: number
+    items: Record<string, number>
+  }>
+  asset_limits: {
+    emoji: { max_px: number; max_px_admin: number }
+    sound: { max_length: number; max_length_admin: number }
+  }
+}
+
+interface SoundAsset {
+  asset_id: string
+  name: string
+  file: string
+  title: string
+  display_name: string
+  loudness: number
+  price: number
+  favorite: boolean
+  play_cost: number
+  url: string
+}
+
+interface EmojiAsset {
+  asset_id: string
+  name: string
+  file: string
+  price: number
+  url: string
+}
+
+interface ShopAsset {
+  asset_id: string
+  name: string
+  title?: string
+  price: number
+  owned: boolean
+  status: "owned" | "available" | "unavailable"
+  loudness?: number
+  url: string
+}
+
+interface ShopCatalog {
+  emoji: ShopAsset[]
+  sound: ShopAsset[]
+  proposal_prices?: Record<"emoji" | "sound", {
+    default: number
+    exclusive: number
     items: Record<string, number>
   }>
 }
+
+interface AdminAsset {
+  asset_id: string
+  name: string
+  file: string
+  display_name?: string
+  loudness?: number
+  price: number
+  default_price: number
+  price_exception: number | null
+  play_default_price?: number
+  play_price_exception?: number | null
+  url: string
+}
+
+interface AdminAssetDraft {
+  name: string
+  display_name: string
+  loudness: string
+  price: string
+  play_price: string
+}
+
+type ProposalDraft = {
+  name: string
+  sourceUrl: string
+  loudness: string
+  exclusive: boolean
+}
+
+type ShopCategory = "emoji" | "sound" | "add"
 
 const SEND_YOUR_CHAOS_ACTIONS = [
   { key: "normalmeme", label: "Normal meme" },
@@ -84,6 +174,13 @@ const SEND_YOUR_CHAOS_ACTIONS = [
 
 function isValidPointBalance(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+}
+
+function parsePointPrice(value: string): number | null {
+  const normalized = value.trim()
+  if (!/^(?:-1|\d+)$/.test(normalized)) return null
+  const price = Number(normalized)
+  return Number.isSafeInteger(price) && price >= -1 ? price : null
 }
 
 export default function AnnoyTheStreamer() {
@@ -133,18 +230,81 @@ export default function AnnoyTheStreamer() {
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
   const [hoveredChatMessage, setHoveredChatMessage] = useState<number | null>(null)
   const [chatInput, setChatInput] = useState("")
+  const [editedCatalogPrices, setEditedCatalogPrices] = useState<Record<string, string>>({})
   const [onlineUsers, setOnlineUsers] = useState<string[]>([])
   const [onlineUserRanks, setOnlineUserRanks] = useState<Record<string, { rank: string; rank_color: string | null }>>({})
   const [showEmojiPanel, setShowEmojiPanel] = useState(false)
-  const [emojis, setEmojis] = useState<string[]>([])
-  const [sounds, setSounds] = useState<{ file: string; title: string; url: string }[]>([]);
+  const [emojiUrls, setEmojiUrls] = useState<Record<string, string>>({})
+  const [usableEmojis, setUsableEmojis] = useState<EmojiAsset[]>([])
+  const [assetListsLoading, setAssetListsLoading] = useState(false)
+  const [sounds, setSounds] = useState<SoundAsset[]>([])
+  const [assetLoadError, setAssetLoadError] = useState("")
   const [soundSearch, setSoundSearch] = useState("");
   const [activeTab, setActiveTab] = useState("facememe")
   const [theme, setTheme] = useState<"light" | "dark">("dark")
+  const [newSoundPlayItem, setNewSoundPlayItem] = useState("")
+  const [newSoundPlayItemPrice, setNewSoundPlayItemPrice] = useState("")
+  const [newEmojiProposalItem, setNewEmojiProposalItem] = useState("")
+  const [newEmojiProposalItemPrice, setNewEmojiProposalItemPrice] = useState("")
+  const [newSoundProposalItem, setNewSoundProposalItem] = useState("")
+  const [newSoundProposalItemPrice, setNewSoundProposalItemPrice] = useState("")
+  const [adminSounds, setAdminSounds] = useState<AdminAsset[]>([])
+  const [adminEmojis, setAdminEmojis] = useState<AdminAsset[]>([])
+  const [adminAssetDrafts, setAdminAssetDrafts] = useState<Record<string, AdminAssetDraft>>({})
+  const [adminSoundFile, setAdminSoundFile] = useState<File | null>(null)
+  const [adminSoundUrl, setAdminSoundUrl] = useState("")
+  const [adminSoundName, setAdminSoundName] = useState("")
+  const [adminSoundLoudness, setAdminSoundLoudness] = useState("")
+  const [adminSoundPrice, setAdminSoundPrice] = useState("")
+  const [adminEmojiFile, setAdminEmojiFile] = useState<File | null>(null)
+  const [adminEmojiUrl, setAdminEmojiUrl] = useState("")
+  const [adminEmojiName, setAdminEmojiName] = useState("")
+  const [adminEmojiPrice, setAdminEmojiPrice] = useState("")
+  const [adminAssetsLoading, setAdminAssetsLoading] = useState(false)
+  const [adminAssetSaving, setAdminAssetSaving] = useState(false)
+  const [adminAssetDefaultPrices, setAdminAssetDefaultPrices] = useState<Record<"sound" | "emoji", number | null>>({
+    sound: 100,
+    emoji: 100,
+  })
+  const [adminAssetUploadErrors, setAdminAssetUploadErrors] = useState<Record<"sound" | "emoji", string>>({
+    sound: "",
+    emoji: "",
+  })
+  const [adminAssetManageErrors, setAdminAssetManageErrors] = useState<Record<"sound" | "emoji", string>>({
+    sound: "",
+    emoji: "",
+  })
+  const [adminAssetLookup, setAdminAssetLookup] = useState<Record<"sound" | "emoji", string>>({
+    sound: "",
+    emoji: "",
+  })
+  const [selectedAdminAsset, setSelectedAdminAsset] = useState<Record<"sound" | "emoji", string | null>>({
+    sound: null,
+    emoji: null,
+  })
+  const [shopCategory, setShopCategory] = useState<ShopCategory>("emoji")
+  const [proposalDrafts, setProposalDrafts] = useState<Record<"emoji" | "sound", ProposalDraft>>({
+    emoji: { name: "", sourceUrl: "", loudness: "", exclusive: false },
+    sound: { name: "", sourceUrl: "", loudness: "", exclusive: false },
+  })
+  const [proposalFiles, setProposalFiles] = useState<Record<"emoji" | "sound", File | null>>({
+    emoji: null,
+    sound: null,
+  })
+  const [proposalSaving, setProposalSaving] = useState<"emoji" | "sound" | null>(null)
+  const [emojiShopSearch, setEmojiShopSearch] = useState("")
+  const [soundShopSearch, setSoundShopSearch] = useState("")
+  const [shopAssets, setShopAssets] = useState<ShopCatalog>({ emoji: [], sound: [] })
+  const [shopProposalPrices, setShopProposalPrices] = useState<NonNullable<ShopCatalog["proposal_prices"]> | null>(null)
+  const [shopLoading, setShopLoading] = useState(false)
+  const [shopError, setShopError] = useState("")
+  const [shopNotice, setShopNotice] = useState("")
+  const [purchasingAssetId, setPurchasingAssetId] = useState<string | null>(null)
   const [showOnlineList, setShowOnlineList] = useState(false)
   const [isStreaming, setIsStreaming] = useState(false)
   const isActiveTimeout = (timeoutUntil: string | null) => {
     if (!timeoutUntil) return false
+  const [chatError, setChatError] = useState("")
     const expiresAt = Date.parse(timeoutUntil)
     return Number.isFinite(expiresAt) && expiresAt > timeoutClock
   }
@@ -174,6 +334,8 @@ export default function AnnoyTheStreamer() {
       setPointsError(true)
       setPointsLoading(false)
       return
+  const previewAudioRef = useRef<HTMLAudioElement | null>(null)
+  const pendingShopRequestIds = useRef<Record<string, string>>({})
     }
     setCurrentPoints(value)
     setPointsError(false)
@@ -230,6 +392,9 @@ export default function AnnoyTheStreamer() {
       ? {
           ...current,
           catalog: {
+  const canAffordSound = (sound: SoundAsset) =>
+    isFreeAction("soundmeme") ||
+    (currentPoints !== null && sound.play_cost >= 0 && currentPoints >= sound.play_cost)
             ...current.catalog,
             [assetType]: { ...current.catalog[assetType], default: value },
           },
@@ -249,6 +414,63 @@ export default function AnnoyTheStreamer() {
             ...current.catalog,
             [assetType]: {
               ...current.catalog[assetType],
+  const updateSoundPlayDefault = (value: number) => {
+    setPointPricing((current) => current
+      ? {
+          ...current,
+          catalog: {
+            ...current.catalog,
+            sound: { ...current.catalog.sound, play_default: value },
+          },
+        }
+      : current)
+  }
+
+  const updateSoundPlayItemPrice = (key: string, value: number) => {
+    setPointPricing((current) => current
+      ? {
+          ...current,
+          catalog: {
+            ...current.catalog,
+            sound: {
+              ...current.catalog.sound,
+              play_items: { ...current.catalog.sound.play_items, [key]: value },
+            },
+          },
+        }
+      : current)
+  }
+
+  const updateEditedSoundPlayItemPrice = (key: string, rawValue: string) => {
+    const inputKey = `sound-play:${key}`
+    setEditedCatalogPrices((current) => ({ ...current, [inputKey]: rawValue }))
+    if (!/^\d+$/.test(rawValue)) return
+    const price = Number(rawValue)
+    if (!Number.isSafeInteger(price)) return
+    setPricingError("")
+    updateSoundPlayItemPrice(key, price)
+  }
+
+  const removeSoundPlayItemPrice = (key: string) => {
+    setEditedCatalogPrices((current) => {
+      const updated = { ...current }
+      delete updated[`sound-play:${key}`]
+      return updated
+    })
+    setPointPricing((current) => {
+      if (!current) return current
+      const playItems = { ...current.catalog.sound.play_items }
+      delete playItems[key]
+      return {
+        ...current,
+        catalog: {
+          ...current.catalog,
+          sound: { ...current.catalog.sound, play_items: playItems },
+        },
+      }
+    })
+  }
+
               items: { ...current.catalog[assetType].items, [key]: value },
             },
           },
@@ -268,6 +490,24 @@ export default function AnnoyTheStreamer() {
           [assetType]: { ...current.catalog[assetType], items },
         },
       }
+  const updateEditedCatalogItemPrice = (
+    assetType: "emoji" | "sound",
+    key: string,
+    rawValue: string,
+  ) => {
+    const inputKey = `${assetType}:${key}`
+    setEditedCatalogPrices((current) => ({ ...current, [inputKey]: rawValue }))
+    const price = parsePointPrice(rawValue)
+    if (price === null) return
+    setPricingError("")
+    updateCatalogItemPrice(assetType, key, price)
+  }
+
+    })
+    setEditedCatalogPrices((current) => {
+      const updated = { ...current }
+      delete updated[`${assetType}:${key}`]
+      return updated
     })
   }
 
@@ -283,6 +523,462 @@ export default function AnnoyTheStreamer() {
       : current)
   }
 
+  const loadAdminAssets = useCallback(async (assetType: "sound" | "emoji") => {
+    setAdminAssetsLoading(true)
+    setAdminAssetManageErrors((current) => ({ ...current, [assetType]: "" }))
+    try {
+      const response = await fetch(`/api/admin/assets/${assetType}`)
+      const result = await response.json()
+      if (!response.ok || !Array.isArray(result.assets)) {
+        throw new Error(result.message || `Could not load ${assetType} assets`)
+      }
+      const assets = result.assets as AdminAsset[]
+      if (typeof result.default_price === "number") {
+        setAdminAssetDefaultPrices((current) => ({ ...current, [assetType]: result.default_price }))
+      } else {
+        const assetDefault = assets.find((asset) => typeof asset.default_price === "number")?.default_price
+        if (typeof assetDefault === "number") {
+          setAdminAssetDefaultPrices((current) => ({ ...current, [assetType]: assetDefault }))
+        }
+      }
+      if (assetType === "sound") setAdminSounds(assets)
+      else setAdminEmojis(assets)
+      setAdminAssetDrafts((current) => ({
+        ...current,
+        ...Object.fromEntries(assets.map((asset) => [asset.asset_id, {
+          name: asset.name,
+          display_name: asset.display_name || asset.name,
+          loudness: Number(asset.loudness ?? 1).toFixed(2),
+          price: asset.price_exception === null ? "" : String(asset.price_exception),
+          play_price: asset.play_price_exception == null ? "" : String(asset.play_price_exception),
+        }])),
+      }))
+    } catch (error) {
+      setAdminAssetManageErrors((current) => ({
+        ...current,
+        [assetType]: error instanceof Error ? error.message : `Could not load ${assetType} assets`,
+      }))
+    } finally {
+      setAdminAssetsLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (isAdmin && adminView === "soundboard") void loadAdminAssets("sound")
+    if (isAdmin && adminView === "emoji") void loadAdminAssets("emoji")
+  }, [adminView, isAdmin, loadAdminAssets])
+
+  const uploadAdminAsset = async (
+    assetType: "sound" | "emoji",
+    event: React.FormEvent<HTMLFormElement>,
+  ) => {
+    event.preventDefault()
+    const file = assetType === "sound" ? adminSoundFile : adminEmojiFile
+    const sourceUrl = assetType === "sound" ? adminSoundUrl.trim() : adminEmojiUrl.trim()
+    if (!file && !sourceUrl) {
+      setAdminAssetUploadErrors((current) => ({ ...current, [assetType]: "Choose a file or enter a URL to upload." }))
+      return
+    }
+    const formData = new FormData()
+    if (file) formData.set("file", file)
+    if (sourceUrl) formData.set("source_url", sourceUrl)
+    if (assetType === "sound") {
+      formData.set("display_name", adminSoundName)
+      formData.set("loudness", adminSoundLoudness)
+      if (adminSoundPrice !== "") formData.set("price", adminSoundPrice)
+    } else {
+      formData.set("name", adminEmojiName)
+      if (adminEmojiPrice !== "") formData.set("price", adminEmojiPrice)
+    }
+    setAdminAssetSaving(true)
+    setAdminAssetUploadErrors((current) => ({ ...current, [assetType]: "" }))
+    setAdminAssetManageErrors((current) => ({ ...current, [assetType]: "" }))
+    setAdminNotice("")
+    try {
+      const response = await fetch(`/api/admin/assets/${assetType}`, {
+        method: "POST",
+        body: formData,
+      })
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.message || `Could not upload ${assetType}`)
+      if (assetType === "sound") {
+        setAdminSoundFile(null)
+        setAdminSoundUrl("")
+        setAdminSoundName("")
+        setAdminSoundLoudness("")
+        setAdminSoundPrice("")
+      } else {
+        setAdminEmojiFile(null)
+        setAdminEmojiUrl("")
+        setAdminEmojiName("")
+        setAdminEmojiPrice("")
+      }
+      setAdminNotice(`${assetType === "sound" ? "Sound" : "Emoji"} uploaded.`)
+      await loadAdminAssets(assetType)
+      await fetchShopCatalog().then(setShopAssets)
+      await refreshOwnedAssetLists()
+      if (assetType === "emoji") await refreshPublicEmojiUrls()
+    } catch (error) {
+      setAdminAssetUploadErrors((current) => ({
+        ...current,
+        [assetType]: error instanceof Error ? error.message : `Could not upload ${assetType}`,
+      }))
+    } finally {
+      setAdminAssetSaving(false)
+    }
+  }
+
+  const saveAdminAsset = async (assetType: "sound" | "emoji", asset: AdminAsset) => {
+    const draft = adminAssetDrafts[asset.asset_id]
+    if (!draft) return
+    const price = draft.price === "" ? null : parsePointPrice(draft.price)
+    const playPrice = draft.play_price === ""
+      ? null
+      : /^\d+$/.test(draft.play_price) && Number.isSafeInteger(Number(draft.play_price))
+        ? Number(draft.play_price)
+        : NaN
+    const loudness = draft.loudness === "" ? 1 : Number(draft.loudness)
+    if (
+      (draft.price !== "" && price === null) ||
+      (assetType === "sound" && (!Number.isFinite(loudness) || loudness < 0 || loudness > 2)) ||
+      (assetType === "sound" && !Number.isSafeInteger(playPrice))
+    ) {
+      setAdminAssetManageErrors((current) => ({
+        ...current,
+        [assetType]: "Enter a valid price and sound loudness from 0 to 2.",
+      }))
+      return
+    }
+    setAdminAssetSaving(true)
+    setAdminAssetManageErrors((current) => ({ ...current, [assetType]: "" }))
+    setAdminNotice("")
+    try {
+      const response = await fetch(`/api/admin/assets/${assetType}/${asset.asset_id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ...(assetType === "sound"
+            ? { display_name: draft.display_name, loudness }
+            : { name: draft.name }),
+          price,
+          ...(assetType === "sound" ? { play_price: playPrice } : {}),
+        }),
+      })
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.message || `Could not update ${assetType}`)
+      setAdminNotice(`${assetType === "sound" ? "Sound" : "Emoji"} updated.`)
+      await loadAdminAssets(assetType)
+      await fetchShopCatalog().then(setShopAssets)
+      await refreshOwnedAssetLists()
+      if (assetType === "emoji") await refreshPublicEmojiUrls()
+    } catch (error) {
+      setAdminAssetManageErrors((current) => ({
+        ...current,
+        [assetType]: error instanceof Error ? error.message : `Could not update ${assetType}`,
+      }))
+    } finally {
+      setAdminAssetSaving(false)
+    }
+  }
+
+  const removeAdminAsset = async (assetType: "sound" | "emoji", asset: AdminAsset) => {
+    if (!window.confirm(`Remove ${assetType} "${asset.display_name || asset.name}"?`)) return
+    setAdminAssetSaving(true)
+    setAdminAssetManageErrors((current) => ({ ...current, [assetType]: "" }))
+    setAdminNotice("")
+    try {
+      const response = await fetch(`/api/admin/assets/${assetType}/${asset.asset_id}`, {
+        method: "DELETE",
+      })
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.message || `Could not remove ${assetType}`)
+      setAdminNotice(`${assetType === "sound" ? "Sound" : "Emoji"} removed.`)
+      await loadAdminAssets(assetType)
+      await fetchShopCatalog().then(setShopAssets)
+      await refreshOwnedAssetLists()
+      if (assetType === "emoji") await refreshPublicEmojiUrls()
+    } catch (error) {
+      setAdminAssetManageErrors((current) => ({
+        ...current,
+        [assetType]: error instanceof Error ? error.message : `Could not remove ${assetType}`,
+      }))
+    } finally {
+      setAdminAssetSaving(false)
+    }
+  }
+
+  const renderAdminAssetManagement = (assetType: "sound" | "emoji") => {
+    const assets = assetType === "sound" ? adminSounds : adminEmojis
+    const isSound = assetType === "sound"
+    const lookup = adminAssetLookup[assetType].trim().toLocaleLowerCase()
+    const selectedAsset = assets.find((asset) => asset.asset_id === selectedAdminAsset[assetType])
+    const defaultPrice = adminAssetDefaultPrices[assetType] ?? pointPricing?.catalog[assetType].default
+    const selectedDraft = selectedAsset ? adminAssetDrafts[selectedAsset.asset_id] : undefined
+    const selectedPricePlaceholder = String(selectedAsset?.default_price ?? defaultPrice ?? "")
+    return (
+      <div className="space-y-4">
+        <details className="rounded-md border">
+          <summary className="cursor-pointer px-3 py-2 text-sm font-semibold">
+            Upload {isSound ? "sound" : "emoji"}
+          </summary>
+          <form
+            className="space-y-2 px-3 pb-3"
+            onSubmit={(event) => void uploadAdminAsset(assetType, event)}
+          >
+          <label className="block space-y-1 text-xs">
+            <span>Name</span>
+            <Input
+              value={isSound ? adminSoundName : adminEmojiName}
+              onChange={(event) => isSound
+                ? setAdminSoundName(event.target.value)
+                : setAdminEmojiName(event.target.value)}
+              placeholder={isSound ? "Sound Name" : "emojiname"}
+              aria-label={isSound ? "Sound display name" : "Emoji name"}
+              required
+            />
+          </label>
+          {isSound && (
+            <label className="block space-y-1 text-xs">
+              <span>Loudness (0–2x multiplier)</span>
+              <Input
+                type="text"
+                inputMode="decimal"
+                value={adminSoundLoudness}
+                onChange={(event) => setAdminSoundLoudness(event.target.value)}
+                onBlur={() => {
+                  if (!adminSoundLoudness.trim()) return
+                  const value = Number(adminSoundLoudness)
+                  if (Number.isFinite(value)) setAdminSoundLoudness(value.toFixed(2))
+                }}
+                placeholder="1.00"
+                aria-label="New sound loudness"
+              />
+            </label>
+          )}
+          <label className="block space-y-1 text-xs">
+            <span>Price</span>
+            <Input
+              type="number"
+              min={-1}
+              step={1}
+              value={isSound ? adminSoundPrice : adminEmojiPrice}
+              onChange={(event) => isSound
+                ? setAdminSoundPrice(event.target.value)
+                : setAdminEmojiPrice(event.target.value)}
+              placeholder={String(defaultPrice ?? "")}
+              aria-label={`${isSound ? "Sound" : "Emoji"} price exception`}
+            />
+          </label>
+          <div className="space-y-1 text-xs">
+            <span>Upload {isSound ? "sound" : "emoji"} file or URL</span>
+            <div className="flex gap-2">
+              <Input
+                type="url"
+                value={isSound ? adminSoundUrl : adminEmojiUrl}
+                onChange={(event) => {
+                  if (isSound) {
+                    setAdminSoundUrl(event.target.value)
+                    if (event.target.value) setAdminSoundFile(null)
+                  } else {
+                    setAdminEmojiUrl(event.target.value)
+                    if (event.target.value) setAdminEmojiFile(null)
+                  }
+                }}
+                placeholder="URL..."
+                className="flex-1"
+                aria-label={`${isSound ? "Sound" : "Emoji"} file URL`}
+              />
+              <div className="relative">
+                <Input
+                  type="file"
+                  accept={isSound ? ".mp3,audio/mpeg" : ".jpg,.jpeg,.png,.gif,image/jpeg,image/png,image/gif"}
+                  onChange={(event) => {
+                    const file = event.target.files?.[0] ?? null
+                    if (isSound) {
+                      setAdminSoundFile(file)
+                      if (file) setAdminSoundUrl("")
+                    } else {
+                      setAdminEmojiFile(file)
+                      if (file) setAdminEmojiUrl("")
+                    }
+                  }}
+                  className="hidden"
+                  id={`admin-${assetType}-file`}
+                  aria-label={`${isSound ? "Sound" : "Emoji"} file to upload`}
+                />
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="icon"
+                  className="h-8 w-8 bg-transparent"
+                  asChild
+                >
+                  <label htmlFor={`admin-${assetType}-file`} className="cursor-pointer flex items-center justify-center">
+                    <Upload className="h-3 w-3" />
+                  </label>
+                </Button>
+              </div>
+            </div>
+            {(isSound ? adminSoundFile : adminEmojiFile) && (
+              <p className="truncate text-muted-foreground">
+                {(isSound ? adminSoundFile : adminEmojiFile)?.name}
+              </p>
+            )}
+          </div>
+          <div className="pt-2">
+            <Button type="submit" disabled={adminAssetSaving}>
+              {adminAssetSaving ? "Uploading..." : `Upload ${isSound ? "sound" : "emoji"}`}
+            </Button>
+          </div>
+          {adminAssetUploadErrors[assetType] && (
+            <p role="alert" className="text-sm text-destructive">{adminAssetUploadErrors[assetType]}</p>
+          )}
+          </form>
+        </details>
+        <section className="space-y-2 rounded-md border p-3">
+          <h3 className="text-sm font-semibold">Manage existing {isSound ? "sounds" : "emojis"}</h3>
+          {adminAssetsLoading && <p className="text-xs text-muted-foreground">Loading assets…</p>}
+          {!adminAssetsLoading && assets.length === 0 && (
+            <p className="text-xs text-muted-foreground">No uploaded assets.</p>
+          )}
+          <form
+            className="flex gap-2"
+            onSubmit={(event) => {
+              event.preventDefault()
+              const match = assets.find((asset) =>
+                [asset.name, asset.display_name ?? "", asset.file].some((name) =>
+                  name.trim().toLocaleLowerCase() === lookup),
+              )
+              setSelectedAdminAsset((current) => ({
+                ...current,
+                [assetType]: match?.asset_id ?? null,
+              }))
+              setAdminAssetManageErrors((current) => ({
+                ...current,
+                [assetType]: match ? "" : `No ${isSound ? "sound" : "emoji"} found with that name.`,
+              }))
+            }}
+          >
+            <div className="min-w-0 flex-1 pr-2">
+              <Input
+                value={adminAssetLookup[assetType]}
+                onChange={(event) => {
+                  const value = event.target.value
+                  setAdminAssetLookup((current) => ({ ...current, [assetType]: value }))
+                  setSelectedAdminAsset((current) => ({ ...current, [assetType]: null }))
+                }}
+                placeholder={isSound ? "Sound name" : "Emoji name"}
+                aria-label={`Find ${isSound ? "sound" : "emoji"} by name`}
+              />
+            </div>
+            <Button type="submit" disabled={adminAssetsLoading}>Load</Button>
+          </form>
+          {selectedAsset && selectedDraft && (() => {
+            const asset = selectedAsset
+            const draft = selectedDraft
+            return (
+              <div key={asset.asset_id} className="space-y-2">
+                <div className="flex items-center gap-2">
+                  {!isSound && <img src={asset.url} alt="" className="h-8 w-8 rounded object-contain" />}
+                  <span className="min-w-0 flex-1 truncate text-xs">{asset.file}</span>
+                </div>
+                <label className="block space-y-1 text-xs">
+                  <span>Name</span>
+                  <Input
+                    value={isSound ? draft.display_name : draft.name}
+                    onChange={(event) => setAdminAssetDrafts((current) => ({
+                      ...current,
+                      [asset.asset_id]: {
+                        ...draft,
+                        [isSound ? "display_name" : "name"]: event.target.value,
+                      },
+                    }))}
+                    aria-label={`${isSound ? "Sound display name" : "Emoji name"} for ${asset.name}`}
+                  />
+                </label>
+                {isSound && (
+                  <label className="block space-y-1 text-xs">
+                    <span>Loudness</span>
+                    <Input
+                      type="number"
+                      min={0}
+                      max={2}
+                      step="0.01"
+                      value={draft.loudness}
+                      onChange={(event) => setAdminAssetDrafts((current) => ({
+                        ...current,
+                        [asset.asset_id]: { ...draft, loudness: event.target.value },
+                      }))}
+                      aria-label={`Loudness for ${asset.name}`}
+                    />
+                  </label>
+                )}
+                <label className="block space-y-1 text-xs">
+                  <span>Price</span>
+                  <Input
+                    type="number"
+                    min={-1}
+                    step={1}
+                    value={draft.price}
+                    onChange={(event) => setAdminAssetDrafts((current) => ({
+                      ...current,
+                      [asset.asset_id]: { ...draft, price: event.target.value },
+                    }))}
+                    placeholder={selectedPricePlaceholder}
+                    aria-label={`Price exception for ${asset.name}`}
+                  />
+                </label>
+                {isSound && (
+                  <label className="block space-y-1 text-xs">
+                    <span>Play price</span>
+                    <Input
+                      type="number"
+                      min={0}
+                      step={1}
+                      value={draft.play_price}
+                      onChange={(event) => setAdminAssetDrafts((current) => ({
+                        ...current,
+                        [asset.asset_id]: { ...draft, play_price: event.target.value },
+                      }))}
+                      placeholder={String(
+                        asset.play_default_price ??
+                        pointPricing?.catalog.sound.play_default ??
+                        10,
+                      )}
+                      aria-label={`Play price exception for ${asset.name}`}
+                    />
+                  </label>
+                )}
+                <div className="flex gap-2 pt-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    disabled={adminAssetSaving}
+                    onClick={() => void saveAdminAsset(assetType, asset)}
+                  >
+                    Save changes
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="destructive"
+                    disabled={adminAssetSaving}
+                    onClick={() => void removeAdminAsset(assetType, asset)}
+                  >
+                    Remove
+                  </Button>
+                </div>
+              </div>
+            )
+          })()}
+          {adminAssetManageErrors[assetType] && (
+            <p role="alert" className="text-sm text-destructive">{adminAssetManageErrors[assetType]}</p>
+          )}
+        </section>
+        {adminNotice && <p role="status" className="text-sm text-muted-foreground">{adminNotice}</p>}
+      </div>
+    )
+  }
+
   const loadPointPricing = useCallback(async () => {
     setPricingLoading(true)
     setPricingError("")
@@ -295,6 +991,88 @@ export default function AnnoyTheStreamer() {
       setPointPricing(result.pricing)
     } catch (error) {
       setPricingError(error instanceof Error ? error.message : "Could not load pricing")
+  const updateProposalExclusive = (proposalType: "sound" | "emoji", value: number) => {
+    setPointPricing((current) => current
+      ? {
+          ...current,
+          proposal_rewards: {
+            ...current.proposal_rewards,
+            [proposalType]: { ...current.proposal_rewards[proposalType], exclusive: value },
+          },
+        }
+      : current)
+  }
+
+  const updateProposalItemReward = (
+    proposalType: "sound" | "emoji",
+    key: string,
+    value: number,
+  ) => {
+    setPointPricing((current) => current
+      ? {
+          ...current,
+          proposal_rewards: {
+            ...current.proposal_rewards,
+            [proposalType]: {
+              ...current.proposal_rewards[proposalType],
+              items: { ...current.proposal_rewards[proposalType].items, [key]: value },
+            },
+          },
+        }
+      : current)
+  }
+
+  const updateEditedProposalItemReward = (
+    proposalType: "sound" | "emoji",
+    key: string,
+    rawValue: string,
+  ) => {
+    const inputKey = `proposal-${proposalType}:${key}`
+    setEditedCatalogPrices((current) => ({ ...current, [inputKey]: rawValue }))
+    const price = parsePointPrice(rawValue)
+    if (price === null) return
+    setPricingError("")
+    updateProposalItemReward(proposalType, key, price)
+  }
+
+  const removeProposalItemReward = (proposalType: "sound" | "emoji", key: string) => {
+    setEditedCatalogPrices((current) => {
+      const updated = { ...current }
+      delete updated[`proposal-${proposalType}:${key}`]
+      return updated
+    })
+    setPointPricing((current) => {
+      if (!current) return current
+      const items = { ...current.proposal_rewards[proposalType].items }
+      delete items[key]
+      return {
+        ...current,
+        proposal_rewards: {
+          ...current.proposal_rewards,
+          [proposalType]: { ...current.proposal_rewards[proposalType], items },
+        },
+      }
+    })
+  }
+
+  const normalizeProposalItemName = (value: string) => value.toLowerCase().replace(/[^a-z0-9]/g, "")
+
+  const updateAssetLimit = (
+    assetType: "sound" | "emoji",
+    field: "max_px" | "max_px_admin" | "max_length" | "max_length_admin",
+    value: number,
+  ) => {
+    setPointPricing((current) => current
+      ? {
+          ...current,
+          asset_limits: {
+            ...current.asset_limits,
+            [assetType]: { ...current.asset_limits[assetType], [field]: value },
+          },
+        }
+      : current)
+  }
+
     } finally {
       setPricingLoading(false)
     }
@@ -314,6 +1092,14 @@ export default function AnnoyTheStreamer() {
       const result = await response.json()
       if (!response.ok || !result.pricing) {
         throw new Error(result.message || "Could not save pricing")
+    if (Object.entries(editedCatalogPrices).some(([key, value]) =>
+      key.startsWith("sound-play:")
+        ? !/^\d+$/.test(value) || !Number.isSafeInteger(Number(value))
+        : parsePointPrice(value) === null,
+    )) {
+      setPricingError("Enter a valid price of -1 or a non-negative whole number.")
+      return
+    }
       }
       setPointPricing(result.pricing)
       setPricingNotice("Pricing saved.")
@@ -328,6 +1114,7 @@ export default function AnnoyTheStreamer() {
   const getCookie = (name: string) => {
     const value = `; ${document.cookie}`
     const parts = value.split(`; ${name}=`)
+      setEditedCatalogPrices({})
     if (parts.length === 2) return parts.pop()?.split(";").shift()
     return ""
   }
@@ -336,6 +1123,44 @@ export default function AnnoyTheStreamer() {
     const d = new Date()
     d.setTime(d.getTime() + days * 24 * 60 * 60 * 1000)
     document.cookie = `${name}=${value};expires=${d.toUTCString()};path=/`
+  const fetchShopCatalog = useCallback(async (): Promise<ShopCatalog> => {
+    const response = await fetch("/api/shop/catalog")
+    const result = await response.json()
+    if (!response.ok || !result.emoji || !result.sound || !result.proposal_prices) {
+      throw new Error(result.message || "Could not load the Point Shop")
+    }
+    setShopProposalPrices(result.proposal_prices)
+    return result as ShopCatalog
+  }, [])
+
+  const refreshPublicEmojiUrls = useCallback(async () => {
+    const response = await fetch("/api/public-emojis")
+    if (!response.ok) throw new Error(`Emoji image list request failed (${response.status})`)
+    const result: { name: string; url: string }[] = await response.json()
+    setEmojiUrls(Object.fromEntries(result.map((emoji) => [emoji.name, emoji.url])))
+  }, [])
+
+  const refreshOwnedAssetLists = useCallback(async () => {
+    const [soundResponse, emojiResponse] = await Promise.all([
+      fetch("/api/soundboardlist"),
+      fetch("/api/usable-emojis"),
+    ])
+    const soundResult = await soundResponse.json()
+    const emojiResult = await emojiResponse.json()
+    if (!soundResponse.ok) {
+      throw new Error(soundResult.message || `Sound list request failed (${soundResponse.status})`)
+    }
+    if (!emojiResponse.ok) {
+      throw new Error(emojiResult.message || `Emoji list request failed (${emojiResponse.status})`)
+    }
+    if (!Array.isArray(soundResult) || !Array.isArray(emojiResult)) {
+      throw new Error("Usable asset lists returned an invalid response")
+    }
+    setSounds(soundResult)
+    setUsableEmojis(emojiResult)
+    setAssetLoadError("")
+  }, [])
+
   }
 
   // THEME HANDLER
@@ -476,6 +1301,9 @@ useEffect(() => {
   });
 
   socket.on('chat_message', (msg: ChatMessage) => {
+    void refreshOwnedAssetLists().catch((error) => {
+      console.error("Could not refresh soundboard prices:", error)
+    })
     setChatMessages(prev => [...prev, msg]);
   });
 
@@ -485,16 +1313,44 @@ useEffect(() => {
 
   socket.on('rank_changed', (change: {
     username: string
+
+    if (!isAdmin) {
+      setShopLoading(true)
+      setShopError("")
+      void fetchShopCatalog()
+        .then((catalog) => setShopAssets(catalog))
+        .catch((error) => {
+          setShopError(error instanceof Error ? error.message : "Could not refresh Point Shop prices")
+          console.error("Could not refresh Point Shop prices:", error)
+        })
+        .finally(() => setShopLoading(false))
+    }
     rank: string
     rank_color: string | null
     permissions?: RolePermissions | null
     usage_costs?: Record<string, number>
   }) => {
     setChatMessages((messages) =>
+  socket.on('chat_message_rejected', (result: { message: string; text?: string }) => {
+    if (result.text) setChatInput((current) => current || result.text || "")
+    setChatError(result.message || "Your message could not be sent")
+  });
+
       messages.map((message) => message.user === change.username ? { ...message, rank: change.rank, rank_color: change.rank_color } : message)
     );
     setOnlineUserRanks((ranks) => ({
       ...ranks,
+  socket.on('asset_catalog_changed', (event: { asset_type: "sound" | "emoji" }) => {
+    void refreshOwnedAssetLists().catch((error) => {
+      console.error("Could not refresh usable assets:", error)
+    })
+    if (event?.asset_type === "emoji") {
+      void refreshPublicEmojiUrls().catch((error) => {
+        console.error("Could not refresh public emoji images:", error)
+      })
+    }
+  })
+
       [change.username]: { rank: change.rank, rank_color: change.rank_color },
     }));
     if (change.username === username) {
@@ -522,7 +1378,7 @@ useEffect(() => {
   return () => {
     socket.disconnect();
   };
-}, [username, refreshCurrentPoints]);
+}, [username, isAdmin, fetchShopCatalog, refreshCurrentPoints, refreshPublicEmojiUrls, refreshOwnedAssetLists]);
 
 // CHAT
 useEffect(() => {
@@ -562,34 +1418,96 @@ useEffect(() => {
     if (chatBoxRef.current) chatBoxRef.current.scrollTop = chatBoxRef.current.scrollHeight
   }, [chatMessages])
 
-// LOAD EMOJIS & SOUNDS DYNAMICALLY
+// Load public emoji URLs for chat rendering separately from owned composer assets.
 useEffect(() => {
-  // --- Load emojis ---
   const loadEmojis = async () => {
     try {
-      const res = await fetch("/api/list-emojis");
+      const res = await fetch("/api/public-emojis");
       if (!res.ok) throw new Error(res.statusText);
-      const data = await res.json();
-      setEmojis(data);
+      const data: { name: string; url: string }[] = await res.json();
+      setEmojiUrls(Object.fromEntries(data.map((emoji) => [emoji.name, emoji.url])))
     } catch (err) {
-      console.warn("Failed to load emojis:", err);
-    }
-  };
-
-  // --- Load sounds ---
-  const loadSoundsFromBackend = async () => {
-    try {
-      const res = await fetch("/api/soundboardlist");
-      if (!res.ok) throw new Error(res.statusText);
-      setSounds(await res.json());
-    } catch (err) {
-      console.warn("Failed to load sounds:", err);
+      console.error("Failed to load public emojis:", err);
     }
   };
 
   loadEmojis();
-  loadSoundsFromBackend();
-}, []);
+}, [])
+
+// The backend returns only assets usable by the signed-in account.
+useEffect(() => {
+  setSounds([])
+  setUsableEmojis([])
+  setAssetLoadError("")
+  if (!username) {
+    setAssetListsLoading(false)
+    return
+  }
+
+  let cancelled = false
+  setAssetListsLoading(true)
+  const loadUsableAssets = async () => {
+    try {
+      const [soundResponse, emojiResponse] = await Promise.all([
+        fetch("/api/soundboardlist"),
+        fetch("/api/usable-emojis"),
+      ])
+      const soundResult = await soundResponse.json()
+      const emojiResult = await emojiResponse.json()
+      if (!soundResponse.ok) {
+        throw new Error(soundResult.message || `Sound list request failed (${soundResponse.status})`)
+      }
+      if (!emojiResponse.ok) {
+        throw new Error(emojiResult.message || `Emoji list request failed (${emojiResponse.status})`)
+      }
+      if (!Array.isArray(soundResult) || !Array.isArray(emojiResult)) {
+        throw new Error("Usable asset lists returned an invalid response")
+      }
+      if (cancelled) return
+      setSounds(soundResult)
+      setUsableEmojis(emojiResult)
+    } catch (err) {
+      if (cancelled) return
+      setAssetLoadError(err instanceof Error ? err.message : "Usable assets could not be loaded")
+      console.error("Failed to load usable assets:", err)
+    } finally {
+      if (!cancelled) setAssetListsLoading(false)
+    }
+  };
+
+  void loadUsableAssets()
+  return () => {
+    cancelled = true
+  }
+}, [username, currentPermissions])
+
+useEffect(() => {
+  setShopAssets({ emoji: [], sound: [] })
+  setShopError("")
+  if (!username || isAdmin) {
+    setShopLoading(false)
+    return
+  }
+
+  let cancelled = false
+  setShopLoading(true)
+  void fetchShopCatalog()
+    .then((catalog) => {
+      if (!cancelled) setShopAssets(catalog)
+    })
+    .catch((error) => {
+      if (!cancelled) {
+        setShopError(error instanceof Error ? error.message : "Could not load the Point Shop")
+        console.error("Could not load Point Shop:", error)
+      }
+    })
+    .finally(() => {
+      if (!cancelled) setShopLoading(false)
+    })
+  return () => {
+    cancelled = true
+  }
+}, [fetchShopCatalog, username, isAdmin])
 
 
 
@@ -616,6 +1534,17 @@ useEffect(() => {
     && (
       managedUser.username.toLowerCase() !== username.toLowerCase()
       || permission("edit_self")
+  const filteredShopAssets = (category: "emoji" | "sound") => {
+    const query = (category === "emoji" ? emojiShopSearch : soundShopSearch).trim().toLowerCase()
+    const statusOrder = { available: 0, owned: 1, unavailable: 2 }
+    return shopAssets[category]
+      .filter((asset) => `${asset.title ?? ""} ${asset.name}`.toLowerCase().includes(query))
+      .sort((left, right) =>
+        statusOrder[left.status] - statusOrder[right.status]
+        || left.name.localeCompare(right.name, undefined, { sensitivity: "base" })
+        || left.name.localeCompare(right.name),
+      )
+  }
     ),
   )
   const timeoutStaffRoleIds = currentPermissions?.capabilities.timeout_staff_role_ids
@@ -645,6 +1574,11 @@ useEffect(() => {
     const name = usernameInput.trim()
     if (!name) return
     setAuthError("")
+    setSounds([])
+    setUsableEmojis([])
+    setAssetLoadError("")
+    setAssetListsLoading(true)
+    setShowEmojiPanel(false)
     try {
       const response = await fetch("/api/auth/lookup", {
         method: "POST",
@@ -857,17 +1791,28 @@ useEffect(() => {
 	  }
 	}
 
-	const insertEmoji = (emoji: string) => setChatInput((prev) => prev + `:${emoji}:`)
+	const insertEmoji = (emoji: string) => {
+    setChatInput((prev) => prev + `:${emoji}:`)
+    setChatError("")
+  }
 
-	const renderMessageWithEmojis = (message: string) => {
+	const renderMessageWithEmojis = (
+    message: string,
+    literalEmojis: string[] = [],
+    messageUser?: string,
+  ) => {
 	  const parts = message.split(/(:\w+:)/g)
 	  return parts.map((part, idx) => {
 		const emojiName = part.replace(/:/g, "")
-		if (emojis.includes(emojiName)) {
+		const senderNowOwnsEmoji = messageUser === username && ownedEmojiNames.has(emojiName)
+		if (
+      emojiUrls[emojiName]
+      && (!literalEmojis.includes(emojiName) || senderNowOwnsEmoji)
+    ) {
 		  return (
 			<img
 			  key={idx}
-			  src={`/img/emoji/${emojiName}.png`}
+			  src={emojiUrls[emojiName]}
 			  alt={emojiName}
 			  className="inline h-5 w-5 align-text-bottom"
 			/>
@@ -978,6 +1923,7 @@ useEffect(() => {
 		return
 	  }
 	  const formData = new FormData()
+    const ownedEmojiNames = new Set(usableEmojis.map((emoji) => emoji.name))
 	  formData.append('user', username)
 	  formData.append('text_ttsmeme', trimmedTts)
 	  formData.append('language', ttsLanguage)
@@ -994,7 +1940,7 @@ useEffect(() => {
     reader.readAsDataURL(file)
   }
 
-	const playSound = (file: string) => {
+	const playSound = (assetId: string) => {
     if (isChatRestricted) return
     const socket = socketRef.current
     if (!socket?.connected) {
@@ -1002,12 +1948,12 @@ useEffect(() => {
       return
     }
     const action = "soundmeme"
-    const requestKey = `${action}:${file}`
+    const requestKey = `${action}:${assetId}`
     const requestId = getPaidUseRequestId(requestKey)
     setActionError("")
     socket.emit(
       "playsound",
-      { file: file.replace(/\.mp3$/i, ""), request_id: requestId },
+      { asset_id: assetId, request_id: requestId },
       (result?: { status?: string; code?: string; message?: string; points?: number }) => {
         if (result?.status !== "ok") {
           if (typeof result?.points === "number") acceptPointBalance(result.points)
@@ -1142,6 +2088,159 @@ if (showUsernamePrompt) {
 
 
 
+  const toggleSoundFavorite = async (sound: SoundAsset) => {
+    setActionError("")
+    try {
+      const response = await fetch("/api/soundboard/favorites", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ asset_id: sound.asset_id, favorite: !sound.favorite }),
+      })
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.message || "Could not update sound favorite")
+      await refreshOwnedAssetLists()
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : "Could not update sound favorite")
+    }
+  }
+
+  const previewShopSound = (sound: ShopAsset) => {
+    previewAudioRef.current?.pause()
+    const audio = new Audio(sound.url)
+    audio.volume = Math.max(0, Math.min(1, sound.loudness ?? 1))
+    previewAudioRef.current = audio
+    audio.play().catch((error) => {
+      console.error("Sound preview could not be played:", error)
+      setShopError("Sound preview could not be played.")
+    })
+  }
+
+  const purchaseShopAsset = async (assetType: "sound" | "emoji", asset: ShopAsset) => {
+    const requestKey = `${assetType}:${asset.asset_id}`
+    let requestId = pendingShopRequestIds.current[requestKey]
+    if (!requestId) {
+      try {
+        requestId = sessionStorage.getItem(`ats-shop-purchase:${username}:${requestKey}`) || ""
+      } catch {
+        requestId = ""
+      }
+    }
+    if (!requestId) requestId = crypto.randomUUID()
+    pendingShopRequestIds.current[requestKey] = requestId
+    try {
+      sessionStorage.setItem(`ats-shop-purchase:${username}:${requestKey}`, requestId)
+    } catch {
+      // The in-memory request ID still protects retries during this page session.
+    }
+
+    setPurchasingAssetId(asset.asset_id)
+    setShopError("")
+    setShopNotice("")
+    try {
+      const response = await fetch("/api/shop/purchase", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          asset_type: assetType,
+          asset_id: asset.asset_id,
+          request_id: requestId,
+          expected_price: asset.price,
+        }),
+      })
+      const result = await response.json()
+      if (!response.ok || result.status !== "ok") {
+        if (
+          response.status === 402
+          || result.code === "asset_unavailable"
+          || result.code === "price_changed"
+          || result.code === "request_id_conflict"
+        ) {
+          delete pendingShopRequestIds.current[requestKey]
+          try {
+            sessionStorage.removeItem(`ats-shop-purchase:${username}:${requestKey}`)
+          } catch {
+            // Storage is optional; the backend remains authoritative.
+          }
+        }
+        if (result.code === "price_changed") {
+          try {
+            setShopAssets(await fetchShopCatalog())
+          } catch (error) {
+            console.error("Updated Point Shop prices could not be loaded:", error)
+          }
+        }
+        throw new Error(result.message || "Purchase could not be completed")
+      }
+
+      acceptPointBalance(result.points)
+      delete pendingShopRequestIds.current[requestKey]
+      try {
+        sessionStorage.removeItem(`ats-shop-purchase:${username}:${requestKey}`)
+      } catch {
+        // Storage is optional; the backend remains authoritative.
+      }
+      setShopNotice(`${asset.title || asset.name} added to your ${assetType === "sound" ? "soundboard" : "emojis"}.`)
+
+      try {
+        const catalog = await fetchShopCatalog()
+        setShopAssets(catalog)
+        await refreshOwnedAssetLists()
+      } catch (error) {
+        setShopError(error instanceof Error ? error.message : "Purchased asset lists could not be refreshed")
+        console.error("Purchased asset lists could not be refreshed:", error)
+      }
+    } catch (error) {
+      setShopError(error instanceof Error ? error.message : "Purchase could not be completed")
+    } finally {
+      setPurchasingAssetId(null)
+    }
+  }
+
+  const submitAssetProposal = async (event: React.FormEvent<HTMLFormElement>, assetType: "emoji" | "sound") => {
+    event.preventDefault()
+    const form = event.currentTarget
+    const draft = proposalDrafts[assetType]
+    const file = proposalFiles[assetType]
+    if (!file && !draft.sourceUrl.trim()) {
+      setShopError("Choose a file or enter a URL.")
+      return
+    }
+    setProposalSaving(assetType)
+    setShopError("")
+    setShopNotice("")
+    try {
+      const formData = new FormData()
+      formData.set("asset_type", assetType)
+      formData.set("request_id", crypto.randomUUID())
+      formData.set("exclusive", String(draft.exclusive))
+      formData.set(assetType === "sound" ? "display_name" : "name", draft.name)
+      formData.set("source_url", draft.sourceUrl)
+      if (assetType === "sound") formData.set("loudness", draft.loudness.trim() || "1")
+      if (file) formData.set("file", file)
+
+      const response = await fetch("/api/shop/propose", { method: "POST", body: formData })
+      const result = await response.json()
+      if (!response.ok || result.status !== "ok") {
+        if (typeof result.points === "number") acceptPointBalance(result.points)
+        throw new Error(result.message || "Proposal could not be submitted.")
+      }
+      acceptPointBalance(result.points)
+      setProposalDrafts((current) => ({
+        ...current,
+        [assetType]: { name: "", sourceUrl: "", loudness: "", exclusive: false },
+      }))
+      setProposalFiles((current) => ({ ...current, [assetType]: null }))
+      form.reset()
+      setShopNotice(`${assetType === "emoji" ? "Emoji" : "Sound"} added.`)
+      setShopAssets(await fetchShopCatalog())
+      await refreshOwnedAssetLists()
+    } catch (error) {
+      setShopError(error instanceof Error ? error.message : "Proposal could not be submitted.")
+    } finally {
+      setProposalSaving(null)
+    }
+  }
+
   // ----------------------------
   // Main Page Render (chat + memes + stream)
   // ----------------------------
@@ -1200,7 +2299,7 @@ if (showUsernamePrompt) {
 
         <div className="flex flex-col md:grid md:grid-cols-1 lg:grid lg:grid-cols-[repeat(auto-fit,320px)] gap-3 sm:gap-4 lg:items-start lg:justify-center">
           {/* --- Left Column: Send Chaos --- */}
-          <div className="order-1 md:order-1 lg:order-1">
+          <div className="order-1 md:order-1 lg:order-3">
             <Card className={`card-hover flex flex-col h-auto max-h-[80dvh] overflow-hidden lg:h-[calc(100dvh_-_18rem)] lg:max-h-none lg:overflow-visible lg:!transition-[transform,box-shadow] ${isChatRestricted ? "opacity-60 grayscale" : ""}`}>
               <CardHeader className="pb-2 sm:pb-3 flex-shrink-0">
                 <CardTitle className="text-base sm:text-lg">Send Your Chaos</CardTitle>
@@ -1375,39 +2474,47 @@ if (showUsernamePrompt) {
                   {/* --- Soundboard Tab --- */}
 <TabsContent value="soundboard" className="mt-0 flex flex-col lg:flex-1 lg:min-h-0">
   <ScrollArea className="pr-3 lg:flex-1 lg:max-h-full lg:overflow-y-auto">
-    <div className="mb-2 flex gap-2">
+    <div className="mb-2">
       <Input
         value={soundSearch}
         onChange={(e) => setSoundSearch(e.target.value)}
         placeholder="Search sounds..."
-        className="h-7 flex-1 text-xs sm:h-8 sm:text-sm"
+        className="h-7 w-full text-xs sm:h-8 sm:text-sm"
       />
-      {!isAdmin && (
-        <Button
-          type="button"
-          disabled
-          className="h-7 px-2 text-xs disabled:opacity-100 sm:h-8 sm:text-sm"
-        >
-          {displayedUsageCost("soundmeme") < 0 ? "Unavailable" : `${displayedUsageCost("soundmeme")}❖`}
-        </Button>
-      )}
     </div>
-    <div className="grid grid-cols-2 gap-1.5 sm:gap-2 pr-1">
-      {filteredSounds.map((sound, idx) => (
-<Button
-  key={idx}
-  variant="outline"
-  disabled={!canAffordAction("soundmeme")}
-  onClick={() => playSound(sound.file)}
-  className="h-auto py-1 sm:py-1.5 px-1.5 sm:px-2 text-[10px] sm:text-xs text-left justify-start disabled:grayscale"
->
-  <Volume2 className="h-2.5 w-2.5 sm:h-3 sm:w-3 mr-1 flex-shrink-0" />
-  <span className="truncate">{sound.title}</span>
-</Button>
-
+    {assetLoadError && <p role="alert" className="text-xs text-destructive">{assetLoadError}</p>}
+    <div className="space-y-2 pr-1">
+      {filteredSounds.map((sound) => (
+        <div key={sound.asset_id} className="flex min-w-0 items-center gap-2 rounded-md border p-2">
+          <Button
+            type="button"
+            variant="outline"
+            size="icon"
+            aria-label={`Play ${sound.title}`}
+            disabled={!canAffordSound(sound) || isChatRestricted}
+            onClick={() => playSound(sound.asset_id)}
+            className="h-8 w-8 flex-shrink-0 disabled:grayscale"
+          >
+            <Volume2 className="h-3 w-3" />
+          </Button>
+          <div className="min-w-0 flex-1">
+            <p className="truncate text-xs font-medium">{sound.title}</p>
+            <p className="text-[10px] text-muted-foreground">{sound.play_cost}❖</p>
+          </div>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            aria-label={`${sound.favorite ? "Remove" : "Add"} ${sound.title} ${sound.favorite ? "from" : "to"} favorites`}
+            onClick={() => void toggleSoundFavorite(sound)}
+            className="h-8 w-8 shrink-0 text-primary hover:text-primary/80"
+          >
+            <Star className={`h-3 w-3 ${sound.favorite ? "fill-primary" : ""}`} />
+          </Button>
+        </div>
       ))}
       {filteredSounds.length === 0 && (
-        <p className="text-[11px] text-muted-foreground col-span-2 text-center mt-2">
+        <p className="text-center text-[11px] text-muted-foreground mt-2">
           No sounds found.
         </p>
       )}
@@ -1422,25 +2529,25 @@ if (showUsernamePrompt) {
           </div>
 
           {username && permission("panel_access") && (
-          <div className="order-2 md:order-2 lg:order-2">
+          <div className="order-3 md:order-3 lg:order-1">
             <Card className="card-hover flex flex-col h-auto max-h-[80dvh] overflow-hidden lg:h-[calc(100dvh_-_18rem)] lg:max-h-none lg:overflow-visible lg:!transition-[transform,box-shadow]">
               <CardHeader className="pb-2 sm:pb-3 flex-shrink-0">
                 <CardTitle className="text-base sm:text-lg">{isAdmin ? "Admin" : "Moderation"}</CardTitle>
                 <CardDescription className="text-xs">{isAdmin ? "Manage users and account settings" : "Inspect users and manage chat moderation"}</CardDescription>
               </CardHeader>
               <CardContent className="min-h-0 flex-1 overflow-y-auto p-3 sm:p-6 lg:overflow-hidden">
-                <Tabs value={adminView} onValueChange={(value) => setAdminView(value as "users" | "admin" | "pricing")} className="flex flex-col lg:h-full">
-                  <TabsList className={`grid w-full ${isAdmin ? "grid-cols-3" : "grid-cols-1"} mb-3 sm:mb-4 h-8 sm:h-10 flex-shrink-0`}>
-                    <TabsTrigger value="users" className="gap-1 text-[10px] sm:text-xs px-1">
+                <Tabs value={adminView} onValueChange={(value) => setAdminView(value as "users" | "admin" | "pricing" | "soundboard" | "emoji")} className="flex flex-col lg:h-full">
+                  <TabsList className={`grid w-full ${isAdmin ? "grid-cols-6" : "grid-cols-1"} mb-3 sm:mb-4 h-auto flex-shrink-0`}>
+                    <TabsTrigger value="users" className={`gap-1 text-[10px] sm:text-xs px-1 ${isAdmin ? "col-span-2" : ""}`}>
                       <Users className="h-3 w-3" /> Users
                     </TabsTrigger>
                     {permission("admin_console") && (
-                      <TabsTrigger value="admin" className="gap-1 text-[10px] sm:text-xs px-1">
+                      <TabsTrigger value="admin" className="col-span-2 gap-1 text-[10px] sm:text-xs px-1">
                         <Shield className="h-3 w-3" /> Admin
                       </TabsTrigger>
                     )}
                     {permission("admin_console") && (
-                      <TabsTrigger value="pricing" className="gap-1 text-[10px] sm:text-xs px-1">
+                      <TabsTrigger value="pricing" className="col-span-2 gap-1 text-[10px] sm:text-xs px-1">
                         ❖ Pricing
                       </TabsTrigger>
                     )}
@@ -1633,7 +2740,7 @@ if (showUsernamePrompt) {
                                   min={-1}
                                   step={1}
                                   value={pointPricing.send_your_chaos[key]}
-                                  onChange={(event) => updateActionPrice(key, Number(event.target.value))}
+                                  onChange={(event) => updateActionPrice(key, event.target.valueAsNumber)}
                                   className="[appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
                                 />
                               </label>
@@ -1641,8 +2748,9 @@ if (showUsernamePrompt) {
                           </div>
                         </section>
 
-                        <section className="space-y-2 border-t pt-3">
-                          <h3 className="text-sm font-semibold">Emoji</h3>
+                        <details className="border-t pt-3">
+                          <summary className="cursor-pointer text-sm font-semibold">Emoji</summary>
+                          <section className="space-y-2 pt-3">
                           <label className="block space-y-1 text-xs">
                             <span>Default price</span>
                             <Input
@@ -1651,7 +2759,7 @@ if (showUsernamePrompt) {
                               min={-1}
                               step={1}
                               value={pointPricing.catalog.emoji.default}
-                              onChange={(event) => updateCatalogDefault("emoji", Number(event.target.value))}
+                              onChange={(event) => updateCatalogDefault("emoji", event.target.valueAsNumber)}
                               className="[appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
                             />
                           </label>
@@ -1666,11 +2774,12 @@ if (showUsernamePrompt) {
                                 onSubmit={(event) => {
                                   event.preventDefault()
                                   const item = newEmojiItem.trim()
-                                  if (!item || Object.prototype.hasOwnProperty.call(pointPricing.catalog.emoji.items, item)) {
-                                    setPricingError("Enter a new item name.")
+                                  const price = parsePointPrice(newEmojiItemPrice)
+                                  if (!item || Object.prototype.hasOwnProperty.call(pointPricing.catalog.emoji.items, item) || price === null) {
+                                    setPricingError("Enter a new item name and a valid price of -1 or a non-negative whole number.")
                                     return
                                   }
-                                  updateCatalogItemPrice("emoji", item, Number(newEmojiItemPrice))
+                                  updateCatalogItemPrice("emoji", item, price)
                                   setNewEmojiItem("")
                                 }}
                               >
@@ -1688,8 +2797,9 @@ if (showUsernamePrompt) {
                                     type="number"
                                     min={-1}
                                     step={1}
-                                    value={price}
-                                    onChange={(event) => updateCatalogItemPrice("emoji", item, Number(event.target.value))}
+                                    inputMode="decimal"
+                                    value={editedCatalogPrices[`emoji:${item}`] ?? String(price)}
+                                    onChange={(event) => updateEditedCatalogItemPrice("emoji", item, event.target.value)}
                                     className="w-24 [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
                                   />
                                   <Button type="button" variant="ghost" size="icon" aria-label={`Remove ${item} emoji exception`} onClick={() => removeCatalogItemPrice("emoji", item)}>
@@ -1708,23 +2818,138 @@ if (showUsernamePrompt) {
                               min={-1}
                               step={1}
                               value={pointPricing.proposal_rewards.emoji.default}
-                              onChange={(event) => updateProposalDefault("emoji", Number(event.target.value))}
+                              onChange={(event) => updateProposalDefault("emoji", event.target.valueAsNumber)}
                               className="[appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
                             />
                           </label>
-                        </section>
+                          <label className="block space-y-1 text-xs">
+                            <span>Add your own (exclusive)</span>
+                            <Input
+                              aria-label="Add your own exclusive sound price"
+                              type="number"
+                              min={-1}
+                              step={1}
+                              value={pointPricing.proposal_rewards.sound.exclusive}
+                              onChange={(event) => updateProposalExclusive("sound", event.target.valueAsNumber)}
+                            />
+                          </label>
+                          <details className="rounded-md border px-3 py-2">
+                            <summary className="cursor-pointer text-xs font-medium">
+                              Proposal reward exceptions ({Object.keys(pointPricing.proposal_rewards.sound.items).length})
+                            </summary>
+                            <div className="space-y-2 pt-2">
+                              <form
+                                autoComplete="off"
+                                className="flex flex-col gap-2"
+                                onSubmit={(event) => {
+                                  event.preventDefault()
+                                  const item = normalizeProposalItemName(newSoundProposalItem)
+                                  const price = parsePointPrice(newSoundProposalItemPrice)
+                                  if (!item || Object.prototype.hasOwnProperty.call(pointPricing.proposal_rewards.sound.items, item) || price === null) {
+                                    setPricingError("Enter a new sound name and a valid proposal reward of -1 or a non-negative whole number.")
+                                    return
+                                  }
+                                  updateProposalItemReward("sound", item, price)
+                                  setNewSoundProposalItem("")
+                                  setNewSoundProposalItemPrice("")
+                                }}
+                              >
+                                <Input
+                                  value={newSoundProposalItem}
+                                  onChange={(event) => setNewSoundProposalItem(event.target.value)}
+                                  placeholder="Sound name"
+                                  aria-label="New sound proposal reward name"
+                                  className="w-full"
+                                />
+                                <div className="flex items-center gap-2">
+                                  <Input
+                                    type="number"
+                                    min={-1}
+                                    step={1}
+                                    value={newSoundProposalItemPrice}
+                                    onChange={(event) => setNewSoundProposalItemPrice(event.target.value)}
+                                    aria-label="New sound proposal reward"
+                                    className="w-full [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                                  />
+                                  <Button type="submit" variant="outline">Add</Button>
+                                </div>
+                              </form>
+                              {Object.entries(pointPricing.proposal_rewards.sound.items).map(([item, price]) => (
+                                <div key={item} className="flex items-center gap-2">
+                                  <span className="min-w-0 flex-1 truncate text-xs">{item}</span>
+                                  <Input
+                                    aria-label={`${item} sound proposal reward`}
+                                    type="number"
+                                    min={-1}
+                                    step={1}
+                                    value={editedCatalogPrices[`proposal-sound:${item}`] ?? String(price)}
+                                    onChange={(event) => updateEditedProposalItemReward("sound", item, event.target.value)}
+                                    className="w-24 [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                                  />
+                                  <Button
+                                    type="button"
+                                    variant="ghost"
+                                    size="icon"
+                                    aria-label={`Remove ${item} sound proposal reward`}
+                                    onClick={() => removeProposalItemReward("sound", item)}
+                                  >
+                                    <Trash2 className="h-3 w-3" />
+                                  </Button>
+                                </div>
+                              ))}
+                            </div>
+                          </details>
+                          <div className="grid grid-cols-2 gap-2">
+                            <label className="space-y-1 text-xs">
+                              <span>Max length (seconds)</span>
+                              <Input
+                                aria-label="Sound max length"
+                                type="number"
+                                min={1}
+                                max={180}
+                                step={1}
+                                value={pointPricing.asset_limits.sound.max_length}
+                                onChange={(event) => updateAssetLimit("sound", "max_length", event.target.valueAsNumber)}
+                              />
+                            </label>
+                            <label className="space-y-1 text-xs">
+                              <span>Max length (admin)</span>
+                              <Input
+                                aria-label="Sound max length admin"
+                                type="number"
+                                min={1}
+                                max={180}
+                                step={1}
+                                value={pointPricing.asset_limits.sound.max_length_admin}
+                                onChange={(event) => updateAssetLimit("sound", "max_length_admin", event.target.valueAsNumber)}
+                              />
+                            </label>
+                          </div>
+                          </section>
+                        </details>
 
-                        <section className="space-y-2 border-t pt-3">
-                          <h3 className="text-sm font-semibold">Soundboard</h3>
+                        <details className="border-t pt-3">
+                          <summary className="cursor-pointer text-sm font-semibold">Soundboard</summary>
+                          <section className="space-y-2 pt-3">
                           <label className="block space-y-1 text-xs">
                             <span>Default price</span>
                             <Input
                               aria-label="Default sound price"
                               type="number"
+                    {permission("admin_console") && (
+                      <TabsTrigger value="soundboard" className="col-start-2 col-span-2 gap-1 text-[10px] sm:text-xs px-1">
+                        <Music className="h-3 w-3" /> Soundboard
+                      </TabsTrigger>
+                    )}
+                    {permission("admin_console") && (
+                      <TabsTrigger value="emoji" className="col-start-4 col-span-2 gap-1 text-[10px] sm:text-xs px-1">
+                        <Smile className="h-3 w-3" /> Emoji
+                      </TabsTrigger>
+                    )}
                               min={-1}
                               step={1}
                               value={pointPricing.catalog.sound.default}
-                              onChange={(event) => updateCatalogDefault("sound", Number(event.target.value))}
+                              onChange={(event) => updateCatalogDefault("sound", event.target.valueAsNumber)}
                               className="[appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
                             />
                           </label>
@@ -1739,15 +2964,16 @@ if (showUsernamePrompt) {
                                 onSubmit={(event) => {
                                   event.preventDefault()
                                   const item = newSoundItem.trim()
-                                  if (!item || Object.prototype.hasOwnProperty.call(pointPricing.catalog.sound.items, item)) {
-                                    setPricingError("Enter a new item name.")
+                                  const price = parsePointPrice(newSoundItemPrice)
+                                  if (!item || Object.prototype.hasOwnProperty.call(pointPricing.catalog.sound.items, item) || price === null) {
+                                    setPricingError("Enter a sound filename and a valid price of -1 or a non-negative whole number.")
                                     return
                                   }
-                                  updateCatalogItemPrice("sound", item, Number(newSoundItemPrice))
+                                  updateCatalogItemPrice("sound", item, price)
                                   setNewSoundItem("")
                                 }}
                               >
-                                <Input value={newSoundItem} onChange={(event) => setNewSoundItem(event.target.value)} placeholder="Sound name" aria-label="New sound exception name" className="w-full" />
+                                <Input value={newSoundItem} onChange={(event) => setNewSoundItem(event.target.value)} placeholder="Sound filename (e.g. 21.mp3)" aria-label="New sound exception filename" className="w-full" />
                                 <div className="flex items-center gap-2">
                                   <Input type="number" min={-1} step={1} value={newSoundItemPrice} onChange={(event) => setNewSoundItemPrice(event.target.value)} aria-label="New sound exception price" className="w-full [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none" />
                                   <Button type="submit" variant="outline">Add</Button>
@@ -1761,8 +2987,9 @@ if (showUsernamePrompt) {
                                     type="number"
                                     min={-1}
                                     step={1}
-                                    value={price}
-                                    onChange={(event) => updateCatalogItemPrice("sound", item, Number(event.target.value))}
+                                    inputMode="decimal"
+                                    value={editedCatalogPrices[`sound:${item}`] ?? String(price)}
+                                    onChange={(event) => updateEditedCatalogItemPrice("sound", item, event.target.value)}
                                     className="w-24 [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
                                   />
                                   <Button type="button" variant="ghost" size="icon" aria-label={`Remove ${item} sound exception`} onClick={() => removeCatalogItemPrice("sound", item)}>
@@ -1781,11 +3008,115 @@ if (showUsernamePrompt) {
                               min={-1}
                               step={1}
                               value={pointPricing.proposal_rewards.sound.default}
-                              onChange={(event) => updateProposalDefault("sound", Number(event.target.value))}
+                              onChange={(event) => updateProposalDefault("sound", event.target.valueAsNumber)}
                               className="[appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
                             />
                           </label>
-                        </section>
+                          <label className="block space-y-1 text-xs">
+                            <span>Add your own (exclusive)</span>
+                            <Input
+                              aria-label="Add your own exclusive emoji price"
+                              type="number"
+                              min={-1}
+                              step={1}
+                              value={pointPricing.proposal_rewards.emoji.exclusive}
+                              onChange={(event) => updateProposalExclusive("emoji", event.target.valueAsNumber)}
+                            />
+                          </label>
+                          <details className="rounded-md border px-3 py-2">
+                            <summary className="cursor-pointer text-xs font-medium">
+                              Proposal reward exceptions ({Object.keys(pointPricing.proposal_rewards.emoji.items).length})
+                            </summary>
+                            <div className="space-y-2 pt-2">
+                              <form
+                                autoComplete="off"
+                                className="flex flex-col gap-2"
+                                onSubmit={(event) => {
+                                  event.preventDefault()
+                                  const item = normalizeProposalItemName(newEmojiProposalItem)
+                                  const price = parsePointPrice(newEmojiProposalItemPrice)
+                                  if (!item || Object.prototype.hasOwnProperty.call(pointPricing.proposal_rewards.emoji.items, item) || price === null) {
+                                    setPricingError("Enter a new emoji name and a valid proposal reward of -1 or a non-negative whole number.")
+                                    return
+                                  }
+                                  updateProposalItemReward("emoji", item, price)
+                                  setNewEmojiProposalItem("")
+                                  setNewEmojiProposalItemPrice("")
+                                }}
+                              >
+                                <Input
+                                  value={newEmojiProposalItem}
+                                  onChange={(event) => setNewEmojiProposalItem(event.target.value)}
+                                  placeholder="Emoji name"
+                                  aria-label="New emoji proposal reward name"
+                                  className="w-full"
+                                />
+                                <div className="flex items-center gap-2">
+                                  <Input
+                                    type="number"
+                                    min={-1}
+                                    step={1}
+                                    value={newEmojiProposalItemPrice}
+                                    onChange={(event) => setNewEmojiProposalItemPrice(event.target.value)}
+                                    aria-label="New emoji proposal reward"
+                                    className="w-full [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                                  />
+                                  <Button type="submit" variant="outline">Add</Button>
+                                </div>
+                              </form>
+                              {Object.entries(pointPricing.proposal_rewards.emoji.items).map(([item, price]) => (
+                                <div key={item} className="flex items-center gap-2">
+                                  <span className="min-w-0 flex-1 truncate text-xs">{item}</span>
+                                  <Input
+                                    aria-label={`${item} emoji proposal reward`}
+                                    type="number"
+                                    min={-1}
+                                    step={1}
+                                    value={editedCatalogPrices[`proposal-emoji:${item}`] ?? String(price)}
+                                    onChange={(event) => updateEditedProposalItemReward("emoji", item, event.target.value)}
+                                    className="w-24 [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                                  />
+                                  <Button
+                                    type="button"
+                                    variant="ghost"
+                                    size="icon"
+                                    aria-label={`Remove ${item} emoji proposal reward`}
+                                    onClick={() => removeProposalItemReward("emoji", item)}
+                                  >
+                                    <Trash2 className="h-3 w-3" />
+                                  </Button>
+                                </div>
+                              ))}
+                            </div>
+                          </details>
+                          <div className="grid grid-cols-2 gap-2">
+                            <label className="space-y-1 text-xs">
+                              <span>Max px</span>
+                              <Input
+                                aria-label="Emoji max px"
+                                type="number"
+                                min={1}
+                                max={8192}
+                                step={1}
+                                value={pointPricing.asset_limits.emoji.max_px}
+                                onChange={(event) => updateAssetLimit("emoji", "max_px", event.target.valueAsNumber)}
+                              />
+                            </label>
+                            <label className="space-y-1 text-xs">
+                              <span>Max px (admin)</span>
+                              <Input
+                                aria-label="Emoji max px admin"
+                                type="number"
+                                min={1}
+                                max={8192}
+                                step={1}
+                                value={pointPricing.asset_limits.emoji.max_px_admin}
+                                onChange={(event) => updateAssetLimit("emoji", "max_px_admin", event.target.valueAsNumber)}
+                              />
+                            </label>
+                          </div>
+                          </section>
+                        </details>
 
                         <div className="space-y-2 border-t pt-3">
                           <Button type="button" onClick={() => void savePointPricing()} disabled={pricingSaving || pricingLoading}>
@@ -1812,7 +3143,7 @@ if (showUsernamePrompt) {
 
 
           {/* --- Right Column: Chat + Online Users --- */}
-          <div className="order-3 lg:order-3 md:order-3 flex flex-col gap-3 sm:gap-4 lg:h-[calc(100dvh_-_18rem)]">
+          <div className="order-2 md:order-2 lg:order-4 flex flex-col gap-3 sm:gap-4 lg:h-[calc(100dvh_-_18rem)]">
             <Card className="card-hover flex max-h-[80dvh] flex-col overflow-hidden lg:flex-1 lg:min-h-0 lg:max-h-none lg:!transition-[transform,box-shadow]">
               <CardHeader className="flex flex-row items-center justify-between pb-1 sm:pb-2 flex-shrink-0">
                 <CardTitle className="flex items-center gap-2 text-base sm:text-lg">
@@ -1873,7 +3204,7 @@ if (showUsernamePrompt) {
                   )}
                 </span>
               </span>{" "}
-						  <span className="text-foreground break-words">{renderMessageWithEmojis(msg.message)}</span>
+						  <span className="text-foreground break-words">{renderMessageWithEmojis(msg.message, msg.literal_emojis, msg.user)}</span>
 						</div>
 
             {msg.id && (
@@ -1903,7 +3234,7 @@ if (showUsernamePrompt) {
                 >
                   {showEmojiPanel && (
                     <div className="relative">
-                      <Card className="absolute bottom-full left-0 right-0 mb-2 z-10">
+                      <Card className="absolute bottom-full left-0 right-0 mb-2 z-10 gap-0 py-1">
                         <CardContent className="p-2">
                           <div className="flex items-center justify-between mb-2">
                             <span className="text-xs font-medium">Emojis (A-Z)</span>
@@ -1916,20 +3247,34 @@ if (showUsernamePrompt) {
                               <X className="h-3 w-3" />
                             </Button>
                           </div>
-<ScrollArea className="h-32 pr-2">
-  <div className="grid grid-cols-[repeat(auto-fit,minmax(20px,1fr))] gap-0.5 sm:gap-1 emoji-panel">
-    {emojis.map((emoji) => (
-      <button
-        key={emoji}
-        onClick={() => insertEmoji(emoji)}
-        className="p-0 m-0 flex items-center justify-center"
-        title={emoji}
-      >
-        <img src={`/img/emoji/${emoji}.png`} alt={emoji} className="h-5 w-5" />
-      </button>
-    ))}
-  </div>
-</ScrollArea>
+                          {assetLoadError && <p role="alert" className="mb-2 text-xs text-destructive">{assetLoadError}</p>}
+<div className="max-h-[108px] overflow-y-auto pr-2 sm:max-h-[116px]">
+  {assetListsLoading ? (
+    <p role="status" className="py-2 text-xs text-muted-foreground">Loading usable emojis...</p>
+  ) : usableEmojis.length > 0 ? (
+    <div
+      aria-label="Usable emojis"
+      data-testid="usable-emoji-picker"
+      className="flex flex-wrap items-start gap-0.5 sm:gap-1 emoji-panel"
+    >
+      {usableEmojis.map((emoji) => (
+        <button
+          key={emoji.asset_id}
+          type="button"
+          onClick={() => insertEmoji(emoji.name)}
+          className="p-0 m-0 flex items-center justify-center"
+          title={emoji.name}
+        >
+          <img src={emoji.url} alt={emoji.name} className="h-5 w-5" />
+        </button>
+      ))}
+    </div>
+  ) : (
+    <p className="py-2 text-xs text-muted-foreground">
+      {assetLoadError ? "Usable emojis are unavailable." : "No usable emojis yet."}
+    </p>
+  )}
+</div>
 
 
                         </CardContent>
@@ -1950,11 +3295,15 @@ if (showUsernamePrompt) {
                   <Input
                     ref={chatInputRef}
                     value={chatInput}
-                    onChange={(e) => setChatInput(e.target.value)}
+                    onChange={(e) => {
+                      setChatInput(e.target.value)
+                      setChatError("")
+                    }}
                     onKeyDown={(e) => e.key === "Enter" && sendChatMessage()}
                     placeholder="Type a message..."
                     maxLength={100}
                     disabled={isChatRestricted}
+                                autoComplete="off"
                     className="flex-1 h-7 sm:h-8 text-xs sm:text-sm"
                   />
                   <Button disabled={isChatRestricted} onClick={sendChatMessage} size="icon" className="h-7 w-7 sm:h-8 sm:w-8">
@@ -1964,7 +3313,262 @@ if (showUsernamePrompt) {
                 </fieldset>
               </CardContent>
             </Card>
-
+          {username && !isAdmin && (
+            <div className="order-4 md:order-4 lg:order-2">
+              <Card className="card-hover flex flex-col h-auto max-h-[80dvh] overflow-hidden lg:h-[calc(100dvh_-_18rem)] lg:max-h-none lg:overflow-visible lg:!transition-[transform,box-shadow]">
+                <CardHeader className="pb-2 sm:pb-3 flex-shrink-0">
+                  <CardTitle className="text-base sm:text-lg">Point Shop</CardTitle>
+                  <CardDescription className="text-xs">Preview and unlock sounds and emojis</CardDescription>
+                </CardHeader>
+                <CardContent className="min-h-0 flex-1 overflow-hidden p-3 sm:p-6">
+                  <Tabs
+                    value={shopCategory}
+                    onValueChange={(value) => setShopCategory(value as ShopCategory)}
+                    className="flex h-full flex-col"
+                  >
+                    <TabsList className="grid w-full grid-cols-3 mb-3 h-8 sm:h-10 flex-shrink-0">
+                      <TabsTrigger value="emoji" className="gap-1 text-[10px] sm:text-xs px-1">
+                        <Smile className="h-3 w-3" /> Emojis
+                      </TabsTrigger>
+                      <TabsTrigger value="sound" className="gap-1 text-[10px] sm:text-xs px-1">
+                        <Volume2 className="h-3 w-3" /> Sounds
+                      </TabsTrigger>
+                      <TabsTrigger value="add" className="gap-1 text-[10px] sm:text-xs px-1">
+                        <Upload className="h-3 w-3" /> Add
+                      </TabsTrigger>
+                    </TabsList>
+                    {(["emoji", "sound", "add"] as const).map((category) => (
+                      <TabsContent
+                        key={category}
+                        value={category}
+                        className="mt-0 min-h-0 flex-1 overflow-hidden"
+                      >
+                        {category === "add" ? (
+                          <ScrollArea className="h-full pr-2">
+                            <div className="space-y-4">
+                              {(["emoji", "sound"] as const).map((assetType) => {
+                                const draft = proposalDrafts[assetType]
+                                const prices = shopProposalPrices?.[assetType]
+                                const normalizedName = draft.name.toLowerCase().replace(/[^a-z0-9]/g, "")
+                                const regularPrice = prices
+                                  ? prices.items[normalizedName] ?? prices.default
+                                  : null
+                                const submissionPrice = prices
+                                  ? draft.exclusive ? prices.exclusive : regularPrice
+                                  : null
+                                const title = assetType === "emoji" ? "Upload emoji" : "Upload sound"
+                                const submitLabel = assetType === "emoji" ? "Add emoji" : "Add sound"
+                                const submitText = submissionPrice === null
+                                  ? submitLabel
+                                  : submissionPrice === -1
+                                    ? `${submitLabel} · Unavailable`
+                                    : `${submitLabel} · ${submissionPrice}❖`
+                                return (
+                                  <form
+                                    key={assetType}
+                                    className="space-y-2 rounded-md border p-3"
+                                    autoComplete="off"
+                                    onSubmit={(event) => void submitAssetProposal(event, assetType)}
+                                  >
+                                    <h3 className="text-sm font-semibold">{title}</h3>
+                                    <label className="block space-y-1 text-xs">
+                                      <span>Name</span>
+                                      <Input
+                                        value={draft.name}
+                                        onChange={(event) => setProposalDrafts((current) => ({
+                                          ...current,
+                                          [assetType]: { ...current[assetType], name: event.target.value },
+                                        }))}
+                                        maxLength={120}
+                                        placeholder={assetType === "emoji" ? "emojiname" : "Sound Name"}
+                                        aria-label={assetType === "emoji" ? "Emoji name" : "Sound display name"}
+                                        required
+                                      />
+                                    </label>
+                                    {assetType === "sound" && (
+                                      <label className="block space-y-1 text-xs">
+                                        <span>Loudness (0–2x multiplier)</span>
+                                        <Input
+                                          type="text"
+                                          inputMode="decimal"
+                                          value={draft.loudness}
+                                          onChange={(event) => setProposalDrafts((current) => ({
+                                            ...current,
+                                            sound: { ...current.sound, loudness: event.target.value },
+                                          }))}
+                                          placeholder="1.00"
+                                          aria-label="New sound loudness"
+                                        />
+                                      </label>
+                                    )}
+                                    <div className="space-y-1 text-xs">
+                                      <span>Upload {assetType} file or URL</span>
+                                      <div className="flex gap-2">
+                                        <Input
+                                          type="url"
+                                          value={draft.sourceUrl}
+                                          placeholder="URL..."
+                                          onChange={(event) => {
+                                            setProposalDrafts((current) => ({
+                                              ...current,
+                                              [assetType]: { ...current[assetType], sourceUrl: event.target.value },
+                                            }))
+                                            if (event.target.value) {
+                                              setProposalFiles((current) => ({ ...current, [assetType]: null }))
+                                            }
+                                          }}
+                                          className="flex-1"
+                                          aria-label={`${assetType === "sound" ? "Sound" : "Emoji"} file URL`}
+                                        />
+                                        <div className="relative">
+                                          <Input
+                                            type="file"
+                                            accept={assetType === "sound" ? ".mp3,audio/mpeg" : ".jpg,.jpeg,.png,.gif,image/jpeg,image/png,image/gif"}
+                                            onChange={(event) => {
+                                              const file = event.target.files?.[0] ?? null
+                                              setProposalFiles((current) => ({ ...current, [assetType]: file }))
+                                              if (file) {
+                                                setProposalDrafts((current) => ({
+                                                  ...current,
+                                                  [assetType]: { ...current[assetType], sourceUrl: "" },
+                                                }))
+                                              }
+                                            }}
+                                            className="hidden"
+                                            id={`proposal-${assetType}-file`}
+                                            aria-label={`${assetType === "sound" ? "Sound" : "Emoji"} file to upload`}
+                                          />
+                                          <Button
+                                            type="button"
+                                            variant="outline"
+                                            size="icon"
+                                            className="h-8 w-8 bg-transparent"
+                                            asChild
+                                          >
+                                            <label htmlFor={`proposal-${assetType}-file`} className="flex cursor-pointer items-center justify-center">
+                                              <Upload className="h-3 w-3" />
+                                            </label>
+                                          </Button>
+                                        </div>
+                                      </div>
+                                      {proposalFiles[assetType] && (
+                                        <p className="truncate text-muted-foreground">{proposalFiles[assetType]?.name}</p>
+                                      )}
+                                    </div>
+                                    <label className="flex items-center gap-2 text-xs">
+                                      <input
+                                        type="checkbox"
+                                        checked={draft.exclusive}
+                                        onChange={(event) => setProposalDrafts((current) => ({
+                                          ...current,
+                                          [assetType]: { ...current[assetType], exclusive: event.target.checked },
+                                        }))}
+                                      />
+                                      Exclusive
+                                    </label>
+                                    <Button
+                                      type="submit"
+                                      disabled={proposalSaving !== null || submissionPrice === null || submissionPrice === -1}
+                                      className="mt-3 h-7 w-full text-xs sm:h-8 sm:text-sm disabled:grayscale"
+                                    >
+                                      {proposalSaving === assetType ? "Adding..." : submitText}
+                                    </Button>
+                                  </form>
+                                )
+                              })}
+                            </div>
+                          </ScrollArea>
+                        ) : (
+                          <div className="flex h-full flex-col gap-2">
+                            <Input
+                              value={category === "emoji" ? emojiShopSearch : soundShopSearch}
+                              onChange={(event) => {
+                                if (category === "emoji") setEmojiShopSearch(event.target.value)
+                                else setSoundShopSearch(event.target.value)
+                              }}
+                              placeholder={`Search ${category === "sound" ? "sounds" : "emojis"}...`}
+                              aria-label={`Search shop ${category === "sound" ? "sounds" : "emojis"}`}
+                              className="h-7 flex-shrink-0 text-xs sm:h-8 sm:text-sm"
+                            />
+                            <ScrollArea className="min-h-0 flex-1 pr-2">
+                              {shopLoading && (
+                                <p role="status" className="py-4 text-center text-xs text-muted-foreground">
+                                  Loading shop items...
+                                </p>
+                              )}
+                              {!shopLoading && filteredShopAssets(category).length === 0 && (
+                                <p className="py-4 text-center text-xs text-muted-foreground">
+                                  {shopAssets[category].length === 0
+                                    ? `No ${category === "sound" ? "sounds" : "emojis"} available.`
+                                    : `No ${category === "sound" ? "sounds" : "emojis"} match your search.`}
+                                </p>
+                              )}
+                              <div className="space-y-2" data-testid={`shop-${category}-items`}>
+                                {filteredShopAssets(category).map((asset) => (
+                                <div
+                                  key={asset.asset_id}
+                                  className="flex items-center gap-2 rounded-md border p-2"
+                                >
+                                  {category === "emoji" ? (
+                                    <img
+                                      src={asset.url}
+                                      alt={asset.name}
+                                      className="h-8 w-8 flex-shrink-0 object-contain"
+                                    />
+                                  ) : (
+                                    <Button
+                                      type="button"
+                                      size="icon"
+                                      variant="outline"
+                                      aria-label={`Preview ${asset.title || asset.name}`}
+                                      onClick={() => previewShopSound(asset)}
+                                      className="h-8 w-8 flex-shrink-0"
+                                    >
+                                      <Volume2 className="h-3 w-3" />
+                                    </Button>
+                                  )}
+                                  <div className="min-w-0 flex-1">
+                                    <p className="truncate text-xs font-medium">
+                                      {asset.title || asset.name}
+                                    </p>
+                                    <p className="text-[10px] text-muted-foreground">
+                                      {asset.status === "owned"
+                                        ? "Owned"
+                                        : asset.status === "unavailable"
+                                          ? "Unavailable"
+                                          : `${asset.price}❖`}
+                                    </p>
+                                  </div>
+                                  {asset.status === "available" && (
+                                    <Button
+                                      type="button"
+                                      size="sm"
+                                      disabled={
+                                        purchasingAssetId === asset.asset_id
+                                        || currentPoints === null
+                                        || currentPoints < asset.price
+                                      }
+                                      onClick={() => void purchaseShopAsset(category, asset)}
+                                      className="h-7 px-2 text-[10px] sm:text-xs"
+                                    >
+                                      {purchasingAssetId === asset.asset_id ? "Buying..." : "Buy"}
+                                    </Button>
+                                  )}
+                                </div>
+                                ))}
+                              </div>
+                            </ScrollArea>
+                          </div>
+                        )}
+                      </TabsContent>
+                    ))}
+                  </Tabs>
+                  {shopError && <p role="alert" className="mt-2 text-xs text-destructive">{shopError}</p>}
+                  {shopNotice && <p role="status" className="mt-2 text-xs text-muted-foreground">{shopNotice}</p>}
+                </CardContent>
+              </Card>
+            </div>
+          )}
             {/* Online Users */}
             <Card className="card-hover flex flex-col lg:flex-shrink-0 lg:max-h-[250px] lg:!transition-[transform,box-shadow]">
               <CardHeader
@@ -1977,8 +3581,6 @@ if (showUsernamePrompt) {
                 </div>
                 <Button variant="ghost" size="icon" className="h-5 w-5 sm:h-6 sm:w-6">
                   {showOnlineList ? (
-                    <ChevronUp className="h-2.5 w-2.5 sm:h-3 sm:w-3" />
-                  ) : (
                     <ChevronDown className="h-2.5 w-2.5 sm:h-3 sm:w-3" />
                   )}
                 </Button>
@@ -2013,4 +3615,104 @@ if (showUsernamePrompt) {
       </div>
     </div>
   )
-}
+}                                autoComplete="off"
+                          <label className="block space-y-1 text-xs">
+                            <span>Default play price</span>
+                            <Input
+                              aria-label="Default sound play price"
+                              type="number"
+                              min={0}
+                              step={1}
+                              value={pointPricing.catalog.sound.play_default}
+                              onChange={(event) => updateSoundPlayDefault(event.target.valueAsNumber)}
+                              className="[appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                            />
+                          </label>
+
+                          <details className="rounded-md border px-3 py-2">
+                            <summary className="cursor-pointer text-xs font-medium">
+                              Play exceptions ({Object.keys(pointPricing.catalog.sound.play_items).length})
+                            </summary>
+                            <div className="space-y-2 pt-2">
+                              <form
+                                autoComplete="off"
+                                className="flex flex-col gap-2"
+                                onSubmit={(event) => {
+                                  event.preventDefault()
+                                  const item = newSoundPlayItem.trim()
+                                  const rawPrice = newSoundPlayItemPrice
+                                  const price = /^\d+$/.test(rawPrice) ? Number(rawPrice) : NaN
+                                  if (
+                                    !item ||
+                                    Object.prototype.hasOwnProperty.call(pointPricing.catalog.sound.play_items, item) ||
+                                    !Number.isSafeInteger(price)
+                                  ) {
+                                    setPricingError("Enter a sound filename and a non-negative whole-number play price.")
+                                    return
+                                  }
+                                  updateSoundPlayItemPrice(item, price)
+                                  setNewSoundPlayItem("")
+                                  setNewSoundPlayItemPrice("")
+                                }}
+                              >
+                                <Input
+                                  value={newSoundPlayItem}
+                                  onChange={(event) => setNewSoundPlayItem(event.target.value)}
+                                  placeholder="Sound filename (e.g. 21.mp3)"
+                                  aria-label="New sound play exception filename"
+                                  className="w-full"
+                                />
+                                <div className="flex items-center gap-2">
+                                  <Input
+                                    type="number"
+                                    min={0}
+                                    step={1}
+                                    value={newSoundPlayItemPrice}
+                                    placeholder={String(pointPricing.catalog.sound.play_default)}
+                                    onChange={(event) => setNewSoundPlayItemPrice(event.target.value)}
+                                    aria-label="New sound play exception price"
+                                    className="w-full [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                                  />
+                                  <Button type="submit" variant="outline">Add</Button>
+                                </div>
+                              </form>
+                              {Object.entries(pointPricing.catalog.sound.play_items).map(([item, price]) => (
+                                <div key={item} className="flex items-center gap-2">
+                                  <span className="min-w-0 flex-1 truncate text-xs">{item}</span>
+                                  <Input
+                                    aria-label={`${item} sound play price`}
+                                    type="number"
+                                    min={0}
+                                    step={1}
+                                    value={editedCatalogPrices[`sound-play:${item}`] ?? String(price)}
+                                    onChange={(event) => updateEditedSoundPlayItemPrice(item, event.target.value)}
+                                    className="w-24 [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                                  />
+                                  <Button
+                                    type="button"
+                                    variant="ghost"
+                                    size="icon"
+                                    aria-label={`Remove ${item} sound play exception`}
+                                    onClick={() => removeSoundPlayItemPrice(item)}
+                                  >
+                                    <Trash2 className="h-3 w-3" />
+                                  </Button>
+                                </div>
+                              ))}
+                            </div>
+                          </details>
+
+                  {permission("admin_console") && (
+                    <TabsContent value="soundboard" className="mt-0 lg:flex-1 lg:min-h-0 lg:overflow-y-auto lg:pr-3">
+                      {renderAdminAssetManagement("sound")}
+                    </TabsContent>
+                  )}
+                  {permission("admin_console") && (
+                    <TabsContent value="emoji" className="mt-0 lg:flex-1 lg:min-h-0 lg:overflow-y-auto lg:pr-3">
+                      {renderAdminAssetManagement("emoji")}
+                    </TabsContent>
+                  )}
+                    aria-label={showEmojiPanel ? "Close emoji picker" : "Open emoji picker"}
+                {chatError && <p role="alert" className="mt-1 text-xs text-destructive">{chatError}</p>}
+                  ) : (
+                    <ChevronUp className="h-2.5 w-2.5 sm:h-3 sm:w-3" />

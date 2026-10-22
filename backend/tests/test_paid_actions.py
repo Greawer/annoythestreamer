@@ -192,6 +192,24 @@ class PaidActionAccountingTests(unittest.TestCase):
         self.assertEqual(transaction['user_id'], self.user_id)
         self.assertEqual(transaction['amount'], -5)
 
+    def test_per_sound_play_cost_is_reserved_and_charged_for_the_request(self):
+        request_id = '20ce68ad-d1f7-4d18-a9f4-7458a6d8ed4a'
+
+        result, status = routes.accept_paid_action(
+            self.actions,
+            self.account,
+            request_id,
+            self.document('soundmeme'),
+            point_cost_override=8,
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(result['points'], 2)
+        action = next(iter(self.actions.documents.values()))
+        self.assertEqual(action['point_cost'], 8)
+        transaction = next(iter(self.transactions.documents.values()))
+        self.assertEqual(transaction['amount'], -8)
+
     def test_concurrent_requests_cannot_overdraw_the_balance(self):
         self.users.account['points'] = 5
         barrier = threading.Barrier(2)
@@ -347,6 +365,24 @@ class PaidActionRouteTests(unittest.TestCase):
         self.tts_actions = InMemoryActions()
         self.sound_actions = InMemoryActions()
         self.transactions = InMemoryTransactions()
+        self.sound_asset = {
+            '_id': ObjectId(),
+            'name': 'sound-file',
+            'file': 'sound-file.mp3',
+        }
+        self.sound_assets = Mock()
+        self.sound_assets.find_one.side_effect = lambda query: (
+            self.sound_asset
+            if query.get('name') == self.sound_asset['name']
+            or query.get('_id') == self.sound_asset['_id']
+            else None
+        )
+        self.asset_ownership = Mock()
+        self.asset_ownership.find_one.return_value = {
+            'user_id': self.user_id,
+            'asset_type': 'sound',
+            'asset_id': self.sound_asset['_id'],
+        }
         self.pricing = Mock()
         self.pricing.find_one.return_value = None
         self.ranks = Mock()
@@ -363,6 +399,8 @@ class PaidActionRouteTests(unittest.TestCase):
             patch.object(routes, 'colnormalmeme', self.normal_actions),
             patch.object(routes, 'colttsmeme', self.tts_actions),
             patch.object(routes, 'colsoundactions', self.sound_actions),
+            patch.object(routes, 'colsounds', self.sound_assets),
+            patch.object(routes, 'colassetownership', self.asset_ownership),
             patch.object(routes, 'colpointtransactions', self.transactions),
             patch.object(routes, 'colpricing', self.pricing),
             patch.object(routes, 'colchat', SimpleNamespace(count_documents=lambda _query: 0)),
@@ -461,20 +499,20 @@ class PaidActionRouteTests(unittest.TestCase):
             duplicate = events.handlers['playsound'](sound_request)
 
         self.assertEqual(result['status'], 'ok')
-        self.assertEqual(result['points'], 5)
+        self.assertEqual(result['points'], 0)
         self.assertTrue(duplicate['duplicate'])
-        self.assertEqual(duplicate['points'], 5)
-        self.assertEqual(self.users.account['points'], 5)
+        self.assertEqual(duplicate['points'], 0)
+        self.assertEqual(self.users.account['points'], 0)
         self.assertEqual(
             [transaction['amount'] for transaction in routes.colpointtransactions.documents.values()],
-            [-5],
+            [-10],
         )
         action = next(iter(sound_actions.documents.values()))
         self.assertEqual(action['file'], 'sound-file.mp3')
         self.assertEqual(action['user_id'], self.user_id)
         events.emit.assert_any_call(
             'playsound',
-            {'file': 'sound-file'},
+            {'file': 'sound-file', 'loudness': 1.0},
             include_self=True,
         )
         self.assertEqual(
@@ -493,6 +531,21 @@ class PaidSoundSocketTransportTests(unittest.TestCase):
             'points': 10,
         })
         actions = InMemoryActions()
+        sound_asset_id = ObjectId()
+        sound_assets = Mock()
+        sound_assets.find_one.return_value = {
+            '_id': sound_asset_id,
+            'name': 'sound-file',
+            'file': 'sound-file.mp3',
+        }
+        asset_ownership = Mock()
+        asset_ownership.find_one.return_value = {
+            'user_id': user_id,
+            'asset_type': 'sound',
+            'asset_id': sound_asset_id,
+        }
+        ranks = Mock()
+        permissions = Mock()
         app = Flask(__name__)
         app.secret_key = 'test-only-secret'
         socketio = SocketIO(app, async_mode='threading')
@@ -502,6 +555,10 @@ class PaidSoundSocketTransportTests(unittest.TestCase):
         patches = [
             patch.object(routes, 'colusers', users),
             patch.object(routes, 'colsoundactions', actions),
+            patch.object(routes, 'colsounds', sound_assets),
+            patch.object(routes, 'colassetownership', asset_ownership),
+            patch.object(routes, 'colranks', ranks),
+            patch.object(routes, 'colpermissions', permissions),
             patch.object(routes, 'colpointtransactions', InMemoryTransactions()),
             patch.object(routes, 'colpricing', Mock(find_one=Mock(return_value=None))),
             patch.object(routes, 'colsettings', SimpleNamespace(find_one=lambda _query: None)),
@@ -514,6 +571,7 @@ class PaidSoundSocketTransportTests(unittest.TestCase):
         for active_patch in patches:
             active_patch.start()
         self.addCleanup(lambda: [active_patch.stop() for active_patch in reversed(patches)])
+        configure_role_permissions(routes, ranks, permissions)
         routes.registersocketiohandlers(socketio)
 
         client = socketio.test_client(app, flask_test_client=flask_client)
@@ -530,10 +588,10 @@ class PaidSoundSocketTransportTests(unittest.TestCase):
         ]
 
         self.assertEqual(first_ack['status'], 'ok')
-        self.assertEqual(first_ack['points'], 5)
+        self.assertEqual(first_ack['points'], 0)
         self.assertTrue(retry_ack['duplicate'])
-        self.assertEqual(retry_ack['points'], 5)
-        self.assertEqual(users.account['points'], 5)
+        self.assertEqual(retry_ack['points'], 0)
+        self.assertEqual(users.account['points'], 0)
         self.assertEqual(len(actions.documents), 1)
         self.assertEqual(len(played_sounds), 1)
 

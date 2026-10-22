@@ -8,18 +8,26 @@ type Sound = {
 
 export default function Soundboard() {
   const [sounds, setSounds] = useState<Sound[]>([]);
+  const [error, setError] = useState("");
 
   useEffect(() => {
     fetch("/api/soundboardlist")
-      .then(res => res.json())
-      .then((sounds: { file: string; title: string; url: string }[]) => {
-        setSounds(sounds.map(sound => ({
+      .then(async (res) => {
+        const result = await res.json()
+        if (!res.ok) throw new Error(result.message || `Sound list request failed (${res.status})`)
+        return result as { file: string; title: string; url: string }[]
+      })
+      .then((assets) => {
+        setSounds(assets.map(sound => ({
           file: sound.file,
           label: sound.title,
           url: sound.url,
         })));
       })
-      .catch(err => console.error("Error loading sounds:", err));
+      .catch(err => {
+        setError(err instanceof Error ? err.message : "Error loading sounds")
+        console.error("Error loading sounds:", err)
+      });
   }, []);
 
   const playSound = (url: string) => {
@@ -31,7 +39,7 @@ export default function Soundboard() {
     <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2 mt-4">
       {sounds.length === 0 && (
         <p className="col-span-full text-gray-400 text-sm italic">
-          No sounds found.
+          {error || "No usable sounds found."}
         </p>
       )}
       {sounds.map((sound, i) => (

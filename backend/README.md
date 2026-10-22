@@ -60,15 +60,39 @@ Routes are registered in `backend/routes.py`. The main API routes include:
   lookup, login/registration, and session management.
 - `/admin/*` for permission-guarded pricing, user inspection, point adjustment,
   rank and timeout management, and stream controls.
+- `/admin/assets/<sound|emoji>` and `/admin/assets/<sound|emoji>/<id>` for
+  capability-guarded asset management; `/admin/pricing` for saved prices,
+  proposal rewards, and upload limits.
+- `/shop/catalog`, `/shop/purchase`, and `/shop/propose` for the authenticated
+  Point Shop, purchases, and custom asset proposals; `/soundboard/favorites`
+  persists each account's favorites.
 - `POST /handle_post` for one authenticated face-meme, normal-meme, or TTS
   action. The backend resolves its price and balance change.
 - `/facememe/next`, `/normalmeme/next`, `/ttsmeme/next`, and
   `/tts/done/<id>` for queued content; `/chathistory`, `/soundboardlist`,
-  `/api/list-emojis`, and `/static/*` for chat and media.
+  `/api/list-emojis`, `/public-emojis`, and `/static/*` for chat and media.
 
 Socket.IO handles authenticated `playsound` requests, chat messages, connection
 presence, and streaming status. Backend permissions and accounting are
 authoritative; frontend visibility is not a security boundary.
+
+## Pricing, assets, and ownership
+
+The `pricing` collection stores the shared versioned pricing document. It
+contains Send Your Chaos/TTS costs, sound and emoji catalog defaults and
+exceptions, proposal reward defaults/exclusive costs/named exceptions, upload
+limits, and sound play costs. An Admin needs the `admin_console` capability to
+read or save pricing and administer assets. Prices and upload limits are
+validated and enforced by Flask; a price of `-1` means unavailable, never free.
+
+Assets are stored separately in the `sounds` and `emojis` collections.
+`asset_ownership` associates accounts with stable asset IDs, `shop_purchases`
+records idempotent purchases, and `sound_favorites` stores per-account sound
+favorites and their ordering. Admin uploads are distinct from shop availability
+and account ownership. User proposals are charged from the configured proposal
+reward settings and become owned by their submitter; they do not become
+shop-available automatically. The backend uses unique indexes for asset names,
+ownership, purchase idempotency, and favorite membership.
 
 All shared website images and media live under root `public/`: images and emoji
 are in `public/img/`, and soundboard/TTS audio is in `public/sounds/`. Next.js

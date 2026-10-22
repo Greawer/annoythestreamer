@@ -74,6 +74,22 @@ are local runtime assets and are not versioned.
 The current soundboard obtains its list and titles from Flask's file scan and
 audio metadata; it does not read this text file.
 
+## Pricing, asset catalog, and Point Shop
+
+Pricing is stored in MongoDB and edited from the capability-guarded Admin
+panel. It controls Send Your Chaos/TTS costs, catalog purchase prices and
+named exceptions, proposal rewards, upload limits, and sound play costs.
+Price `-1` makes an item unavailable for purchase; the backend enforces prices,
+balances, ownership, and idempotency.
+
+Admins manage sound and emoji uploads, metadata, availability, and removal in
+separate tabs. Users can purchase available catalog assets or submit sound
+and emoji proposals in the Point Shop. Ownership is stored by account and
+stable asset ID; uploaded, available, purchased, and usable states remain
+separate. Sound favorites are per account, and sound play pricing is separate
+from purchase pricing. These settings and records are database-backed; no
+additional local setup or pricing file is required.
+
 ## Run locally
 
 Start MongoDB first. Run each application service in its own PowerShell

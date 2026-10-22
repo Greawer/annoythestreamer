@@ -6,6 +6,8 @@ import { io, type Socket } from "socket.io-client";
 interface ChatMessage {
   user: string;
   message: string;
+  literal_emojis?: string[];
+  rank_color?: string | null;
   id?: string;
 }
 
@@ -27,7 +29,7 @@ const getUserColor = (user: string, currentUsername: string) => {
 
 const ChatCapturePage = () => {
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
-  const [emojis, setEmojis] = useState<string[]>([]);
+  const [emojiUrls, setEmojiUrls] = useState<Record<string, string>>({});
   const [currentUsername, setCurrentUsername] = useState("");
   const chatBoxRef = useRef<HTMLDivElement>(null);
   const socketRef = useRef<Socket | null>(null);
@@ -40,10 +42,10 @@ const ChatCapturePage = () => {
   useEffect(() => {
     const loadEmojis = async () => {
       try {
-        const res = await fetch("/api/list-emojis");
+        const res = await fetch("/api/public-emojis");
         if (!res.ok) throw new Error(res.statusText);
-        const data = await res.json();
-        setEmojis(data);
+        const data: { name: string; url: string }[] = await res.json();
+        setEmojiUrls(Object.fromEntries(data.map((emoji) => [emoji.name, emoji.url])));
       } catch (err) {
         console.warn("Failed to load emojis:", err);
       }
@@ -62,6 +64,18 @@ const ChatCapturePage = () => {
     socketRef.current.on("chat_history", (msgs: ChatMessage[]) => {
       setChatMessages(msgs.slice(-50));
     });
+    socketRef.current.on("asset_catalog_changed", (event: { asset_type: "sound" | "emoji" }) => {
+      if (event.asset_type !== "emoji") return;
+      void fetch("/api/public-emojis")
+        .then((response) => {
+          if (!response.ok) throw new Error(response.statusText);
+          return response.json();
+        })
+        .then((emojis: { name: string; url: string }[]) => {
+          setEmojiUrls(Object.fromEntries(emojis.map((emoji) => [emoji.name, emoji.url])));
+        })
+        .catch((error) => console.warn("Failed to refresh emojis:", error));
+    });
 
     return () => {
       socketRef.current?.disconnect();
@@ -75,15 +89,15 @@ const ChatCapturePage = () => {
     }
   }, [chatMessages]);
 
-  const renderMessageWithEmojis = (message: string) => {
+  const renderMessageWithEmojis = (message: string, literalEmojis: string[] = []) => {
     const parts = message.split(/(:\w+:)/g);
     return parts.map((part, idx) => {
       const emojiName = part.replace(/:/g, "");
-      if (emojis.includes(emojiName)) {
+      if (emojiUrls[emojiName] && !literalEmojis.includes(emojiName)) {
         return (
           <img
             key={idx}
-            src={`/img/emoji/${emojiName}.png`}
+            src={emojiUrls[emojiName]}
             alt={emojiName}
             className="inline h-5 w-5 align-text-bottom"
           />
@@ -139,10 +153,10 @@ const ChatCapturePage = () => {
             className={`group p-1 sm:p-1.5 rounded flex items-start justify-between gap-2 ${highlightClass}`}
           >
             <div className="flex-1 min-w-0 break-words">
-              <span style={{ color: getUserColor(msg.user, currentUsername) }} className="font-semibold">
+              <span style={{ color: msg.rank_color ?? getUserColor(msg.user, currentUsername) }} className="font-semibold">
                 {msg.user}:
               </span>{" "}
-              <span className="break-words">{renderMessageWithEmojis(msg.message)}</span>
+              <span className="break-words">{renderMessageWithEmojis(msg.message, msg.literal_emojis)}</span>
             </div>
           </div>
         );

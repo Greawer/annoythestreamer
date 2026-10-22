@@ -36,6 +36,13 @@ class PublicAssetRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(set(response.get_json()), {'sample'})
 
+        public_assets = self.client.get('/public-emojis')
+        self.assertEqual(public_assets.status_code, 200)
+        self.assertEqual(
+            public_assets.get_json(),
+            [{'name': 'sample', 'url': '/img/emoji/sample.jpg'}],
+        )
+
         response = self.client.get('/emoji/sample')
         self.assertEqual(response.get_json(), {'url': '/static/img/emoji/sample.jpg'})
 
@@ -52,19 +59,12 @@ class PublicAssetRouteTests(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.data, b'generated audio')
 
-    def test_soundboard_listing_and_static_route_use_public_directory(self):
+    def test_soundboard_listing_requires_login_and_static_route_uses_public_directory(self):
         sound_path = self.soundboard_path / 'sample.mp3'
         sound_path.write_bytes(b'test audio')
         with patch.object(routes, 'SOUNDDIR', str(self.soundboard_path)):
             with self.client.get('/soundboardlist') as listing:
-                self.assertEqual(
-                    listing.get_json(),
-                    [{
-                        'file': 'sample.mp3',
-                        'title': 'sample',
-                        'url': '/static/sounds/soundboard/sample.mp3',
-                    }],
-                )
+                self.assertEqual(listing.status_code, 401)
 
         with self.client.get('/static/sounds/soundboard/sample.mp3') as response:
             self.assertEqual(response.status_code, 200)

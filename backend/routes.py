@@ -18,18 +18,32 @@ from client import (
     colpermissions,
     colsettings,
     colpricing,
+    colsounds,
+    colemojis,
+    colassetownership,
+    colshoppurchases,
+    colsoundfavorites,
     lastfacememe,
     lastnormalmeme,
 )
 from datetime import datetime, timedelta, timezone
+import math
 import os
 import logging
 import re
 import uuid
 import copy
+import hashlib
+import tempfile
+import ipaddress
+import http.client
+import io
+import socket
+import urllib.parse
 from collections import deque
 from mutagen import File as MutagenFile
 
+from werkzeug.datastructures import FileStorage
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
@@ -42,15 +56,26 @@ ACTION_COSTS = {
 }
 MAX_POINT_PRICE = 9_007_199_254_740_991
 POINT_PRICING_ID = 'point_pricing'
+ASSET_PRICE_UNCHANGED = object()
 DEFAULT_POINT_PRICING = {
     'send_your_chaos': dict(ACTION_COSTS),
     'catalog': {
         'emoji': {'default': 100, 'categories': {}, 'items': {}},
-        'sound': {'default': 100, 'categories': {}, 'items': {}},
+        'sound': {
+            'default': 100,
+            'categories': {},
+            'items': {},
+            'play_default': 10,
+            'play_items': {},
+        },
     },
     'proposal_rewards': {
-        'sound': {'default': 100_000, 'items': {}},
-        'emoji': {'default': 100_000, 'items': {}},
+        'sound': {'default': 100_000, 'exclusive': 100_000, 'items': {}},
+        'emoji': {'default': 100_000, 'exclusive': 100_000, 'items': {}},
+    },
+    'asset_limits': {
+        'emoji': {'max_px': 1024, 'max_px_admin': 2048},
+        'sound': {'max_length': 3, 'max_length_admin': 10},
     },
 }
 lastmessages = deque(maxlen=MAX_MESSAGES)
@@ -273,7 +298,7 @@ def validate_price(value, label):
     return value
 
 
-def validate_price_map(value, label):
+def validate_price_map(value, label, allow_filename=False):
     if not isinstance(value, dict):
         raise ValueError(f'{label} must be an object')
     normalized = {}
@@ -281,8 +306,10 @@ def validate_price_map(value, label):
         if (
             not isinstance(raw_key, str)
             or not raw_key.strip()
-            or len(raw_key.strip()) > 80
-            or any(character in raw_key for character in ('.', '$'))
+            or len(raw_key.strip()) > (120 if allow_filename else 80)
+            or '$' in raw_key
+            or ('.' in raw_key and not allow_filename)
+            or (allow_filename and os.path.basename(raw_key) != raw_key)
             or any(ord(character) < 32 for character in raw_key)
         ):
             raise ValueError(f'{label} names must be 1 to 80 characters and cannot contain "." or "$"')
@@ -295,8 +322,37 @@ def validate_price_map(value, label):
 
 def validate_point_pricing(value):
     if not isinstance(value, dict):
+def validate_play_price(value, label):
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MAX_POINT_PRICE:
+        raise ValueError(f'{label} must be a whole number from 0 to {MAX_POINT_PRICE}')
+    return value
+
+
+def validate_play_price_map(value, label, allow_filename=False):
+    if not isinstance(value, dict):
+        raise ValueError(f'{label} must be an object')
+    normalized = {}
+    for raw_key, price in value.items():
+        if (
+            not isinstance(raw_key, str)
+            or not raw_key.strip()
+            or len(raw_key.strip()) > (120 if allow_filename else 80)
+            or '$' in raw_key
+            or ('.' in raw_key and not allow_filename)
+            or (allow_filename and os.path.basename(raw_key) != raw_key)
+            or any(ord(character) < 32 for character in raw_key)
+        ):
+            raise ValueError(f'{label} names must be 1 to 80 characters and cannot contain "." or "$"')
+        key = raw_key.strip()
+        if key in normalized:
+            raise ValueError(f'{label} contains a duplicate name: {key}')
+        normalized[key] = validate_play_price(price, f'{label} price for "{key}"')
+    return normalized
+
+
         raise ValueError('Pricing must be an object')
-    if set(value) != {'send_your_chaos', 'catalog', 'proposal_rewards'}:
+    required_sections = {'send_your_chaos', 'catalog', 'proposal_rewards'}
+    if not required_sections.issubset(value) or set(value) - required_sections - {'asset_limits'}:
         raise ValueError('Pricing must include Send Your Chaos, catalog, and proposal reward settings')
 
     chaos = value['send_your_chaos']
@@ -312,7 +368,13 @@ def validate_point_pricing(value):
         raise ValueError('Catalog pricing must include emoji and sound')
     normalized_catalog = {}
     for asset_type, asset_prices in catalog.items():
-        if not isinstance(asset_prices, dict) or set(asset_prices) != {'default', 'categories', 'items'}:
+        required_fields = {'default', 'categories', 'items'}
+        optional_fields = {'play_default', 'play_items'} if asset_type == 'sound' else set()
+        if (
+            not isinstance(asset_prices, dict)
+            or not required_fields.issubset(asset_prices)
+            or set(asset_prices) - required_fields - optional_fields
+        ):
             raise ValueError(f'{asset_type} pricing must include default, categories, and items')
         normalized_catalog[asset_type] = {
             'default': validate_price(asset_prices['default'], f'{asset_type} default price'),
@@ -320,30 +382,74 @@ def validate_point_pricing(value):
                 asset_prices['categories'],
                 f'{asset_type} category',
             ),
-            'items': validate_price_map(asset_prices['items'], f'{asset_type} item'),
+            'items': validate_price_map(
+                asset_prices['items'],
+                f'{asset_type} item',
+                allow_filename=asset_type == 'sound',
+            ),
         }
 
     proposals = value['proposal_rewards']
+        if asset_type == 'sound':
+            normalized_catalog[asset_type].update({
+                'play_default': validate_play_price(
+                    asset_prices.get('play_default', 10),
+                    'Soundboard default play price',
+                ),
+                'play_items': validate_play_price_map(
+                    asset_prices.get('play_items', {}),
+                    'Soundboard play exception',
+                    allow_filename=True,
+                ),
+            })
     if not isinstance(proposals, dict) or set(proposals) != {'sound', 'emoji'}:
         raise ValueError('Proposal rewards must include sound and emoji')
     normalized_proposals = {}
     for proposal_type, rewards in proposals.items():
-        if not isinstance(rewards, dict) or set(rewards) != {'default', 'items'}:
-            raise ValueError(f'{proposal_type} proposal rewards must include default and items')
+        if (
+            not isinstance(rewards, dict)
+            or not {'default', 'items'}.issubset(rewards)
+            or set(rewards) - {'default', 'exclusive', 'items'}
+        ):
+            raise ValueError(f'{proposal_type} proposal prices must include default, exclusive, and items')
         normalized_proposals[proposal_type] = {
             'default': validate_price(rewards['default'], f'{proposal_type} proposal reward'),
             'items': validate_price_map(
                 rewards['items'],
+            'exclusive': validate_price(
+                rewards.get('exclusive', DEFAULT_POINT_PRICING['proposal_rewards'][proposal_type]['exclusive']),
+                f'{proposal_type} exclusive submission price',
+            ),
                 f'{proposal_type} proposal item',
             ),
         }
 
     return {
         'send_your_chaos': normalized_chaos,
+    limits = value.get('asset_limits', DEFAULT_POINT_PRICING['asset_limits'])
+    if not isinstance(limits, dict) or set(limits) != {'emoji', 'sound'}:
+        raise ValueError('Asset limits must include emoji and sound')
+    normalized_limits = {}
+    for asset_type, fields in {
+        'emoji': ('max_px', 'max_px_admin'),
+        'sound': ('max_length', 'max_length_admin'),
+    }.items():
+        values = limits[asset_type]
+        if not isinstance(values, dict) or set(values) != set(fields):
+            raise ValueError(f'{asset_type} upload limits are invalid')
+        maximum = 8192 if asset_type == 'emoji' else 180
+        normalized_limits[asset_type] = {}
+        for field in fields:
+            limit = values[field]
+            if isinstance(limit, bool) or not isinstance(limit, int) or not 0 < limit <= maximum:
+                raise ValueError(f'{asset_type} {field} must be a positive whole number no greater than {maximum}')
+            normalized_limits[asset_type][field] = limit
+
         'catalog': normalized_catalog,
         'proposal_rewards': normalized_proposals,
     }
 
+        'asset_limits': normalized_limits,
 
 def load_point_pricing():
     document = colpricing.find_one({'_id': POINT_PRICING_ID})
@@ -351,12 +457,53 @@ def load_point_pricing():
         return copy.deepcopy(DEFAULT_POINT_PRICING)
     pricing = document.get('pricing')
     try:
-        return validate_point_pricing(pricing)
+        normalized = validate_point_pricing(pricing)
     except ValueError as error:
         logger.error('Stored point pricing is invalid: %s', error)
         raise ValueError('Stored point pricing is invalid; an administrator must correct it') from error
 
 
+    if isinstance(pricing, dict):
+        if 'asset_limits' not in pricing:
+            colpricing.update_one(
+                {'_id': POINT_PRICING_ID, 'pricing.asset_limits': {'$exists': False}},
+                {'$set': {'pricing.asset_limits': normalized['asset_limits']}},
+            )
+        sound_pricing = pricing.get('catalog', {}).get('sound', {})
+        for field in ('play_default', 'play_items'):
+            if field not in sound_pricing:
+                colpricing.update_one(
+                    {
+                        '_id': POINT_PRICING_ID,
+                        f'pricing.catalog.sound.{field}': {'$exists': False},
+                    },
+                    {'$set': {
+                        f'pricing.catalog.sound.{field}': normalized['catalog']['sound'][field],
+                    }},
+                )
+        for asset_type in ('emoji', 'sound'):
+            if 'exclusive' not in pricing.get('proposal_rewards', {}).get(asset_type, {}):
+                colpricing.update_one(
+                    {
+                        '_id': POINT_PRICING_ID,
+                        f'pricing.proposal_rewards.{asset_type}.exclusive': {'$exists': False},
+                    },
+                    {'$set': {
+                        f'pricing.proposal_rewards.{asset_type}.exclusive':
+                            normalized['proposal_rewards'][asset_type]['exclusive'],
+                    }},
+                )
+    return normalized
+
+
+def resolve_catalog_asset_price(asset_type, asset, pricing=None):
+    if asset.get('exclusive') is True:
+        return -1
+    settings = pricing if pricing is not None else load_point_pricing()
+    item_key = catalog_asset_exception_key(asset_type, asset, settings)
+    if item_key is not None:
+        return settings['catalog'][asset_type]['items'][item_key]
+    return settings['catalog'][asset_type]['default']
 def resolve_catalog_price(asset_type, item_id=None, category=None, pricing=None):
     settings = pricing if pricing is not None else load_point_pricing()
     catalog = settings['catalog'].get(asset_type)
@@ -371,6 +518,823 @@ def resolve_catalog_price(asset_type, item_id=None, category=None, pricing=None)
 
 def resolve_proposal_reward(proposal_type, item_id=None, pricing=None):
     settings = pricing if pricing is not None else load_point_pricing()
+def resolve_sound_play_price(asset, pricing):
+    sound_pricing = pricing['catalog']['sound']
+    item_key = catalog_asset_exception_key('sound', asset, pricing, 'play_items')
+    return sound_pricing['play_items'][item_key] if item_key is not None else sound_pricing['play_default']
+
+
+def catalog_asset_exception_key(asset_type, asset, pricing, map_name='items'):
+    asset_pricing = pricing['catalog'][asset_type]
+    candidates = []
+    filename = asset.get('file')
+    if asset_type == 'sound' and isinstance(filename, str):
+        candidates.extend((filename, os.path.splitext(filename)[0]))
+    candidates.extend((asset.get('pricing_name'), asset.get('name')))
+    return next(
+        (
+            candidate
+            for candidate in dict.fromkeys(candidates)
+            if isinstance(candidate, str) and candidate in asset_pricing[map_name]
+        ),
+        None,
+    )
+
+
+def catalog_asset_exception_value(asset_type, asset, pricing, map_name='items'):
+    key = catalog_asset_exception_key(asset_type, asset, pricing, map_name)
+    return pricing['catalog'][asset_type][map_name].get(key) if key is not None else None
+
+
+def catalog_asset_exception_target(asset_type, asset):
+    if asset_type == 'sound':
+        filename = asset.get('file')
+        if isinstance(filename, str) and filename:
+            return filename
+    return asset.get('pricing_name', asset['name'])
+
+
+def asset_collection(asset_type):
+    if asset_type == 'sound':
+        return colsounds
+    if asset_type == 'emoji':
+        return colemojis
+    raise ValueError(f'Unsupported asset type: {asset_type}')
+
+
+def normalize_asset_name(value):
+    if not isinstance(value, str):
+        raise ValueError('Asset name is required')
+    name = re.sub(r'[^a-z0-9]', '', value.lower())
+    if not name or len(name) > 80:
+        raise ValueError('Asset name must contain 1 to 80 letters or numbers')
+    return name
+
+
+def parse_asset_price(value):
+    if value is None or value == '':
+        return None
+    if isinstance(value, str):
+        if not re.fullmatch(r'-?\d+', value):
+            raise ValueError('Price must be -1 or a non-negative whole number')
+        value = int(value)
+    return validate_price(value, 'Asset price')
+
+
+def parse_play_price(value):
+    if value is None or value == '':
+        return None
+    if isinstance(value, str):
+        if not re.fullmatch(r'\d+', value):
+            raise ValueError('Play price must be a non-negative whole number')
+        value = int(value)
+    return validate_play_price(value, 'Play price')
+
+
+def inspect_emoji_file(path):
+    size = os.path.getsize(path)
+    if size > 16 * 1024 * 1024:
+        raise ValueError('Emoji files must be no larger than 16 MB')
+    with open(path, 'rb') as image:
+        header = image.read(32)
+        if header.startswith(b'\x89PNG\r\n\x1a\n') and len(header) >= 24:
+            return 'png', int.from_bytes(header[16:20], 'big'), int.from_bytes(header[20:24], 'big')
+        if header.startswith((b'GIF87a', b'GIF89a')) and len(header) >= 10:
+            return 'gif', int.from_bytes(header[6:8], 'little'), int.from_bytes(header[8:10], 'little')
+        if header.startswith(b'\xff\xd8'):
+            image.seek(2)
+            while True:
+                marker_start = image.read(1)
+                if not marker_start:
+                    break
+                if marker_start != b'\xff':
+                    continue
+                marker = image.read(1)
+                while marker == b'\xff':
+                    marker = image.read(1)
+                if marker in {b'\xd8', b'\xd9', b'\x00'}:
+                    continue
+                length_bytes = image.read(2)
+                if len(length_bytes) != 2:
+                    break
+                segment_length = int.from_bytes(length_bytes, 'big')
+                if marker in {
+                    b'\xc0', b'\xc1', b'\xc2', b'\xc3', b'\xc5', b'\xc6',
+                    b'\xc7', b'\xc9', b'\xca', b'\xcb', b'\xcd', b'\xce', b'\xcf',
+                }:
+                    image.read(1)
+                    dimensions = image.read(4)
+                    if len(dimensions) == 4:
+                        return 'jpg', int.from_bytes(dimensions[2:4], 'big'), int.from_bytes(dimensions[:2], 'big')
+                    break
+                if segment_length < 2:
+                    break
+                image.seek(segment_length - 2, os.SEEK_CUR)
+    raise ValueError('Emoji must be a valid JPG, PNG, or GIF image')
+
+
+def validate_uploaded_asset(upload, asset_type, directory, maximum=None):
+    if not upload or not upload.filename:
+        raise ValueError('Choose a file to upload')
+    if maximum is None:
+        maximum = 10 if asset_type == 'sound' else 2048
+    os.makedirs(directory, exist_ok=True)
+    with tempfile.NamedTemporaryFile(delete=False, dir=directory, prefix='.ats-upload-') as temporary:
+        temporary_path = temporary.name
+    try:
+        upload.save(temporary_path)
+        if asset_type == 'sound':
+            if not upload.filename.lower().endswith('.mp3') or os.path.getsize(temporary_path) > 10 * 1024 * 1024:
+                raise ValueError('Sound uploads must be MP3 files no larger than 10 MB')
+            audio = MutagenFile(temporary_path)
+            duration = getattr(getattr(audio, 'info', None), 'length', None)
+            mime_types = getattr(audio, 'mime', []) if audio is not None else []
+            if (
+                audio is None
+                or not isinstance(duration, (int, float))
+                or duration <= 0
+                or duration > maximum
+                or not any(mime == 'audio/mpeg' for mime in mime_types)
+            ):
+                raise ValueError(f'Sound uploads must be valid MP3 audio no longer than {maximum} seconds')
+            return temporary_path, 'mp3'
+
+        extension, width, height = inspect_emoji_file(temporary_path)
+        if not 0 < width <= maximum or not 0 < height <= maximum:
+            raise ValueError(f'Emoji dimensions must not exceed {maximum} by {maximum} pixels')
+        return temporary_path, extension
+    except Exception:
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
+        raise
+
+
+def connect_admin_asset_address(address_info, timeout, source_address, context, hostname):
+    family, socket_type, protocol, _canonical_name, sockaddr = address_info
+    asset_socket = socket.socket(family, socket_type, protocol)
+    try:
+        asset_socket.settimeout(timeout)
+        if source_address:
+            asset_socket.bind(source_address)
+        asset_socket.connect(sockaddr)
+        return context.wrap_socket(asset_socket, server_hostname=hostname)
+    except OSError:
+        asset_socket.close()
+        raise
+
+
+def fetch_admin_asset_url(source_url, asset_type):
+    if not isinstance(source_url, str) or not source_url.strip():
+        raise ValueError('Enter a valid HTTPS asset URL')
+    try:
+        parsed = urllib.parse.urlsplit(source_url.strip())
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError('Enter a valid HTTPS asset URL') from error
+    if (
+        parsed.scheme != 'https'
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or port not in (None, 443)
+    ):
+        raise ValueError('Asset URLs must use HTTPS without credentials or a custom port')
+    try:
+        resolved_addresses = socket.getaddrinfo(parsed.hostname, 443, type=socket.SOCK_STREAM)
+    except (OSError, ValueError) as error:
+        raise ValueError('The asset URL host could not be resolved') from error
+    if not resolved_addresses or any(
+        not ipaddress.ip_address(address[4][0]).is_global
+        for address in resolved_addresses
+    ):
+        raise ValueError('Asset URLs must resolve only to public addresses')
+
+    class PinnedHTTPSConnection(http.client.HTTPSConnection):
+        def __init__(self, host, addresses):
+            super().__init__(host, port=443, timeout=10)
+            self.addresses = addresses
+
+        def connect(self):
+            last_error = None
+            for address_info in self.addresses:
+                try:
+                    self.sock = connect_admin_asset_address(
+                        address_info,
+                        self.timeout,
+                        self.source_address,
+                        self._context,
+                        self.host,
+                    )
+                    return
+                except OSError as error:
+                    last_error = error
+            if last_error:
+                raise last_error
+            raise OSError('The asset URL host has no usable address')
+
+    connection = PinnedHTTPSConnection(parsed.hostname, resolved_addresses)
+    request_path = parsed.path or '/'
+    if parsed.query:
+        request_path = f'{request_path}?{parsed.query}'
+    try:
+        connection.request(
+            'GET',
+            request_path,
+            headers={'User-Agent': 'AnnoyTheStreamer-AssetUpload/1.0'},
+        )
+        with connection.getresponse() as response:
+            if response.status != 200:
+                raise ValueError('The asset URL did not return a successful response')
+            content = response.read(16 * 1024 * 1024 + 1)
+    except (http.client.HTTPException, TimeoutError, OSError) as error:
+        raise ValueError('The asset URL could not be downloaded') from error
+    finally:
+        connection.close()
+    if len(content) > 16 * 1024 * 1024:
+        raise ValueError('The asset URL file is too large')
+
+    path_name = os.path.basename(parsed.path)
+    if not path_name or '.' not in path_name:
+        path_name = 'asset.mp3' if asset_type == 'sound' else 'asset'
+    return FileStorage(stream=io.BytesIO(content), filename=path_name)
+
+
+def save_catalog_price_exception(
+    asset_type,
+    old_name,
+    new_name,
+    price=ASSET_PRICE_UNCHANGED,
+    play_price=ASSET_PRICE_UNCHANGED,
+    old_play_name=ASSET_PRICE_UNCHANGED,
+    new_play_name=ASSET_PRICE_UNCHANGED,
+):
+    pricing = load_point_pricing()
+    items = pricing['catalog'][asset_type]['items']
+    old_has_exception = old_name in items
+    if old_name != new_name and new_name in items and (
+        old_has_exception or price not in (None, ASSET_PRICE_UNCHANGED)
+    ):
+        raise ValueError('An unrelated price exception already uses the new asset name')
+    old_price = items.get(old_name)
+    if old_name != new_name:
+        items.pop(old_name, None)
+        if price is ASSET_PRICE_UNCHANGED and old_has_exception:
+            items[new_name] = old_price
+    if price is None:
+        items.pop(new_name, None)
+    elif price is not ASSET_PRICE_UNCHANGED:
+        items[new_name] = price
+    if asset_type == 'sound':
+        play_items = pricing['catalog']['sound']['play_items']
+        play_old_key = old_name if old_play_name is ASSET_PRICE_UNCHANGED else old_play_name
+        play_new_key = new_name if new_play_name is ASSET_PRICE_UNCHANGED else new_play_name
+        old_has_play_exception = play_old_key in play_items
+        if play_old_key != play_new_key and play_new_key in play_items and (
+            old_has_play_exception or play_price not in (None, ASSET_PRICE_UNCHANGED)
+        ):
+            raise ValueError('An unrelated play-price exception already uses the new sound filename')
+        old_play_price = play_items.get(play_old_key)
+        if play_old_key != play_new_key:
+            play_items.pop(play_old_key, None)
+            if play_price is ASSET_PRICE_UNCHANGED and old_has_play_exception:
+                play_items[play_new_key] = old_play_price
+        if play_price is None:
+            play_items.pop(play_new_key, None)
+        elif play_price is not ASSET_PRICE_UNCHANGED:
+            play_items[play_new_key] = validate_play_price(play_price, 'Sound play price')
+    elif play_price is not ASSET_PRICE_UNCHANGED:
+        raise ValueError('Play-price exceptions are only supported for sounds')
+    normalized = validate_point_pricing(pricing)
+    colpricing.update_one(
+        {'_id': POINT_PRICING_ID},
+        {'$set': {
+            'schema_version': 1,
+            'pricing': normalized,
+            'updated_at': datetime.now(timezone.utc),
+        }},
+        upsert=True,
+    )
+    return normalized
+
+
+def can_use_asset(account, asset_type, asset):
+    if not isinstance(account, dict) or not isinstance(asset, dict):
+        return False
+    if has_permission(account, 'admin_console'):
+        return True
+    return colassetownership.find_one({
+        'user_id': account.get('_id'),
+        'asset_type': asset_type,
+        'asset_id': asset.get('_id'),
+    }) is not None
+
+
+def upload_limit(pricing, asset_type, is_admin):
+    limits = pricing['asset_limits'][asset_type]
+    if asset_type == 'emoji':
+        return limits['max_px_admin' if is_admin else 'max_px']
+    return limits['max_length_admin' if is_admin else 'max_length']
+
+
+def legacy_emoji_exists(name):
+    return any(
+        os.path.isfile(os.path.join(EMOJIDIR, f'{name}{extension}'))
+        for extension in ('.jpg', '.png', '.gif')
+    )
+
+
+def list_usable_assets(account, asset_type):
+    collection = asset_collection(asset_type)
+    if has_permission(account, 'admin_console'):
+        return list(collection.find({}).sort('name', 1))
+    owned_assets = colassetownership.find(
+        {'user_id': account['_id'], 'asset_type': asset_type},
+        {'asset_id': 1},
+    )
+    asset_ids = [record['asset_id'] for record in owned_assets if isinstance(record.get('asset_id'), ObjectId)]
+    return list(collection.find({'_id': {'$in': asset_ids}}).sort('name', 1)) if asset_ids else []
+
+
+def serialize_asset(asset, asset_type, pricing):
+    name = asset['name']
+    price = resolve_catalog_asset_price(asset_type, asset, pricing)
+    if asset_type == 'sound':
+        filename = asset['file']
+        return {
+            'asset_id': str(asset['_id']),
+            'name': name,
+            'file': filename,
+            'title': asset.get('display_name', name),
+            'display_name': asset.get('display_name', name),
+            'loudness': asset.get('loudness', 1.0),
+            'price': price,
+            'url': f"/static/sounds/soundboard/{filename}",
+        }
+    filename = asset['file']
+    return {
+        'asset_id': str(asset['_id']),
+        'name': name,
+        'file': filename,
+        'price': price,
+        'url': f"/img/emoji/{filename}",
+    }
+
+
+def register_legacy_assets():
+    colpricing.update_one(
+        {'_id': POINT_PRICING_ID},
+        {'$setOnInsert': {
+            'schema_version': 1,
+            'pricing': copy.deepcopy(DEFAULT_POINT_PRICING),
+        }},
+        upsert=True,
+    )
+    load_point_pricing()
+    registered = {'sound': 0, 'emoji': 0}
+
+    def register(collection, asset_type, name, asset):
+        try:
+            validate_price_map({name: 0}, f'{asset_type} item')
+        except ValueError:
+            logger.error("Skipping legacy %s asset with unsupported name %r", asset_type, name)
+            return
+        if collection.find_one({'file': asset['file']}):
+            return
+        if collection.find_one({'name': name}):
+            logger.error("Skipping duplicate %s asset name %r from %r", asset_type, name, asset['file'])
+            return
+
+        document = {
+            '_id': ObjectId(),
+            'name': name,
+            'pricing_name': name,
+            **asset,
+        }
+        try:
+            result = collection.update_one(
+                {'file': asset['file']},
+                {'$setOnInsert': document},
+                upsert=True,
+            )
+        except DuplicateKeyError:
+            if not collection.find_one({'file': asset['file']}):
+                raise
+            return
+        if result.upserted_id is None:
+            return
+        registered[asset_type] += 1
+
+    if os.path.isdir(SOUNDDIR):
+        for filename in sorted(os.listdir(SOUNDDIR)):
+            if not filename.lower().endswith('.mp3'):
+                continue
+            if os.path.basename(filename) != filename:
+                logger.error("Skipping unsafe sound filename %r", filename)
+                continue
+            name = os.path.splitext(filename)[0]
+            display_name = name
+            try:
+                audio = MutagenFile(os.path.join(SOUNDDIR, filename), easy=True)
+                if audio and audio.get('title'):
+                    display_name = str(audio['title'][0]).strip() or name
+            except Exception:
+                logger.warning("Could not read title metadata for sound %s", filename, exc_info=True)
+            register(colsounds, 'sound', name, {
+                'display_name': display_name,
+                'loudness': 1.0,
+                'file': filename,
+            })
+
+    if os.path.isdir(EMOJIDIR):
+        for filename in sorted(os.listdir(EMOJIDIR)):
+            if not filename.lower().endswith(('.jpg', '.png', '.gif')):
+                continue
+            if os.path.basename(filename) != filename:
+                logger.error("Skipping unsafe emoji filename %r", filename)
+                continue
+            name = os.path.splitext(filename)[0]
+            register(colemojis, 'emoji', name, {'file': filename})
+
+    return registered
+
+
+def list_shop_assets(account):
+    pricing = load_point_pricing()
+    assets = {}
+    status_order = {'available': 0, 'owned': 1, 'unavailable': 2}
+    for asset_type in ('emoji', 'sound'):
+        collection = asset_collection(asset_type)
+        owned_ids = {
+            ownership['asset_id']
+            for ownership in colassetownership.find(
+                {'user_id': account['_id'], 'asset_type': asset_type},
+                {'asset_id': 1},
+            )
+            if isinstance(ownership.get('asset_id'), ObjectId)
+        }
+        assets[asset_type] = []
+        for asset in collection.find({}).sort('name', 1):
+            if asset.get('proposal_state') == 'processing':
+                continue
+            item = serialize_asset(asset, asset_type, pricing)
+            owned = asset['_id'] in owned_ids
+            unavailable = item['price'] == -1 or asset.get('exclusive') is True
+            if asset.get('exclusive') is True:
+                item['price'] = -1
+            item.update({
+                'owned': owned,
+                'status': 'owned' if owned else ('unavailable' if unavailable else 'available'),
+            })
+            assets[asset_type].append(item)
+        assets[asset_type].sort(key=lambda item: (
+            status_order[item['status']],
+            item['name'].casefold(),
+            item['name'],
+        ))
+    return assets
+
+
+def ensure_asset_ownership(ownership):
+    try:
+        colassetownership.insert_one(dict(ownership))
+    except DuplicateKeyError:
+        if not colassetownership.find_one(ownership):
+            raise
+
+
+def broadcast_proposed_asset(asset_type, asset, socketio):
+    if not socketio:
+        return
+    socketio.emit('asset_catalog_changed', {'asset_type': asset_type})
+    if asset_type == 'emoji':
+        emoji_name = asset['name']
+        colchat.update_many(
+            {'literal_emojis': emoji_name},
+            {'$pull': {'literal_emojis': emoji_name}},
+        )
+        for message in lastmessages:
+            if emoji_name in message.get('literal_emojis', []):
+                message['literal_emojis'] = [
+                    name for name in message['literal_emojis']
+                    if name != emoji_name
+                ]
+        socketio.emit('chat_history', add_current_ranks(list(lastmessages)))
+
+
+def purchase_catalog_asset(account, asset_type, asset_id, request_id, expected_price=None, socketio=None):
+    if not isinstance(account, dict) or not isinstance(account.get('_id'), ObjectId):
+        return {'status': 'error', 'message': 'Login required'}, 401
+    if has_permission(account, 'admin_console'):
+        return {'status': 'error', 'message': 'Admins already have access to all assets'}, 403
+    if asset_type not in {'sound', 'emoji'}:
+        return {'status': 'error', 'message': 'Unsupported asset type'}, 400
+    request_id = normalize_request_id(request_id)
+    if not request_id:
+        return {'status': 'error', 'message': 'A valid purchase request ID is required'}, 400
+    if expected_price is not None and (
+        isinstance(expected_price, bool)
+        or not isinstance(expected_price, int)
+        or expected_price < 0
+    ):
+        return {'status': 'error', 'message': 'Expected price must be a non-negative whole number'}, 400
+    try:
+        asset_id = ObjectId(asset_id)
+    except Exception:
+        return {'status': 'error', 'message': 'Asset not found'}, 404
+
+    user_id = account['_id']
+    identity = {'user_id': user_id, 'asset_type': asset_type, 'asset_id': asset_id}
+    asset = asset_collection(asset_type).find_one({'_id': asset_id})
+    if not asset:
+        return {'status': 'error', 'message': 'Asset not found'}, 404
+
+    request_purchase = colshoppurchases.find_one({
+        'user_id': user_id,
+        'request_id': request_id,
+    })
+    if request_purchase and (
+        request_purchase.get('asset_type') != asset_type
+        or request_purchase.get('asset_id') != asset_id
+    ):
+        return {
+            'status': 'error',
+            'code': 'request_id_conflict',
+            'message': 'This request ID belongs to a different purchase.',
+        }, 409
+
+    purchase = request_purchase or colshoppurchases.find_one(identity)
+    if colassetownership.find_one(identity):
+        current_user = colusers.find_one({'_id': user_id}) or account
+        if purchase and (
+            purchase.get('state') in {'reserved', 'charging', 'debited'}
+            or (
+                purchase.get('state') == 'completed'
+                and current_user.get('pending_point_operation') == f"shop-purchase:{purchase['_id']}"
+            )
+        ):
+            return _finish_catalog_purchase(purchase, account, socketio)
+        return {
+            'status': 'ok',
+            'owned': True,
+            'duplicate': True,
+            'points': current_user.get('points', 0),
+        }, 200
+
+    if purchase and purchase.get('state') == 'completed':
+        return _finish_catalog_purchase(purchase, account, socketio)
+    if purchase and purchase.get('state') in {'reserved', 'debited'}:
+        return _finish_catalog_purchase(purchase, account, socketio)
+    try:
+        pricing = load_point_pricing()
+        price = resolve_catalog_asset_price(asset_type, asset, pricing)
+    except ValueError as error:
+        return {'status': 'error', 'message': str(error)}, 503
+    if price == -1:
+        return {
+            'status': 'error',
+            'code': 'asset_unavailable',
+            'message': 'This asset is currently unavailable for purchase.',
+        }, 403
+    if expected_price is not None and expected_price != price:
+        return {
+            'status': 'error',
+            'code': 'price_changed',
+            'price': price,
+            'message': 'The price changed. Review the updated price before buying.',
+        }, 409
+
+    if purchase and purchase.get('state') == 'rejected':
+        try:
+            colshoppurchases.update_one(
+                {'_id': purchase['_id'], 'state': 'rejected'},
+                {'$set': {
+                    'request_id': request_id,
+                    'price': price,
+                    'state': 'reserved',
+                    'failure': None,
+                    'updated_at': datetime.now(timezone.utc),
+                }},
+            )
+        except DuplicateKeyError:
+            return {
+                'status': 'error',
+                'code': 'request_id_conflict',
+                'message': 'This request ID belongs to a different purchase.',
+            }, 409
+        purchase = colshoppurchases.find_one({'_id': purchase['_id']})
+        if not purchase or purchase.get('request_id') != request_id:
+            return {'status': 'error', 'message': 'Purchase could not be reserved'}, 503
+    elif not purchase:
+        purchase = {
+            **identity,
+            'request_id': request_id,
+            'price': price,
+            'state': 'reserved',
+            'created_at': datetime.now(timezone.utc),
+        }
+        try:
+            colshoppurchases.insert_one(purchase)
+            purchase = colshoppurchases.find_one({
+                'user_id': user_id,
+                'request_id': request_id,
+            })
+        except DuplicateKeyError:
+            request_purchase = colshoppurchases.find_one({
+                'user_id': user_id,
+                'request_id': request_id,
+            })
+            if request_purchase and (
+                request_purchase.get('asset_type') != asset_type
+                or request_purchase.get('asset_id') != asset_id
+            ):
+                return {
+                    'status': 'error',
+                    'code': 'request_id_conflict',
+                    'message': 'This request ID belongs to a different purchase.',
+                }, 409
+            purchase = request_purchase or colshoppurchases.find_one(identity)
+            if not purchase:
+                raise
+
+    if not purchase:
+        return {'status': 'error', 'message': 'Purchase could not be reserved'}, 503
+    return _finish_catalog_purchase(purchase, account, socketio)
+
+
+def _finish_catalog_purchase(purchase, account, socketio=None):
+    user_id = account['_id']
+    purchase_id = str(purchase['_id'])
+    operation_id = f'shop-purchase:{purchase_id}'
+    price = purchase['price']
+    if isinstance(price, bool) or not isinstance(price, int) or price < 0:
+        logger.error("Invalid stored shop purchase price for purchase %s", purchase_id)
+        return {'status': 'error', 'message': 'Purchase could not be confirmed'}, 503
+
+    current_user = colusers.find_one({'_id': user_id})
+    if not current_user:
+        return {'status': 'error', 'message': 'Account could not be loaded'}, 401
+    if purchase.get('state') == 'completed' and current_user.get('pending_point_operation') != operation_id:
+        ensure_asset_ownership({
+            'user_id': user_id,
+            'asset_type': purchase['asset_type'],
+            'asset_id': purchase['asset_id'],
+        })
+        return {
+            'status': 'ok',
+            'owned': True,
+            'duplicate': True,
+            'points': current_user.get('points', 0),
+        }, 200
+
+    debited_user = None
+    if price:
+        if purchase.get('state') == 'reserved':
+            colshoppurchases.update_one(
+                {'_id': purchase['_id'], 'state': 'reserved'},
+                {'$set': {
+                    'state': 'charging',
+                    'updated_at': datetime.now(timezone.utc),
+                }},
+            )
+            purchase = colshoppurchases.find_one({'_id': purchase['_id']}) or purchase
+            current_user = colusers.find_one({'_id': user_id}) or current_user
+            if purchase.get('state') == 'completed' and current_user.get('pending_point_operation') != operation_id:
+                return {
+                    'status': 'ok',
+                    'owned': True,
+                    'duplicate': True,
+                    'points': current_user.get('points', 0),
+                }, 200
+        if purchase_id in current_user.get('shop_purchase_ids', []):
+            debited_user = current_user
+        else:
+            if current_user.get('pending_point_operation'):
+                return {
+                    'status': 'error',
+                    'message': 'A previous point action is still being processed. Retry this purchase in a moment.',
+                    'points': current_user.get('points', 0),
+                }, 409
+            if purchase.get('state') == 'debited':
+                logger.error("Shop purchase %s lost its pending point operation", purchase_id)
+                return {'status': 'error', 'message': 'Purchase could not be confirmed'}, 503
+            debited_user = colusers.find_one_and_update(
+                {
+                    '_id': user_id,
+                    '$expr': {'$gte': [{'$ifNull': ['$points', 0]}, price]},
+                    'shop_purchase_ids': {'$ne': purchase_id},
+                    '$or': [
+                        {'pending_point_operation': {'$exists': False}},
+                        {'pending_point_operation': None},
+                    ],
+                },
+                {
+                    '$inc': {'points': -price},
+                    '$set': {'pending_point_operation': operation_id},
+                    '$addToSet': {'shop_purchase_ids': purchase_id},
+                },
+                return_document=ReturnDocument.AFTER,
+            )
+            if not debited_user:
+                current_user = colusers.find_one({'_id': user_id})
+                if not current_user:
+                    return {'status': 'error', 'message': 'Account could not be loaded'}, 401
+                if purchase_id in current_user.get('shop_purchase_ids', []):
+                    debited_user = current_user
+                elif current_user.get('pending_point_operation'):
+                    return {
+                        'status': 'error',
+                        'message': 'A previous point action is still being processed. Retry this purchase in a moment.',
+                        'points': current_user.get('points', 0),
+                    }, 409
+                else:
+                    colshoppurchases.update_one(
+                        {'_id': purchase['_id'], 'state': {'$in': ['reserved', 'charging']}},
+                        {'$set': {
+                            'state': 'rejected',
+                            'failure': 'insufficient_points',
+                            'updated_at': datetime.now(timezone.utc),
+                        }},
+                    )
+                    balance = current_user.get('points', 0)
+                    return {
+                        'status': 'error',
+                        'code': 'insufficient_points',
+                        'message': f"This asset costs {price} points. You have {balance} points.",
+                        'points': balance,
+                    }, 402
+
+        if purchase.get('state') in {'reserved', 'charging'}:
+            balance_after = (
+                debited_user.get('points', 0)
+                if debited_user
+                else current_user.get('points', 0)
+            )
+            colshoppurchases.update_one(
+                {'_id': purchase['_id'], 'state': {'$in': ['reserved', 'charging']}},
+                {'$set': {
+                    'state': 'debited',
+                    'balance_after': balance_after,
+                    'updated_at': datetime.now(timezone.utc),
+                }},
+            )
+            purchase = colshoppurchases.find_one({'_id': purchase['_id']}) or purchase
+
+    ownership = {
+        'user_id': user_id,
+        'asset_type': purchase['asset_type'],
+        'asset_id': purchase['asset_id'],
+    }
+    try:
+        ensure_asset_ownership(ownership)
+    except Exception:
+        logger.exception("Could not grant asset ownership for shop purchase %s", purchase_id)
+        return {'status': 'error', 'message': 'Purchase is being finalized; retry shortly.'}, 503
+
+    colshoppurchases.update_one(
+        {'_id': purchase['_id'], 'state': {'$in': ['reserved', 'debited', 'completed']}},
+        {'$set': {
+            'state': 'completed',
+            'completed_at': datetime.now(timezone.utc),
+            'updated_at': datetime.now(timezone.utc),
+        }},
+    )
+    completed_purchase = colshoppurchases.find_one({'_id': purchase['_id']})
+    if not completed_purchase or completed_purchase.get('state') != 'completed':
+        logger.error("Could not finalize shop purchase %s", purchase_id)
+        return {'status': 'error', 'message': 'Purchase is being finalized; retry shortly.'}, 503
+    purchase = completed_purchase
+
+    if price:
+        try:
+            record_point_transaction(
+                user_id,
+                str(uuid.uuid5(uuid.NAMESPACE_URL, f"shop-purchase:{purchase_id}")),
+                'shop_purchase',
+                -price,
+                purchase.get('balance_after', current_user.get('points', 0) - price),
+                asset_type=purchase['asset_type'],
+                asset_id=str(purchase['asset_id']),
+                purchase_id=purchase_id,
+            )
+        except Exception:
+            logger.exception("Could not record point ledger entry for shop purchase %s", purchase_id)
+            return {'status': 'error', 'message': 'Purchase is being finalized; retry shortly.'}, 503
+        _clear_pending_point_operation(user_id, operation_id)
+
+    current_user = colusers.find_one({'_id': user_id}) or current_user
+    if debited_user and socketio:
+        try:
+            emit_points_changed(socketio, current_user)
+        except Exception:
+            logger.exception("Shop purchase point notification failed for %s", user_id)
+    return {
+        'status': 'ok',
+        'owned': True,
+        'duplicate': False,
+        'points': current_user.get('points', 0),
+    }, 200
+
+
     rewards = settings['proposal_rewards'].get(proposal_type)
     if rewards is None:
         raise ValueError(f'Unsupported proposal type: {proposal_type}')
@@ -516,13 +1480,18 @@ def flush_all_pending_point_transactions():
             logger.exception("Pending point transaction flush failed for user %s", user.get('_id'))
 
 
-def get_action_cost(action, account):
+def get_action_cost(action, account, sound_asset=None, pricing=None):
     profile = role_permissions(account)
     capabilities = profile.get('capabilities', {}) if profile else {}
     free_actions = capabilities.get('free_actions')
     if isinstance(free_actions, list) and action in free_actions:
         return 0
-    cost = load_point_pricing()['send_your_chaos'][action]
+    settings = pricing if pricing is not None else load_point_pricing()
+    cost = (
+        resolve_sound_play_price(sound_asset, settings)
+        if action == 'soundmeme' and sound_asset is not None
+        else settings['send_your_chaos'][action]
+    )
     if cost == -1:
         return -1
     discount = capabilities.get('discount_percent', 0)
@@ -556,7 +1525,14 @@ def record_point_transaction(user_id, request_id, action_type, amount, balance_a
     )
 
 
-def accept_paid_action(action_collection, account, request_id, document, socketio=None):
+def accept_paid_action(
+    action_collection,
+    account,
+    request_id,
+    document,
+    socketio=None,
+    point_cost_override=None,
+):
     user_id = account['_id']
     existing = action_collection.find_one({'user_id': user_id, 'request_id': request_id})
     if existing and any(
@@ -612,7 +1588,11 @@ def accept_paid_action(action_collection, account, request_id, document, socketi
         }, 200
 
     if existing is None:
-        cost = get_action_cost(document['action_type'], account)
+        cost = (
+            point_cost_override
+            if point_cost_override is not None
+            else get_action_cost(document['action_type'], account)
+        )
         if cost == -1:
             current_user = colusers.find_one({'_id': user_id}) or account
             return {
@@ -640,7 +1620,11 @@ def accept_paid_action(action_collection, account, request_id, document, socketi
 
     cost = existing.get('point_cost')
     if cost is None:
-        cost = get_action_cost(existing['action_type'], account)
+        cost = (
+            point_cost_override
+            if point_cost_override is not None
+            else get_action_cost(existing['action_type'], account)
+        )
     if cost == -1:
         current_user = colusers.find_one({'_id': user_id}) or account
         action_collection.update_one(
@@ -876,15 +1860,35 @@ def registersocketiohandlers(socketio: SocketIO):
         request_id = normalize_request_id(data.get('request_id'))
         sound_name = data.get('file')
         if not request_id:
+        asset_id = data.get('asset_id')
             return {'status': 'error', 'message': 'A valid request ID is required'}
-        if not isinstance(sound_name, str) or not sound_name or os.path.basename(sound_name) != sound_name:
-            return {'status': 'error', 'message': 'Select a valid sound'}
-        if sound_name.lower().endswith('.mp3'):
-            filename = sound_name
-        elif os.path.splitext(sound_name)[1]:
-            return {'status': 'error', 'message': 'This sound format is not supported'}
+        if isinstance(asset_id, str) and ObjectId.is_valid(asset_id):
+            asset = colsounds.find_one({'_id': ObjectId(asset_id)})
         else:
-            filename = f'{sound_name}.mp3'
+            if (
+                not isinstance(sound_name, str)
+                or not sound_name
+                or os.path.basename(sound_name) != sound_name
+            ):
+                return {'status': 'error', 'message': 'Select a valid sound'}
+            asset_name = os.path.splitext(sound_name)[0]
+            asset = colsounds.find_one({'name': asset_name})
+        if not asset:
+            return {'status': 'error', 'message': 'Sound is no longer available'}
+        if not can_use_asset(account, 'sound', asset):
+            return {
+                'status': 'error',
+                'code': 'asset_not_owned',
+                'message': 'You do not own this sound',
+                'points': account.get('points', 0),
+            }
+        filename = asset.get('file')
+        if (
+            not isinstance(filename, str)
+            or os.path.basename(filename) != filename
+            or not filename.lower().endswith('.mp3')
+        ):
+            return {'status': 'error', 'message': 'This sound format is not supported'}
         if not os.path.isfile(os.path.join(SOUNDDIR, filename)):
             return {'status': 'error', 'message': 'Sound is no longer available'}
 
@@ -910,11 +1914,19 @@ def registersocketiohandlers(socketio: SocketIO):
             socketio,
         )
         if status != 200 or result.get('duplicate'):
+            point_cost_override=get_action_cost(
+                'soundmeme',
+                account,
+                sound_asset=asset,
+            ),
             return result
         try:
             socketio.emit(
                 'playsound',
-                {'file': os.path.splitext(filename)[0]},
+                {
+                    'file': os.path.splitext(filename)[0],
+                    'loudness': asset.get('loudness', 1.0),
+                },
                 include_self=True,
             )
         except Exception:
@@ -963,17 +1975,39 @@ def registersocketiohandlers(socketio: SocketIO):
                 return
             rank = account.get('rank', 'User')
             color = get_rank_color(rank)
+            literal_emojis = []
+            for emoji_name in set(re.findall(r':(\w+):', message)):
+                emoji = colemojis.find_one({'name': emoji_name})
+                is_unregistered_asset = emoji is None and legacy_emoji_exists(emoji_name)
+                if (
+                    (emoji and not can_use_asset(account, 'emoji', emoji))
+                    or (is_unregistered_asset and not has_permission(account, 'admin_console'))
+                ):
+                    literal_emojis.append(emoji_name)
             msgobj = {
                 'user': user,
                 'message': message,
                 'rank': rank,
                 'rank_color': color,
+                'literal_emojis': literal_emojis,
                 'timestamp': datetime.now(timezone.utc)
             }
             try:
                 colchat.insert_one(msgobj)
-                lastmessages.append({'user': user, 'message': message, 'rank': rank, 'rank_color': color})
-                socketio.emit('chat_message', {'user': user, 'message': message, 'rank': rank, 'rank_color': color})
+                lastmessages.append({
+                    'user': user,
+                    'message': message,
+                    'literal_emojis': literal_emojis,
+                    'rank': rank,
+                    'rank_color': color,
+                })
+                socketio.emit('chat_message', {
+                    'user': user,
+                    'message': message,
+                    'literal_emojis': literal_emojis,
+                    'rank': rank,
+                    'rank_color': color,
+                })
             except Exception as e:
                 logger.error(f"Chat save failed: {e}")
 
@@ -1474,6 +2508,310 @@ def registerroutes(app, socketio: SocketIO):
                         requested_amount=adjustment['requested_amount'],
                         actor_user_id=ObjectId(session['user_id']),
                         timestamp=adjustment.get('timestamp', timestamp),
+    @app.route('/admin/assets/<asset_type>', methods=['GET', 'POST'])
+    @require_login
+    def adminassets(asset_type):
+        if not get_admin_user('admin_console'):
+            return jsonify({'message': 'Admin login required'}), 403
+        if asset_type not in {'sound', 'emoji'}:
+            return jsonify({'message': 'Unsupported asset type'}), 404
+        collection = asset_collection(asset_type)
+        try:
+            pricing = load_point_pricing()
+            if request.method == 'GET':
+                assets = []
+                for asset in collection.find({}).sort('name', 1):
+                    item = serialize_asset(asset, asset_type, pricing)
+                    item['default_price'] = pricing['catalog'][asset_type]['default']
+                    item['price_exception'] = catalog_asset_exception_value(
+                        asset_type,
+                        asset,
+                        pricing,
+                    )
+                    if asset_type == 'sound':
+                        item['play_default_price'] = pricing['catalog']['sound']['play_default']
+                        item['play_price_exception'] = catalog_asset_exception_value(
+                            'sound',
+                            asset,
+                            pricing,
+                            'play_items',
+                        )
+                    assets.append(item)
+                return jsonify({
+                    'assets': assets,
+                    'default_price': pricing['catalog'][asset_type]['default'],
+                })
+
+            if request.content_length and request.content_length > 17 * 1024 * 1024:
+                return jsonify({'message': 'Upload is too large'}), 413
+            upload = request.files.get('file')
+            data = request.get_json(silent=True) if request.is_json else request.form
+            data = data if isinstance(data, dict) or hasattr(data, 'get') else {}
+            source_url = data.get('source_url')
+            if upload and source_url:
+                raise ValueError('Choose a file or enter a URL, not both')
+            if source_url:
+                upload = fetch_admin_asset_url(source_url, asset_type)
+            raw_name = data.get('display_name') if asset_type == 'sound' else data.get('name')
+            name = normalize_asset_name(raw_name)
+            display_name = raw_name.strip() if isinstance(raw_name, str) else ''
+            if asset_type == 'sound' and (not display_name or len(display_name) > 120):
+                raise ValueError('Sound display name must be 1 to 120 characters')
+            loudness = 1.0
+            if asset_type == 'sound':
+                try:
+                    raw_loudness = data.get('loudness', '')
+                    if isinstance(raw_loudness, str):
+                        raw_loudness = raw_loudness.strip() or '1'
+                    loudness = float(raw_loudness or 1)
+                except (TypeError, ValueError) as error:
+                    raise ValueError('Loudness must be a number from 0 to 2') from error
+                if not 0 <= loudness <= 2:
+                    raise ValueError('Loudness must be a number from 0 to 2')
+            price = parse_asset_price(data.get('price'))
+            if collection.find_one({'name': name}):
+                return jsonify({'message': 'An asset with this name already exists'}), 409
+
+            directory = SOUNDDIR if asset_type == 'sound' else EMOJIDIR
+            temp_path, extension = validate_uploaded_asset(
+                upload,
+                asset_type,
+                directory,
+                upload_limit(pricing, asset_type, True),
+            )
+            filename = f'{name}.{extension}'
+            destination = os.path.join(directory, filename)
+            try:
+                os.link(temp_path, destination)
+            except FileExistsError:
+                return jsonify({'message': 'A file with this normalized name already exists'}), 409
+
+            document = {
+                '_id': ObjectId(),
+                'name': name,
+                'pricing_name': name,
+                'file': filename,
+                'created_at': datetime.now(timezone.utc),
+            }
+            if asset_type == 'sound':
+                document.update({'display_name': display_name, 'loudness': loudness})
+            try:
+                collection.insert_one(document)
+                price_key = filename if asset_type == 'sound' else name
+                save_catalog_price_exception(asset_type, price_key, price_key, price)
+            except Exception:
+                collection.delete_one({'_id': document['_id']})
+                if os.path.exists(destination):
+                    os.remove(destination)
+                raise
+            if socketio:
+                socketio.emit('usage_costs_changed')
+                socketio.emit('asset_catalog_changed', {'asset_type': asset_type})
+            return jsonify({'asset': serialize_asset(document, asset_type, load_point_pricing())}), 201
+        except ValueError as error:
+            return jsonify({'message': str(error)}), 400
+        except Exception:
+            logger.exception('Could not administer %s assets', asset_type)
+            return jsonify({'message': 'Asset could not be saved'}), 503
+        finally:
+            if request.method == 'POST' and 'temp_path' in locals() and os.path.exists(temp_path):
+                os.remove(temp_path)
+
+    @app.route('/admin/assets/<asset_type>/<asset_id>', methods=['PATCH', 'DELETE'])
+    @require_login
+    def adminasset(asset_type, asset_id):
+        if not get_admin_user('admin_console'):
+            return jsonify({'message': 'Admin login required'}), 403
+        if asset_type not in {'sound', 'emoji'} or not ObjectId.is_valid(asset_id):
+            return jsonify({'message': 'Asset not found'}), 404
+        collection = asset_collection(asset_type)
+        asset_oid = ObjectId(asset_id)
+        asset = collection.find_one({'_id': asset_oid})
+        if not asset:
+            return jsonify({'message': 'Asset not found'}), 404
+        asset = copy.deepcopy(asset)
+        old_name = asset.get('name')
+        old_filename = asset.get('file')
+        if (
+            not isinstance(old_name, str)
+            or not isinstance(old_filename, str)
+            or os.path.basename(old_filename) != old_filename
+        ):
+            return jsonify({'message': 'Stored asset metadata is invalid'}), 503
+        extension = os.path.splitext(old_filename)[1].lower()
+        allowed_extensions = {'.mp3'} if asset_type == 'sound' else {'.jpg', '.png', '.gif'}
+        if extension not in allowed_extensions:
+            return jsonify({'message': 'Stored asset metadata is invalid'}), 503
+        directory = SOUNDDIR if asset_type == 'sound' else EMOJIDIR
+        old_path = os.path.join(directory, old_filename)
+        staged_path = None
+        new_path = None
+        committed = False
+        try:
+            pricing = load_point_pricing()
+            if request.method == 'DELETE':
+                old_price_key = catalog_asset_exception_key(asset_type, asset, pricing)
+                if old_price_key is None:
+                    old_price_key = old_filename if asset_type == 'sound' else asset.get('pricing_name', old_name)
+                old_play_price_key = (
+                    catalog_asset_exception_key('sound', asset, pricing, 'play_items') or old_filename
+                    if asset_type == 'sound'
+                    else ASSET_PRICE_UNCHANGED
+                )
+                if os.path.exists(old_path):
+                    staged_path = os.path.join(directory, f'.ats-remove-{uuid.uuid4().hex}')
+                    os.replace(old_path, staged_path)
+                result = collection.delete_one({'_id': asset_oid})
+                if not getattr(result, 'deleted_count', 1):
+                    if staged_path and os.path.exists(staged_path):
+                        os.replace(staged_path, old_path)
+                    return jsonify({'message': 'Asset could not be removed'}), 503
+                try:
+                    save_catalog_price_exception(
+                        asset_type,
+                        old_price_key,
+                        old_price_key,
+                        None,
+                        None if asset_type == 'sound' else ASSET_PRICE_UNCHANGED,
+                        old_play_price_key,
+                        old_play_price_key,
+                    )
+                except Exception:
+                    collection.insert_one(asset)
+                    if staged_path and os.path.exists(staged_path):
+                        os.replace(staged_path, old_path)
+                    raise
+                committed = True
+                if staged_path and os.path.exists(staged_path):
+                    try:
+                        os.remove(staged_path)
+                    except OSError:
+                        logger.warning("Could not remove staged asset file %s", staged_path)
+                if socketio:
+                    socketio.emit('usage_costs_changed')
+                    socketio.emit('asset_catalog_changed', {'asset_type': asset_type})
+                if asset_type == 'emoji' and socketio:
+                    socketio.emit('chat_history', add_current_ranks(list(lastmessages)))
+                return jsonify({'status': 'ok'})
+
+            data = request.get_json(silent=True)
+            if not isinstance(data, dict):
+                return jsonify({'message': 'Request body must be an object'}), 400
+            updated = {}
+            new_name = old_name
+            if asset_type == 'sound':
+                if 'display_name' in data:
+                    display_name = data['display_name'].strip() if isinstance(data['display_name'], str) else ''
+                    if not display_name or len(display_name) > 120:
+                        raise ValueError('Sound display name must be 1 to 120 characters')
+                    new_name = normalize_asset_name(display_name)
+                    updated['display_name'] = display_name
+                if 'loudness' in data:
+                    loudness = data['loudness']
+                    if isinstance(loudness, bool) or not isinstance(loudness, (int, float)) or not 0 <= loudness <= 2:
+                        raise ValueError('Loudness must be a number from 0 to 2')
+                    updated['loudness'] = float(loudness)
+            elif 'name' in data:
+                new_name = normalize_asset_name(data['name'])
+            price = parse_asset_price(data['price']) if 'price' in data else ASSET_PRICE_UNCHANGED
+            play_price = (
+                parse_play_price(data.get('play_price'))
+                if 'play_price' in data and asset_type == 'sound'
+                else ASSET_PRICE_UNCHANGED
+            )
+            old_price_key = catalog_asset_exception_key(asset_type, asset, pricing)
+            if old_price_key is None:
+                old_price_key = old_filename if asset_type == 'sound' else asset.get('pricing_name', old_name)
+            old_play_price_key = None
+            if asset_type == 'sound':
+                old_play_price_key = catalog_asset_exception_key(
+                    'sound',
+                    asset,
+                    pricing,
+                    'play_items',
+                ) or old_filename
+            new_filename = f'{new_name}{os.path.splitext(old_filename)[1].lower()}'
+            if collection.find_one({'name': new_name, '_id': {'$ne': asset_oid}}):
+                return jsonify({'message': 'An asset with this name already exists'}), 409
+            if new_filename != old_filename:
+                new_path = os.path.join(directory, new_filename)
+                if os.path.exists(new_path):
+                    return jsonify({'message': 'A file with this normalized name already exists'}), 409
+                if not os.path.isfile(old_path):
+                    return jsonify({'message': 'Asset file is missing'}), 503
+                staged_path = os.path.join(directory, f'.ats-rename-{uuid.uuid4().hex}')
+                os.replace(old_path, staged_path)
+                os.link(staged_path, new_path)
+                updated['file'] = new_filename
+            updated.update({
+                'name': new_name,
+                'pricing_name': new_name,
+                'updated_at': datetime.now(timezone.utc),
+            })
+            collection.update_one({'_id': asset_oid}, {'$set': updated})
+            try:
+                save_catalog_price_exception(
+                    asset_type,
+                    old_price_key,
+                    new_filename if asset_type == 'sound' else new_name,
+                    price,
+                    play_price,
+                    old_play_price_key,
+                    new_filename if asset_type == 'sound' else new_name,
+                )
+            except Exception:
+                collection.update_one(
+                    {'_id': asset_oid},
+                    {'$set': {key: value for key, value in asset.items() if key != '_id'}},
+                )
+                raise
+            committed = True
+            if staged_path and os.path.exists(staged_path):
+                try:
+                    os.remove(staged_path)
+                except OSError:
+                    logger.warning("Could not remove staged asset file %s", staged_path)
+            if asset_type == 'emoji' and new_name != old_name:
+                old_shortcode = f':{old_name}:'
+                new_shortcode = f':{new_name}:'
+                for message in colchat.find({'message': {'$regex': re.escape(old_shortcode)}}):
+                    updated_message = message.get('message', '').replace(old_shortcode, new_shortcode)
+                    literals = message.get('literal_emojis', [])
+                    updated_literals = [new_name if value == old_name else value for value in literals]
+                    colchat.update_one(
+                        {'_id': message['_id']},
+                        {'$set': {'message': updated_message, 'literal_emojis': updated_literals}},
+                    )
+                for message in lastmessages:
+                    if old_shortcode in message.get('message', ''):
+                        message['message'] = message['message'].replace(old_shortcode, new_shortcode)
+                    message['literal_emojis'] = [
+                        new_name if value == old_name else value
+                        for value in message.get('literal_emojis', [])
+                    ]
+                if socketio:
+                    socketio.emit('asset_catalog_changed', {'asset_type': asset_type})
+                    socketio.emit('chat_history', add_current_ranks(list(lastmessages)))
+            if socketio:
+                socketio.emit('usage_costs_changed')
+            refreshed = collection.find_one({'_id': asset_oid})
+            return jsonify({'asset': serialize_asset(refreshed, asset_type, load_point_pricing())})
+        except ValueError as error:
+            if not committed and staged_path and os.path.exists(staged_path):
+                if new_path and os.path.exists(new_path):
+                    os.remove(new_path)
+                if not os.path.exists(old_path):
+                    os.replace(staged_path, old_path)
+            return jsonify({'message': str(error)}), 400
+        except Exception:
+            logger.exception('Could not update %s asset %s', asset_type, asset_id)
+            if not committed and staged_path and os.path.exists(staged_path):
+                if new_path and os.path.exists(new_path):
+                    os.remove(new_path)
+                if not os.path.exists(old_path):
+                    os.replace(staged_path, old_path)
+            return jsonify({'message': 'Asset could not be updated'}), 503
+
                     )
             except Exception:
                 logger.exception("Admin point adjustment transaction remains pending for %s", request_id)
@@ -1738,7 +3076,7 @@ def registerroutes(app, socketio: SocketIO):
 
     @app.route('/emoji/<name>')
     def emojiname(name):
-        for ext in ['.jpg', '.png']:
+        for ext in ['.jpg', '.png', '.gif']:
             path = os.path.join(EMOJIDIR, f"{name}{ext}")
             if os.path.isfile(path):
                 return jsonify({'url': f"/static/img/emoji/{name}{ext}"})
@@ -1748,32 +3086,504 @@ def registerroutes(app, socketio: SocketIO):
     def listemojis():
         if os.path.exists(EMOJIDIR):
             emojis = [os.path.splitext(f)[0] for f in os.listdir(EMOJIDIR)
-                      if os.path.splitext(f)[1].lower() in ['.jpg', '.png']]
+                      if os.path.splitext(f)[1].lower() in ['.jpg', '.png', '.gif']]
             return jsonify(emojis)
         return jsonify([])
 
     @app.route('/soundboardlist')
     def soundboardlist():
-        sounds = []
-        if os.path.exists(SOUNDDIR):
-            for filename in os.listdir(SOUNDDIR):
-                if not filename.lower().endswith(('.mp3', '.m4a', '.wav')):
-                    continue
-                filepath = os.path.join(SOUNDDIR, filename)
-                title = os.path.splitext(filename)[0]
+        account = get_session_user()
+        try:
+            pricing = load_point_pricing()
+            assets = list_usable_assets(account, 'sound')
+            favorite_documents = list(colsoundfavorites.find({'user_id': account['_id']}))
+            def favorite_added_order(item):
+                created_at = item.get('created_at')
+                if not isinstance(created_at, datetime):
+                    created_at = datetime.min.replace(tzinfo=timezone.utc)
+                elif created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=timezone.utc)
+                else:
+                    created_at = created_at.astimezone(timezone.utc)
+                return created_at, str(item.get('_id', ''))
+
+            favorite_documents.sort(key=favorite_added_order)
+            favorite_order = {
+                str(item['asset_id']): position
+                for position, item in enumerate(favorite_documents)
+            }
+            assets.sort(key=lambda asset: (
+                (0, favorite_order[str(asset['_id'])])
+                if str(asset['_id']) in favorite_order
+                else (
+                    1,
+                    str(asset.get('display_name') or asset['name']).casefold(),
+                    asset['name'].casefold(),
+                )
+            ))
+            result = []
+            for asset in assets:
+                item = serialize_asset(asset, 'sound', pricing)
+                item['favorite'] = str(asset['_id']) in favorite_order
+                item['play_cost'] = get_action_cost(
+                    'soundmeme',
+                    account,
+                    sound_asset=asset,
+                    pricing=pricing,
+                )
+                result.append(item)
+            return jsonify(result)
+        except ValueError as error:
+            return jsonify({'message': str(error)}), 503
+        except Exception:
+            logger.exception("Could not load usable sounds for account %s", account.get('_id'))
+            return jsonify({'message': 'Usable sounds could not be loaded'}), 503
+
+    @app.route('/soundboard/favorites', methods=['POST'])
+    @require_login
+    def soundboardfavorites():
+        account = get_session_user()
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({'message': 'Request body must be an object'}), 400
+        asset_id = data.get('asset_id')
+        favorite = data.get('favorite')
+        if not isinstance(asset_id, str) or not ObjectId.is_valid(asset_id):
+            return jsonify({'message': 'Select a valid sound'}), 400
+        if not isinstance(favorite, bool):
+            return jsonify({'message': 'Favorite must be true or false'}), 400
+        try:
+            asset = colsounds.find_one({'_id': ObjectId(asset_id)})
+            if not asset:
+                return jsonify({'message': 'Sound is no longer available'}), 404
+            if not can_use_asset(account, 'sound', asset):
+                return jsonify({'message': 'You do not own this sound'}), 403
+            favorite_query = {'user_id': account['_id'], 'asset_id': asset['_id']}
+            if favorite:
                 try:
-                    audio = MutagenFile(filepath, easy=True)
-                    if audio:
-                        title = audio.get('title', [title])[0]
-                except:
+                    colsoundfavorites.insert_one({
+                        **favorite_query,
+                        'created_at': datetime.now(timezone.utc),
+                    })
+                except DuplicateKeyError:
                     pass
-                sounds.append({
-                    'file': filename,
-                    'title': title,
-                    'url': f"/static/sounds/soundboard/{filename}"
-                })
-        return jsonify(sounds)
+            else:
+                colsoundfavorites.delete_one(favorite_query)
+            return jsonify({'favorite': favorite})
+        except Exception:
+            logger.exception("Could not update sound favorite for account %s", account.get('_id'))
+            return jsonify({'message': 'Sound favorite could not be updated'}), 503
 
     @app.route('/debug/routes')
     def debugroutes():
-        return jsonify([f"{rule.rule} {rule.methods}" for rule in app.url_map.iter_rules()])
+        return jsonify([f"{rule.rule} {rule.methods}" for rule in app.url_map.iter_rules()])    @app.route('/public-emojis')
+    def publicemojis():
+        if not os.path.isdir(EMOJIDIR):
+            return jsonify([])
+        filenames = {}
+        for filename in sorted(os.listdir(EMOJIDIR)):
+            name, extension = os.path.splitext(filename)
+            if extension.lower() not in {'.jpg', '.png', '.gif'}:
+                continue
+            if name not in filenames or extension.lower() == '.jpg':
+                filenames[name] = filename
+        return jsonify([
+            {
+                'name': name,
+                'url': f"/img/emoji/{filename}",
+            }
+            for name, filename in sorted(filenames.items())
+        ])
+
+    @app.route('/usable-emojis')
+    @require_login
+    def usableemojis():
+        account = get_session_user()
+        try:
+            pricing = load_point_pricing()
+            assets = list_usable_assets(account, 'emoji')
+            return jsonify([serialize_asset(asset, 'emoji', pricing) for asset in assets])
+        except ValueError as error:
+            return jsonify({'message': str(error)}), 503
+        except Exception:
+            logger.exception("Could not load usable emojis for account %s", account.get('_id'))
+            return jsonify({'message': 'Usable emojis could not be loaded'}), 503
+
+    @app.route('/shop/catalog')
+    @require_login
+    def shopcatalog():
+        account = get_session_user()
+        try:
+            pricing = load_point_pricing()
+            catalog = list_shop_assets(account)
+            catalog['proposal_prices'] = pricing['proposal_rewards']
+            return jsonify(catalog)
+        except ValueError as error:
+            return jsonify({'message': str(error)}), 503
+        except Exception:
+            logger.exception("Could not load shop catalog for account %s", account.get('_id'))
+            return jsonify({'message': 'Shop catalog could not be loaded'}), 503
+
+    @app.route('/shop/purchase', methods=['POST'])
+    @require_login
+    def shoppurchase():
+        account = get_session_user()
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({'status': 'error', 'message': 'Request body must be an object'}), 400
+        if 'expected_price' not in data:
+            return jsonify({'status': 'error', 'message': 'Expected price is required'}), 400
+        try:
+            result, status = purchase_catalog_asset(
+                account,
+                data.get('asset_type'),
+                data.get('asset_id'),
+                data.get('request_id'),
+                data.get('expected_price'),
+                socketio,
+            )
+        except Exception:
+            logger.exception(
+                "Shop purchase failed for account %s",
+                account.get('_id') if isinstance(account, dict) else None,
+            )
+            return jsonify({
+                'status': 'error',
+                'message': 'Purchase could not be confirmed; retry it shortly.',
+            }), 503
+        if status == 200 and result.get('status') == 'ok' and data.get('asset_type') == 'emoji':
+            try:
+                asset_id = data.get('asset_id')
+                emoji = colemojis.find_one({
+                    '_id': ObjectId(asset_id),
+                }) if isinstance(asset_id, str) and ObjectId.is_valid(asset_id) else None
+                if emoji and isinstance(emoji.get('name'), str):
+                    emoji_name = emoji['name']
+                    colchat.update_many(
+                        {'literal_emojis': emoji_name},
+                        {'$pull': {'literal_emojis': emoji_name}},
+                    )
+                    for message in lastmessages:
+                        if emoji_name in message.get('literal_emojis', []):
+                            message['literal_emojis'] = [
+                                name for name in message['literal_emojis']
+                                if name != emoji_name
+                            ]
+                    socketio.emit('chat_history', add_current_ranks(list(lastmessages)))
+            except Exception:
+                logger.exception("Could not refresh chat rendering after emoji purchase")
+                return jsonify({
+                    'status': 'error',
+                    'message': 'Purchase completed, but chat could not be refreshed. Reload the page.',
+                }), 503
+        return jsonify(result), status
+
+    @app.route('/shop/propose', methods=['POST'])
+    @require_login
+    def shoppropose():
+        account = get_session_user()
+        if not isinstance(account, dict) or not isinstance(account.get('_id'), ObjectId):
+            return jsonify({'status': 'error', 'message': 'Login required'}), 401
+        if request.content_length and request.content_length > 17 * 1024 * 1024:
+            return jsonify({'status': 'error', 'message': 'Upload is too large'}), 413
+
+        data = request.form
+        asset_type = data.get('asset_type')
+        if asset_type not in {'emoji', 'sound'}:
+            return jsonify({'status': 'error', 'message': 'Unsupported asset type'}), 400
+        request_id = normalize_request_id(data.get('request_id'))
+        if not request_id:
+            return jsonify({'status': 'error', 'message': 'A valid request ID is required'}), 400
+
+        user_id = account['_id']
+        operation_id = f'asset-proposal:{asset_type}:{request_id}'
+        transaction_id = operation_id
+        collection = asset_collection(asset_type)
+        ownership = {
+            'user_id': user_id,
+            'asset_type': asset_type,
+        }
+        existing = collection.find_one({
+            'proposal_user_id': user_id,
+            'proposal_request_id': request_id,
+        })
+        if existing and existing.get('proposal_state') in {'processing', 'complete'}:
+            filename = existing.get('file')
+            directory = SOUNDDIR if asset_type == 'sound' else EMOJIDIR
+            if (
+                not isinstance(filename, str)
+                or os.path.basename(filename) != filename
+                or not os.path.isfile(os.path.join(directory, filename))
+            ):
+                return jsonify({
+                    'status': 'error',
+                    'message': 'The submitted asset is still being processed. Contact an administrator if this persists.',
+                }), 503
+            ownership['asset_id'] = existing['_id']
+            ensure_asset_ownership(ownership)
+            if existing.get('proposal_state') != 'complete':
+                collection.update_one(
+                    {'_id': existing['_id'], 'proposal_state': 'processing'},
+                    {'$set': {'proposal_state': 'complete'}},
+                )
+            record_point_transaction(
+                user_id,
+                transaction_id,
+                f'{asset_type}_proposal',
+                -existing['proposal_cost'],
+                existing['proposal_balance_after'],
+                asset_id=existing['_id'],
+            )
+            colusers.update_one(
+                {'_id': user_id, 'pending_point_operation': operation_id},
+                {'$unset': {'pending_point_operation': ''}},
+            )
+            current_user = colusers.find_one({'_id': user_id}) or account
+            broadcast_proposed_asset(asset_type, existing, socketio)
+            return jsonify({
+                'status': 'ok',
+                'duplicate': True,
+                'points': current_user.get('points', 0),
+            })
+        if existing:
+            return jsonify({
+                'status': 'error',
+                'message': 'This proposal is still being processed. Retry shortly.',
+            }), 409
+
+        temp_path = None
+        destination = None
+        asset = None
+        ownership_added = False
+        stored_file = False
+        charged = False
+        charged_here = False
+        completed = False
+        cost = 0
+        balance_after = account.get('points', 0)
+
+        def rollback_proposal():
+            if completed:
+                return
+            if ownership_added:
+                colassetownership.delete_one({
+                    **ownership,
+                    'asset_id': asset['_id'],
+                })
+            if asset:
+                collection.delete_one({'_id': asset['_id']})
+            if stored_file and destination and os.path.exists(destination):
+                os.remove(destination)
+            if charged_here:
+                refund = colusers.update_one(
+                    {'_id': user_id, 'pending_point_operation': operation_id},
+                    {
+                        '$inc': {'points': cost},
+                        '$unset': {'pending_point_operation': ''},
+                    },
+                )
+                if not getattr(refund, 'matched_count', 0):
+                    logger.error(
+                        'Could not roll back proposal debit for account %s, request %s',
+                        user_id,
+                        request_id,
+                    )
+
+        try:
+            pricing = load_point_pricing()
+            raw_name = data.get('display_name') if asset_type == 'sound' else data.get('name')
+            name = normalize_asset_name(raw_name)
+            display_name = raw_name.strip() if isinstance(raw_name, str) else ''
+            if asset_type == 'sound' and (not display_name or len(display_name) > 120):
+                raise ValueError('Sound display name must be 1 to 120 characters')
+            loudness = 1.0
+            if asset_type == 'sound':
+                try:
+                    raw_loudness = data.get('loudness', '').strip() or '1'
+                    loudness = float(raw_loudness)
+                except (AttributeError, TypeError, ValueError) as error:
+                    raise ValueError('Loudness must be a number from 0 to 2') from error
+                if not math.isfinite(loudness) or not 0 <= loudness <= 2:
+                    raise ValueError('Loudness must be a number from 0 to 2')
+
+            rewards = pricing['proposal_rewards'][asset_type]
+            exclusive = data.get('exclusive') == 'true'
+            cost = rewards['exclusive'] if exclusive else resolve_proposal_reward(
+                asset_type,
+                name,
+                pricing,
+            )
+            if cost == -1:
+                return jsonify({
+                    'status': 'error',
+                    'code': 'proposal_unavailable',
+                    'message': 'This proposal type is currently unavailable.',
+                }), 403
+
+            if collection.find_one({'name': name}):
+                return jsonify({
+                    'status': 'error',
+                    'code': 'duplicate_asset_name',
+                    'message': 'An asset with this name already exists.',
+                }), 409
+
+            upload = request.files.get('file')
+            source_url = data.get('source_url', '').strip()
+            if upload and source_url:
+                raise ValueError('Choose a file or enter a URL, not both')
+            if source_url:
+                upload = fetch_admin_asset_url(source_url, asset_type)
+            directory = SOUNDDIR if asset_type == 'sound' else EMOJIDIR
+            temp_path, extension = validate_uploaded_asset(
+                upload,
+                asset_type,
+                directory,
+                upload_limit(
+                    pricing,
+                    asset_type,
+                    has_permission(account, 'admin_console'),
+                ),
+            )
+            filename = f'{name}.{extension}'
+            destination = os.path.join(directory, filename)
+            current_user = colusers.find_one({'_id': user_id}) or account
+            retrying_charged_proposal = (
+                current_user.get('pending_point_operation') == operation_id
+            )
+            try:
+                os.link(temp_path, destination)
+            except FileExistsError:
+                same_retry_file = False
+                if retrying_charged_proposal and os.path.isfile(destination):
+                    with open(temp_path, 'rb') as uploaded_file:
+                        uploaded_digest = hashlib.sha256(uploaded_file.read()).digest()
+                    with open(destination, 'rb') as stored_asset:
+                        stored_digest = hashlib.sha256(stored_asset.read()).digest()
+                    same_retry_file = uploaded_digest == stored_digest
+                if not same_retry_file:
+                    return jsonify({
+                        'status': 'error',
+                        'code': 'duplicate_asset_file',
+                        'message': 'A file with this normalized name already exists.',
+                    }), 409
+            else:
+                stored_file = True
+
+            if cost:
+                current_user = colusers.find_one({'_id': user_id}) or account
+                if current_user.get('pending_point_operation') == operation_id:
+                    debited_user = current_user
+                    charged = True
+                elif current_user.get('pending_point_operation'):
+                    rollback_proposal()
+                    return jsonify({
+                        'status': 'error',
+                        'message': 'A previous point action is still being processed. Retry shortly.',
+                        'points': current_user.get('points', 0),
+                    }), 409
+                else:
+                    debited_user = colusers.find_one_and_update(
+                        {
+                            '_id': user_id,
+                            '$expr': {'$gte': [{'$ifNull': ['$points', 0]}, cost]},
+                            '$or': [
+                                {'pending_point_operation': {'$exists': False}},
+                                {'pending_point_operation': None},
+                            ],
+                        },
+                        {
+                            '$inc': {'points': -cost},
+                            '$set': {'pending_point_operation': operation_id},
+                        },
+                        return_document=ReturnDocument.AFTER,
+                    )
+                    charged_here = debited_user is not None
+                if not debited_user:
+                    current_user = colusers.find_one({'_id': user_id}) or account
+                    if current_user.get('pending_point_operation') == operation_id:
+                        debited_user = current_user
+                        charged = True
+                    elif current_user.get('points', 0) < cost:
+                        rollback_proposal()
+                        return jsonify({
+                            'status': 'error',
+                            'code': 'insufficient_points',
+                            'message': f"This proposal costs {cost} points. You have {current_user.get('points', 0)} points.",
+                            'points': current_user.get('points', 0),
+                        }), 402
+                    else:
+                        rollback_proposal()
+                        return jsonify({
+                            'status': 'error',
+                            'message': 'A previous point action is still being processed. Retry shortly.',
+                            'points': current_user.get('points', 0),
+                        }), 409
+                charged = debited_user.get('pending_point_operation') == operation_id
+                balance_after = debited_user.get('points', 0)
+
+            asset = {
+                '_id': ObjectId(),
+                'name': name,
+                'pricing_name': name,
+                'file': filename,
+                'exclusive': exclusive,
+                'proposal_state': 'processing',
+                'proposal_user_id': user_id,
+                'proposal_request_id': request_id,
+                'proposal_cost': cost,
+                'proposal_balance_after': balance_after,
+                'created_at': datetime.now(timezone.utc),
+            }
+            if asset_type == 'sound':
+                asset.update({'display_name': display_name, 'loudness': loudness})
+            collection.insert_one(asset)
+            ownership['asset_id'] = asset['_id']
+            ensure_asset_ownership(ownership)
+            ownership_added = True
+            result = collection.update_one(
+                {'_id': asset['_id'], 'proposal_state': 'processing'},
+                {'$set': {'proposal_state': 'complete'}},
+            )
+            if not getattr(result, 'matched_count', 0):
+                raise RuntimeError('Proposal asset could not be finalized')
+            asset['proposal_state'] = 'complete'
+            completed = True
+            record_point_transaction(
+                user_id,
+                transaction_id,
+                f'{asset_type}_proposal',
+                -cost,
+                balance_after,
+                asset_id=asset['_id'],
+            )
+            if charged:
+                colusers.update_one(
+                    {'_id': user_id, 'pending_point_operation': operation_id},
+                    {'$unset': {'pending_point_operation': ''}},
+                )
+            current_user = colusers.find_one({'_id': user_id}) or account
+            broadcast_proposed_asset(asset_type, asset, socketio)
+            return jsonify({
+                'status': 'ok',
+                'points': current_user.get('points', balance_after),
+                'asset': serialize_asset(asset, asset_type, pricing),
+            }), 201
+        except ValueError as error:
+            rollback_proposal()
+            return jsonify({'status': 'error', 'message': str(error)}), 400
+        except Exception:
+            rollback_proposal()
+            logger.exception(
+                'Could not submit %s proposal for account %s',
+                asset_type,
+                user_id,
+            )
+            return jsonify({
+                'status': 'error',
+                'message': 'Proposal could not be confirmed. Retry shortly.',
+            }), 503
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.remove(temp_path)
+
+    @require_login

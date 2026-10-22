@@ -29,6 +29,11 @@ def get_collections():
     colpricing = dbname['pricing']
     colpointtransactions = dbname['point_transactions']
     colsoundactions = dbname['sound_actions']
+    colsounds = dbname['sounds']
+    colemojis = dbname['emojis']
+    colassetownership = dbname['asset_ownership']
+    colshoppurchases = dbname['shop_purchases']
+    colsoundfavorites = dbname['sound_favorites']
     return (
         colfacememe,
         colnormalmeme,
@@ -41,6 +46,11 @@ def get_collections():
         colpricing,
         colpointtransactions,
         colsoundactions,
+        colsounds,
+        colemojis,
+        colassetownership,
+        colshoppurchases,
+        colsoundfavorites,
     )
 
 # Global cache - refresh on demand
@@ -56,10 +66,45 @@ def get_collections():
     colpricing,
     colpointtransactions,
     colsoundactions,
+    colsounds,
+    colemojis,
+    colassetownership,
+    colshoppurchases,
+    colsoundfavorites,
 ) = get_collections()
 colusers.create_index('username', unique=True)
 colranks.create_index('rank', unique=True)
 colpermissions.create_index('rank_id', unique=True)
+colsounds.create_index('name', unique=True)
+colsounds.create_index('file', unique=True)
+colemojis.create_index('name', unique=True)
+colemojis.create_index('file', unique=True)
+for asset_collection in (colsounds, colemojis):
+    asset_collection.create_index(
+        [('proposal_user_id', 1), ('proposal_request_id', 1)],
+        unique=True,
+        sparse=True,
+    )
+colassetownership.create_index(
+    [('user_id', 1), ('asset_type', 1), ('asset_id', 1)],
+    unique=True,
+)
+colshoppurchases.create_index(
+    [('user_id', 1), ('asset_type', 1), ('asset_id', 1)],
+    unique=True,
+)
+colsoundfavorites.create_index(
+    [('user_id', 1), ('asset_id', 1)],
+    unique=True,
+)
+colsoundfavorites.create_index(
+    [('user_id', 1), ('created_at', 1), ('_id', 1)],
+)
+colshoppurchases.create_index(
+    [('user_id', 1), ('request_id', 1)],
+    unique=True,
+    partialFilterExpression={'request_id': {'$type': 'string'}},
+)
 for action_collection in (colfacememe, colnormalmeme, colttsmeme, colsoundactions):
     action_collection.create_index(
         [('user_id', 1), ('request_id', 1)],
@@ -197,7 +242,7 @@ def lastnormalmeme():
         return None
 
 def refresh_collections():
-    global colfacememe, colnormalmeme, colttsmeme, colchat, colusers, colranks, colpermissions, colsettings, colpricing, colpointtransactions, colsoundactions
+    global colfacememe, colnormalmeme, colttsmeme, colchat, colusers, colranks, colpermissions, colsettings, colpricing, colpointtransactions, colsoundactions, colsounds, colemojis, colassetownership, colshoppurchases, colsoundfavorites
     (
         colfacememe,
         colnormalmeme,
@@ -210,5 +255,10 @@ def refresh_collections():
         colpricing,
         colpointtransactions,
         colsoundactions,
+        colsounds,
+        colemojis,
+        colassetownership,
+        colshoppurchases,
+        colsoundfavorites,
     ) = get_collections()
     print("Collections refreshed")

@@ -11,6 +11,7 @@ from client import migrate_legacy_sound_actions
 from routes import (
     registersocketiohandlers,
     registerroutes,
+    register_legacy_assets,
     seed_role_permissions,
     start_stream_points_worker,
 )
@@ -46,6 +47,7 @@ seed_role_permissions()
 
 if __name__ == "__main__":
     migrate_legacy_sound_actions()
+    register_legacy_assets()
     start_tts_worker(socketio)
     start_stream_points_worker(socketio)
     host = os.getenv("ATS_BACKEND_HOST", "127.0.0.1")

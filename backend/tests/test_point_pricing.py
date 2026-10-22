@@ -93,11 +93,21 @@ class PointPricingTests(unittest.TestCase):
                         'unavailable_emoji': -1,
                     },
                 },
-                'sound': {'default': 100, 'categories': {}, 'items': {}},
+                'sound': {
+                    'default': 100,
+                    'categories': {},
+                    'items': {},
+                    'play_default': 10,
+                    'play_items': {},
+                },
             },
             'proposal_rewards': {
-                'sound': {'default': 100000, 'items': {'test_sound': 25}},
-                'emoji': {'default': 100000, 'items': {'test_emoji': 10}},
+                'sound': {'default': 100000, 'exclusive': 100000, 'items': {'test_sound': 25}},
+                'emoji': {'default': 100000, 'exclusive': 100000, 'items': {'test_emoji': 10}},
+            },
+            'asset_limits': {
+                'emoji': {'max_px': 1024, 'max_px_admin': 2048},
+                'sound': {'max_length': 3, 'max_length_admin': 10},
             },
         }
 
@@ -121,6 +131,200 @@ class PointPricingTests(unittest.TestCase):
         self.assertEqual(self.pricing.document['_id'], routes.POINT_PRICING_ID)
         self.assertEqual(self.pricing.document['pricing'], self.admin_payload())
         self.socketio.emit.assert_called_once_with('usage_costs_changed')
+
+    def test_admin_play_prices_persist_separately_from_sound_purchase_prices(self):
+        self.login_as(self.admin)
+        payload = self.admin_payload()
+        payload['catalog']['sound']['default'] = 125
+        payload['catalog']['sound']['items']['sample_sound'] = 75
+        payload['catalog']['sound']['play_default'] = 12
+        payload['catalog']['sound']['play_items']['sample_sound'] = 4
+
+        saved = self.client.put('/admin/pricing', json={'pricing': payload})
+        retrieved = self.client.get('/admin/pricing')
+        sound_pricing = retrieved.get_json()['pricing']['catalog']['sound']
+
+        self.assertEqual(saved.status_code, 200)
+        self.assertEqual(retrieved.status_code, 200)
+        self.assertEqual(sound_pricing['default'], 125)
+        self.assertEqual(sound_pricing['items']['sample_sound'], 75)
+        self.assertEqual(sound_pricing['play_default'], 12)
+        self.assertEqual(sound_pricing['play_items']['sample_sound'], 4)
+
+    def test_legacy_pricing_receives_database_compatible_proposal_and_limit_defaults(self):
+        legacy = self.admin_payload()
+        del legacy['catalog']['sound']['play_default']
+        del legacy['catalog']['sound']['play_items']
+        for proposal_type in ('emoji', 'sound'):
+            del legacy['proposal_rewards'][proposal_type]['exclusive']
+        del legacy['asset_limits']
+
+        normalized = routes.validate_point_pricing(legacy)
+
+        self.assertEqual(normalized['proposal_rewards']['emoji']['exclusive'], 100000)
+        self.assertEqual(normalized['proposal_rewards']['sound']['exclusive'], 100000)
+        self.assertEqual(normalized['asset_limits']['emoji'], {'max_px': 1024, 'max_px_admin': 2048})
+        self.assertEqual(normalized['asset_limits']['sound'], {'max_length': 3, 'max_length_admin': 10})
+        self.assertEqual(normalized['catalog']['sound']['play_default'], 10)
+        self.assertEqual(normalized['catalog']['sound']['play_items'], {})
+
+    def test_sound_play_prices_fall_back_dynamically_and_do_not_change_purchase_price(self):
+        pricing = routes.validate_point_pricing(self.admin_payload())
+        sound = {'name': 'sample_sound', 'pricing_name': 'sample_sound'}
+
+        self.assertEqual(routes.resolve_sound_play_price(sound, pricing), 10)
+        pricing['catalog']['sound']['play_default'] = 12
+        self.assertEqual(routes.resolve_sound_play_price(sound, pricing), 12)
+        pricing['catalog']['sound']['play_items']['sample_sound'] = 7
+        self.assertEqual(routes.resolve_sound_play_price(sound, pricing), 7)
+        self.assertEqual(routes.resolve_catalog_asset_price('sound', sound, pricing), 100)
+
+    def test_vip_discount_applies_to_default_and_exception_play_prices(self):
+        pricing = routes.validate_point_pricing(self.admin_payload())
+        pricing['catalog']['sound']['play_default'] = 11
+        pricing['catalog']['sound']['play_items']['sample_sound'] = 7
+        vip = {**self.user, 'rank': 'VIP'}
+        sound = {'name': 'sample_sound', 'pricing_name': 'sample_sound'}
+
+        self.assertEqual(routes.get_action_cost('soundmeme', vip, sound, pricing), 4)
+        del pricing['catalog']['sound']['play_items']['sample_sound']
+        self.assertEqual(routes.get_action_cost('soundmeme', vip, sound, pricing), 6)
+
+    def test_invalid_sound_play_prices_are_rejected(self):
+        for invalid in (-1, -2, 1.5, True, '5'):
+            with self.subTest(default=invalid):
+                payload = self.admin_payload()
+                payload['catalog']['sound']['play_default'] = invalid
+                with self.assertRaises(ValueError):
+                    routes.validate_point_pricing(payload)
+            with self.subTest(exception=invalid):
+                payload = self.admin_payload()
+                payload['catalog']['sound']['play_items']['invalid_sound'] = invalid
+                with self.assertRaises(ValueError):
+                    routes.validate_point_pricing(payload)
+
+    def test_sound_price_exception_maps_save_and_rename_independently(self):
+        pricing = self.admin_payload()
+        pricing['catalog']['sound']['items']['sample_sound'] = 80
+        pricing['catalog']['sound']['play_items']['sample_sound'] = 6
+        self.pricing.document = {
+            '_id': routes.POINT_PRICING_ID,
+            'pricing': routes.validate_point_pricing(pricing),
+        }
+
+        routes.save_catalog_price_exception('sound', 'sample_sound', 'sample_sound', 90)
+        saved = self.pricing.document['pricing']['catalog']['sound']
+        self.assertEqual(saved['items']['sample_sound'], 90)
+        self.assertEqual(saved['play_items']['sample_sound'], 6)
+
+        routes.save_catalog_price_exception(
+            'sound',
+            'sample_sound',
+            'renamed_sound',
+            routes.ASSET_PRICE_UNCHANGED,
+            routes.ASSET_PRICE_UNCHANGED,
+        )
+        saved = self.pricing.document['pricing']['catalog']['sound']
+        self.assertNotIn('sample_sound', saved['items'])
+        self.assertEqual(saved['items']['renamed_sound'], 90)
+        self.assertNotIn('sample_sound', saved['play_items'])
+        self.assertEqual(saved['play_items']['renamed_sound'], 6)
+
+    def test_sound_filename_exceptions_resolve_for_shop_and_soundboard(self):
+        payload = self.admin_payload()
+        payload['catalog']['sound']['items']['21.mp3'] = 80
+        payload['catalog']['sound']['play_items']['21.mp3'] = 6
+        pricing = routes.validate_point_pricing(payload)
+        sound = {
+            '_id': ObjectId(),
+            'name': 'internalname',
+            'pricing_name': 'internalname',
+            'display_name': 'Readable title',
+            'file': '21.mp3',
+        }
+
+        self.assertEqual(routes.resolve_catalog_asset_price('sound', sound, pricing), 80)
+        self.assertEqual(routes.serialize_asset(sound, 'sound', pricing)['price'], 80)
+        self.assertEqual(routes.resolve_sound_play_price(sound, pricing), 6)
+        self.assertEqual(routes.get_action_cost('soundmeme', self.user, sound, pricing), 6)
+
+    def test_sound_filename_purchase_and_play_exceptions_rename_independently(self):
+        payload = self.admin_payload()
+        payload['catalog']['sound']['items']['21.mp3'] = 80
+        payload['catalog']['sound']['play_items']['internalname'] = 6
+        self.pricing.document = {
+            '_id': routes.POINT_PRICING_ID,
+            'pricing': routes.validate_point_pricing(payload),
+        }
+
+        routes.save_catalog_price_exception(
+            'sound',
+            '21.mp3',
+            '22.mp3',
+            routes.ASSET_PRICE_UNCHANGED,
+            routes.ASSET_PRICE_UNCHANGED,
+            'internalname',
+            '22.mp3',
+        )
+
+        saved = self.pricing.document['pricing']['catalog']['sound']
+        self.assertEqual(saved['items'], {'22.mp3': 80})
+        self.assertEqual(saved['play_items'], {'22.mp3': 6})
+
+    def test_invalid_asset_limits_are_rejected(self):
+        for asset_type, field in (
+            ('emoji', 'max_px'),
+            ('emoji', 'max_px_admin'),
+            ('sound', 'max_length'),
+            ('sound', 'max_length_admin'),
+        ):
+            payload = self.admin_payload()
+            payload['asset_limits'][asset_type][field] = 0
+            with self.subTest(asset_type=asset_type, field=field):
+                with self.assertRaises(ValueError):
+                    routes.validate_point_pricing(payload)
+
+    def test_minus_one_item_exception_persists_and_removal_restores_default(self):
+        self.login_as(self.admin)
+        payload = self.admin_payload()
+        payload['catalog']['emoji']['items']['blocked_emoji'] = -1
+
+        saved = self.client.put('/admin/pricing', json={'pricing': payload})
+
+        self.assertEqual(saved.status_code, 200)
+        self.assertEqual(
+            routes.resolve_catalog_price('emoji', 'blocked_emoji', pricing=saved.get_json()['pricing']),
+            -1,
+        )
+
+        del payload['catalog']['emoji']['items']['blocked_emoji']
+        restored = self.client.put('/admin/pricing', json={'pricing': payload})
+
+        self.assertEqual(restored.status_code, 200)
+        self.assertEqual(
+            routes.resolve_catalog_price('emoji', 'blocked_emoji', pricing=restored.get_json()['pricing']),
+            payload['catalog']['emoji']['default'],
+        )
+
+    def test_existing_item_exception_can_be_edited_to_minus_one(self):
+        self.login_as(self.admin)
+        payload = self.admin_payload()
+        payload['catalog']['emoji']['items']['editable_emoji'] = 25
+        created = self.client.put('/admin/pricing', json={'pricing': payload})
+        self.assertEqual(created.status_code, 200)
+
+        payload['catalog']['emoji']['items']['editable_emoji'] = -1
+        edited = self.client.put('/admin/pricing', json={'pricing': payload})
+
+        self.assertEqual(edited.status_code, 200)
+        self.assertEqual(
+            edited.get_json()['pricing']['catalog']['emoji']['items']['editable_emoji'],
+            -1,
+        )
+        self.assertEqual(
+            routes.resolve_catalog_price('emoji', 'editable_emoji', pricing=edited.get_json()['pricing']),
+            -1,
+        )
 
     def test_only_c4_admin_console_permission_can_read_or_save_prices(self):
         self.login_as(self.user)
@@ -146,6 +350,14 @@ class PointPricingTests(unittest.TestCase):
             with self.subTest(price=invalid_price):
                 payload = self.admin_payload()
                 payload['send_your_chaos']['normalmeme'] = invalid_price
+                response = self.client.put('/admin/pricing', json={'pricing': payload})
+                self.assertEqual(response.status_code, 400)
+                self.assertIsNone(self.pricing.document)
+
+        for invalid_exception in (-2, 1.5, True, '5'):
+            with self.subTest(exception_price=invalid_exception):
+                payload = self.admin_payload()
+                payload['catalog']['emoji']['items']['editable_emoji'] = invalid_exception
                 response = self.client.put('/admin/pricing', json={'pricing': payload})
                 self.assertEqual(response.status_code, 400)
                 self.assertIsNone(self.pricing.document)
