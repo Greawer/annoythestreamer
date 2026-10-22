@@ -21,6 +21,10 @@ yarn-error.log*
 .env*
 !.env.example
 
+# Local-only project notes
+/AGENTS.md
+/ROADMAP.md
+
 # vercel
 .vercel
 
