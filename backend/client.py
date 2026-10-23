@@ -31,9 +31,11 @@ def get_collections():
     colsoundactions = dbname['sound_actions']
     colsounds = dbname['sounds']
     colemojis = dbname['emojis']
+    colthemes = dbname['themes']
     colassetownership = dbname['asset_ownership']
     colshoppurchases = dbname['shop_purchases']
     colsoundfavorites = dbname['sound_favorites']
+    colbadges = dbname['badges']
     return (
         colfacememe,
         colnormalmeme,
@@ -48,9 +50,11 @@ def get_collections():
         colsoundactions,
         colsounds,
         colemojis,
+        colthemes,
         colassetownership,
         colshoppurchases,
         colsoundfavorites,
+        colbadges,
     )
 
 # Global cache - refresh on demand
@@ -68,9 +72,11 @@ def get_collections():
     colsoundactions,
     colsounds,
     colemojis,
+    colthemes,
     colassetownership,
     colshoppurchases,
     colsoundfavorites,
+    colbadges,
 ) = get_collections()
 colusers.create_index('username', unique=True)
 colranks.create_index('rank', unique=True)
@@ -79,6 +85,9 @@ colsounds.create_index('name', unique=True)
 colsounds.create_index('file', unique=True)
 colemojis.create_index('name', unique=True)
 colemojis.create_index('file', unique=True)
+colbadges.create_index('name_key', unique=True)
+colbadges.create_index('file', unique=True)
+colthemes.create_index('name_key', unique=True)
 for asset_collection in (colsounds, colemojis):
     asset_collection.create_index(
         [('proposal_user_id', 1), ('proposal_request_id', 1)],
@@ -242,7 +251,7 @@ def lastnormalmeme():
         return None
 
 def refresh_collections():
-    global colfacememe, colnormalmeme, colttsmeme, colchat, colusers, colranks, colpermissions, colsettings, colpricing, colpointtransactions, colsoundactions, colsounds, colemojis, colassetownership, colshoppurchases, colsoundfavorites
+    global colfacememe, colnormalmeme, colttsmeme, colchat, colusers, colranks, colpermissions, colsettings, colpricing, colpointtransactions, colsoundactions, colsounds, colemojis, colthemes, colassetownership, colshoppurchases, colsoundfavorites
     (
         colfacememe,
         colnormalmeme,
@@ -257,6 +266,7 @@ def refresh_collections():
         colsoundactions,
         colsounds,
         colemojis,
+        colthemes,
         colassetownership,
         colshoppurchases,
         colsoundfavorites,

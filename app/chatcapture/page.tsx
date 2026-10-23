@@ -3,13 +3,14 @@
 import { useEffect, useRef, useState } from "react";
 import { io, type Socket } from "socket.io-client";
 
-interface ChatMessage {
-  user: string;
+type ChatMessage = {
   message: string;
   literal_emojis?: string[];
-  rank_color?: string | null;
   id?: string;
-}
+} & (
+  | { system: true; actor?: string; user?: never; rank_color?: never }
+  | { system?: false; user: string; rank_color?: string | null; actor?: never }
+);
 
 const admins = ["Greawer"];
 const colors = { admin: "#ffc0cb", user: "#a855f7", self: "#ef4444" };
@@ -144,6 +145,18 @@ const ChatCapturePage = () => {
       )}
 
       {chatMessages.map((msg, idx) => {
+        if (msg.system) {
+          return (
+            <div
+              key={msg.id || idx}
+              className="rounded bg-muted/30 px-1 py-0.5 text-[15px] leading-tight text-muted-foreground"
+            >
+              {msg.actor && <span>{msg.actor}: </span>}
+              <span className="break-words">{msg.message}</span>
+            </div>
+          );
+        }
+
         const isMentioned = new RegExp(`@${currentUsername}\\b`, "i").test(msg.message);
         const highlightClass = isMentioned ? "mention-highlight-self" : "";
 

@@ -126,23 +126,67 @@
   }
 }
 
-/* Custom scrollbar styling */
+/* Scrollbars follow the active theme accent color. */
+:root {
+  scrollbar-color: var(--primary) transparent;
+}
+
 ::-webkit-scrollbar {
   width: 8px;
   height: 8px;
 }
 
 ::-webkit-scrollbar-track {
-  background: oklch(0.2 0.02 340);
+  background: transparent;
 }
 
 ::-webkit-scrollbar-thumb {
-  background: oklch(0.4 0.1 340);
+  background: var(--primary);
   border-radius: 4px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: oklch(0.75 0.15 350);
+  background: color-mix(in srgb, var(--primary), white 20%);
+}
+
+@media (max-width: 639px) {
+  [data-chaos-control-sizing] :is(input:not([type="hidden"]):not([type="file"]):not([type="checkbox"]):not([type="radio"]):not([type="color"]), select, textarea, button:not([role="tab"])) {
+    height: 1.75rem;
+    min-height: 1.75rem;
+    font-size: 0.75rem;
+  }
+
+  [data-chaos-control-sizing] :is(button.size-9, button.w-9) {
+    width: 1.75rem;
+  }
+}
+
+@media (min-width: 640px) {
+  [data-chaos-control-sizing] :is(input:not([type="hidden"]):not([type="file"]):not([type="checkbox"]):not([type="radio"]):not([type="color"]), select, textarea, button:not([role="tab"])) {
+    height: 2rem;
+    min-height: 2rem;
+    font-size: 0.875rem;
+  }
+
+  [data-chaos-control-sizing] :is(button.size-9, button.w-9) {
+    width: 2rem;
+  }
+}
+
+.joined-tabs {
+  gap: 0;
+  padding: 0.25rem;
+  border-radius: 0.375rem;
+  background: var(--muted);
+}
+
+.joined-tabs > [role="tab"] {
+  min-width: 0;
+  border-radius: 0.25rem;
+}
+
+.joined-tabs[data-columns="1"] > [role="tab"] {
+  border: 0;
 }
 
 /* Gradient background effect for streaming theme */

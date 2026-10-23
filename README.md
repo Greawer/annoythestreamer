@@ -1,8 +1,7 @@
 # AnnoyTheStreamer 2.0
 
 The current 2.0 alpha is an interactive streamer website built with Next.js,
-Flask, MongoDB, and Socket.IO. Development status and planned work are tracked
-in the [roadmap](./ROADMAP.md).
+Flask, MongoDB, and Socket.IO.
 
 ## Architecture
 
@@ -28,7 +27,7 @@ Install from the repository root in PowerShell:
 npm ci
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install -r backend\requirements.txt
+python -m pip install -r requirements.txt
 ```
 
 ## Configuration
@@ -60,6 +59,9 @@ Next.js serves these files directly. Flask's `/static/<path>` compatibility
 route serves from the same `public/` tree for its APIs and existing media
 clients. Website pages, including OBS browser views, are implemented in the
 Next.js `app/` directory; Flask no longer renders legacy HTML templates.
+Git excludes all files under `public/`; only empty-directory `.gitkeep` markers
+are tracked. Restore any required local assets separately before using
+features that depend on them.
 
 Put user-provided soundboard audio (`.mp3`, `.m4a`, or `.wav`) in
 `public/sounds/soundboard/`; keep generated TTS audio in
@@ -67,8 +69,8 @@ Put user-provided soundboard audio (`.mp3`, `.m4a`, or `.wav`) in
 MongoDB message-ID order, marking evicted records done and removing their
 filepaths while preserving records for request deduplication. Stored
 `/static/sounds/tts/...` playback URLs are unchanged for retained messages.
-Emoji images belong in `public/img/emoji/`. User media and generated TTS output
-are local runtime assets and are not versioned.
+Emoji images belong in `public/img/emoji/`. Public media and generated TTS
+output are local runtime assets and are not versioned.
 
 `public/sounds/soundboard/_sound-list.txt` is a local-only legacy title list.
 The current soundboard obtains its list and titles from Flask's file scan and
@@ -128,5 +130,3 @@ python -m unittest discover -s backend/tests -v
 
 This is **AnnoyTheStreamer 2.0**, currently on the `2.0.0-alpha.1` development
 version. The stable `2.0.0` release is reserved for the first stable release.
-See [ROADMAP.md](./ROADMAP.md) for verified features, work in progress, and
-planned follow-up features.

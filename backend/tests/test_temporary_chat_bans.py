@@ -98,6 +98,14 @@ class TemporaryChatBanTests(unittest.TestCase):
         self.assertEqual(set(update), {"$set"})
         timeout_until = update["$set"]["chat_timeout_until"]
         self.assertGreaterEqual(timeout_until, started_at + timedelta(seconds=30))
+        activity = self.chat.insert_one.call_args.args[0]
+        self.assertTrue(activity['system'])
+        self.assertNotIn('user', activity)
+        self.assertEqual(activity['message'], 'staff-user banned target-user for 30s.')
+        self.socketio.emit.assert_any_call(
+            'chat_message',
+            {'system': True, 'message': 'staff-user banned target-user for 30s.'},
+        )
         self.assertLess(timeout_until, started_at + timedelta(seconds=31))
         self.assertEqual(
             response.get_json()["user"]["chat_timeout_until"],
@@ -130,6 +138,12 @@ class TemporaryChatBanTests(unittest.TestCase):
             {"$unset": {"chat_timeout_until": ""}},
         )
         self.assertIsNone(response.get_json()["user"]["chat_timeout_until"])
+        activity = self.chat.insert_one.call_args.args[0]
+        self.assertEqual(activity['message'], 'unbanned target-user.')
+        self.socketio.emit.assert_any_call(
+            'chat_message',
+            {'system': True, 'message': 'unbanned target-user.'},
+        )
 
     def test_legacy_permanent_ban_route_is_retired(self):
         self._login("admin")

@@ -16,7 +16,7 @@ Start MongoDB, then from the repository root install the backend dependencies:
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install -r backend\requirements.txt
+python -m pip install -r requirements.txt
 ```
 
 Start Flask from the repository root with the existing npm script:
@@ -99,6 +99,8 @@ are in `public/img/`, and soundboard/TTS audio is in `public/sounds/`. Next.js
 serves these files directly. Flask disables its built-in static folder and
 retains existing `/static/<path>` URLs by serving the requested path from
 `public/`. The Next.js proxy forwards `/static/*` requests to Flask.
+Git excludes all files under `public/`; only empty-directory `.gitkeep`
+markers are tracked, so restore required local assets separately.
 
 User-provided soundboard audio belongs in `public/sounds/soundboard/`.
 `/soundboardlist` scans that directory and derives titles from audio metadata
@@ -109,8 +111,8 @@ MongoDB message-ID order. On eviction, it removes the file, marks the message
 done, and removes its `filepath`; it retains the MongoDB document so retries
 remain deduplicated. Missing files are handled the same way, and `created=yes`
 records are not requeued. Existing playback URLs and filenames are preserved
-for retained audio. Ignore rules exclude user media and generated output
-without hiding application assets, tests, source, or configuration templates.
+for retained audio. Ignore rules exclude all `public/` contents without hiding
+application source, tests, or configuration templates.
 
 ## Tests
 

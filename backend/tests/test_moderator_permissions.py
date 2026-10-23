@@ -16,7 +16,8 @@ class ModeratorPermissionTests(unittest.TestCase):
     def setUp(self):
         self.app = Flask(__name__)
         self.app.secret_key = "test-only-secret"
-        routes.registerroutes(self.app, Mock())
+        self.socketio = Mock()
+        routes.registerroutes(self.app, self.socketio)
         self.client = self.app.test_client()
         self.actor = {
             "_id": ObjectId(),
@@ -144,6 +145,18 @@ class ModeratorPermissionTests(unittest.TestCase):
         remove = self.client.post("/admin/users/target-user/rank", json={"rank": "User"})
         self.assertEqual(remove.status_code, 200)
         self.assertEqual(remove.get_json()["user"]["rank"], "User")
+        activity_messages = [
+            call.args[1]["message"]
+            for call in self.socketio.emit.call_args_list
+            if call.args[0] == "chat_message"
+        ]
+        self.assertEqual(
+            activity_messages,
+            [
+                "staff-user changed target-user's rank to VIP.",
+                "staff-user changed target-user's rank to User.",
+            ],
+        )
 
     def test_moderator_can_assign_future_non_staff_ranks(self):
         self.ranks.find_one.side_effect = lambda query: {"rank": query["rank"]}
@@ -217,13 +230,52 @@ class ModeratorPermissionTests(unittest.TestCase):
         self.target["username"] = "target-user"
         self.target["_id"] = ObjectId()
         self.target["rank"] = "User"
-        for staff_rank in ("Mod", "admin"):
-            with self.subTest(assign=staff_rank):
-                response = self.client.post(
-                    "/admin/users/target-user/rank",
-                    json={"rank": staff_rank},
-                )
-                self.assertEqual(response.status_code, 400)
+        moderator_rank = self.client.post(
+            "/admin/users/target-user/rank",
+            json={"rank": "Mod"},
+        )
+        self.assertEqual(moderator_rank.status_code, 200)
+        self.assertEqual(moderator_rank.get_json()["user"]["rank"], "Mod")
+
+        self.target["rank"] = "User"
+        admin_rank = self.client.post(
+            "/admin/users/target-user/rank",
+            json={"rank": "admin"},
+        )
+        self.assertEqual(admin_rank.status_code, 400)
+
+    def test_moderator_cannot_assign_staff_rank_without_permission_collection_grant(self):
+        denied = self.client.post(
+            "/admin/users/target-user/rank",
+            json={"rank": "Moderator"},
+        )
+
+        self.assertEqual(denied.status_code, 403)
+        self.users.find_one_and_update.assert_not_called()
+
+    def test_streaming_changes_emit_started_and_finished_activity(self):
+        self.actor["rank"] = "Admin"
+        with self.client.session_transaction() as session:
+            session["admin_user_id"] = str(self.actor["_id"])
+        self.settings.find_one.side_effect = [
+            {"streaming": False},
+            {"streaming": True},
+        ]
+        self.settings.find_one_and_update.side_effect = [
+            {"streaming": True},
+            {"streaming": False},
+        ]
+
+        started = self.client.post("/admin/streaming", json={"streaming": True})
+        finished = self.client.post("/admin/streaming", json={"streaming": False})
+
+        self.assertEqual([started.status_code, finished.status_code], [200, 200])
+        activity_messages = [
+            call.args[1]["message"]
+            for call in self.socketio.emit.call_args_list
+            if call.args[0] == "chat_message"
+        ]
+        self.assertEqual(activity_messages, ["Stream started.", "Stream finished."])
 
         self.users.find_one_and_update.assert_not_called()
 
@@ -351,6 +403,15 @@ class ModeratorPermissionTests(unittest.TestCase):
 
         self.assertEqual(rank_response.status_code, 200)
         self.assertEqual(rank_response.get_json()["user"]["rank"], "VIP")
+        rank_activity = next(
+            call.args[1]
+            for call in self.socketio.emit.call_args_list
+            if call.args[0] == "chat_message"
+        )
+        self.assertEqual(rank_activity, {
+            "system": True,
+            "message": "changed target-user's rank to VIP.",
+        })
         self.assertEqual(points_response.status_code, 200)
         self.assertEqual(reset_response.status_code, 200)
         self.assertEqual(streaming_response.status_code, 200)

@@ -256,6 +256,10 @@ class PointBalanceTests(unittest.TestCase):
         self.assertEqual(transaction.args[1]["$setOnInsert"]["amount"], -200)
         self.assertEqual(transaction.args[1]["$setOnInsert"]["requested_amount"], -500)
         self.assertEqual(transaction.args[1]["$setOnInsert"]["balance_after"], 0)
+        self.socketio.emit.assert_any_call(
+            "chat_message",
+            {"system": True, "message": "target-user -200❖"},
+        )
         adjustment_pipeline = self.users.find_one_and_update.call_args.args[1][0]["$set"]
         self.assertEqual(
             adjustment_pipeline["point_adjustment_records"]["$concatArrays"][1][0]["amount"],
@@ -271,7 +275,13 @@ class PointBalanceTests(unittest.TestCase):
         )
         self.assertEqual(
             self.socketio.emit.call_args_list,
-            [unittest.mock.call("points_changed", {"updated": True}, to="target-socket")],
+            [
+                unittest.mock.call("points_changed", {"updated": True}, to="target-socket"),
+                unittest.mock.call(
+                    "chat_message",
+                    {"system": True, "message": "target-user -200❖"},
+                ),
+            ],
         )
 
     def test_admin_adjustment_retry_does_not_notify_or_reapply(self):

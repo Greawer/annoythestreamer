@@ -1,7 +1,7 @@
 "use client"
 
 import type React from "react"
-import { useState, useEffect, useRef, useCallback } from "react"
+import { useState, useEffect, useRef, useCallback, useLayoutEffect } from "react"
 import { io, type Socket } from "socket.io-client"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -21,23 +21,26 @@ import {
   Smile,
   Star,
   X,
-  Sun,
-  Moon,
+  Palette,
   Upload,
   Trash2,
   Shield,
+  Award,
   ChevronDown,
   ChevronUp,
+  ExternalLink,
 } from "lucide-react"
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 
-interface ChatMessage {
-  user: string
+type ChatMessage = {
   message: string
   literal_emojis?: string[]
-  rank?: string
-  rank_color?: string | null
   id?: string
-}
+  badge?: BadgeAsset | null
+} & (
+  | { system: true; actor?: string; user?: never; rank?: never; rank_color?: never }
+  | { system?: false; user: string; rank?: string; rank_color?: string | null; actor?: never }
+)
 
 interface ManagedUser {
   username: string
@@ -49,6 +52,17 @@ interface ManagedUser {
   chat_timeout_until: string | null
   registered_at: string | null
   message_count: number
+  email: string | null
+  banned: boolean
+  badges: BadgeAsset[]
+  visible_badge_id: string | null
+}
+
+interface BadgeAsset {
+  asset_id: string
+  name: string
+  file: string
+  url: string
 }
 
 interface RankOption {
@@ -69,6 +83,11 @@ interface PointPricing {
   send_your_chaos: Record<string, number>
   catalog: {
     emoji: {
+      default: number
+      categories: Record<string, number>
+      items: Record<string, number>
+    }
+    theme: {
       default: number
       categories: Record<string, number>
       items: Record<string, number>
@@ -124,9 +143,33 @@ interface ShopAsset {
   url: string
 }
 
+interface ThemeOption extends ShopAsset {
+  primary_color: string
+  panel_color: string
+  accent_color: string
+  background_image_exists: boolean
+  background_opacity: number
+  background_image_name: string | null
+  is_standard: boolean
+  price_overridden?: boolean
+}
+
+interface AdminThemeDraft {
+  name: string
+  primary_color: string
+  panel_color: string
+  accent_color: string
+  price: string
+  background_url: string
+  background_opacity: string
+  background_file: File | null
+  remove_background: boolean
+}
+
 interface ShopCatalog {
   emoji: ShopAsset[]
   sound: ShopAsset[]
+  theme: ThemeOption[]
   proposal_prices?: Record<"emoji" | "sound", {
     default: number
     exclusive: number
@@ -163,7 +206,25 @@ type ProposalDraft = {
   exclusive: boolean
 }
 
-type ShopCategory = "emoji" | "sound" | "add"
+type ShopCategory = "emoji" | "sound" | "theme" | "add"
+
+const STANDARD_THEME_ID = "65f0a0000000000000000001"
+const STANDARD_THEME: ThemeOption = {
+  asset_id: STANDARD_THEME_ID,
+  name: "Standard",
+  title: "Standard",
+  price: 0,
+  owned: true,
+  status: "owned",
+  primary_color: "#000000",
+  panel_color: "#171717",
+  accent_color: "#f9a8d4",
+  background_image_exists: false,
+  background_opacity: 0,
+  background_image_name: null,
+  is_standard: true,
+  url: "",
+}
 
 const SEND_YOUR_CHAOS_ACTIONS = [
   { key: "normalmeme", label: "Normal meme" },
@@ -183,7 +244,20 @@ function parsePointPrice(value: string): number | null {
   return Number.isSafeInteger(price) && price >= -1 ? price : null
 }
 
+function contrastingTextColor(color: string): "#000000" | "#ffffff" {
+  const match = /^#([0-9a-f]{6})$/i.exec(color)
+  if (!match) return "#ffffff"
+  const channels = [0, 2, 4].map((offset) => {
+    const value = Number.parseInt(match[1].slice(offset, offset + 2), 16) / 255
+    return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4
+  })
+  const luminance = 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+  return luminance > 0.179 ? "#000000" : "#ffffff"
+}
+
 export default function AnnoyTheStreamer() {
+  const [isChatOnly, setIsChatOnly] = useState(false)
+  const [chatPopoutBlocked, setChatPopoutBlocked] = useState(false)
   const [username, setUsername] = useState<string>("")
   const [sessionRestored, setSessionRestored] = useState(false)
   const [usernameInput, setUsernameInput] = useState("")
@@ -198,10 +272,11 @@ export default function AnnoyTheStreamer() {
   const [passwordResetToken, setPasswordResetToken] = useState("")
   const [passwordResetAccount, setPasswordResetAccount] = useState<{
     username: string
-    email: string | null
+    recoveryType: "password" | "email"
   } | null>(null)
   const [resetPasswordInput, setResetPasswordInput] = useState("")
   const [resetPasswordConfirmation, setResetPasswordConfirmation] = useState("")
+  const [resetEmailInput, setResetEmailInput] = useState("")
   const [authError, setAuthError] = useState("")
   const [logoutError, setLogoutError] = useState("")
   const [isLoggingOut, setIsLoggingOut] = useState(false)
@@ -212,21 +287,110 @@ export default function AnnoyTheStreamer() {
   const [actionError, setActionError] = useState("")
   const [pointsLoading, setPointsLoading] = useState(true)
   const [pointsError, setPointsError] = useState(false)
-  const [adminView, setAdminView] = useState<"users" | "admin" | "pricing" | "soundboard" | "emoji">("users")
+  const [adminView, setAdminView] = useState<"users" | "admin" | "pricing" | "soundboard" | "emoji" | "themes" | "badges">("users")
   const [lookupUsername, setLookupUsername] = useState("")
   const [managedUser, setManagedUser] = useState<ManagedUser | null>(null)
+  const [adminBadges, setAdminBadges] = useState<BadgeAsset[]>([])
+  const [adminBadgeName, setAdminBadgeName] = useState("")
+  const [adminBadgeFile, setAdminBadgeFile] = useState<File | null>(null)
+  const [adminBadgeUrl, setAdminBadgeUrl] = useState("")
+  const [adminBadgeDrafts, setAdminBadgeDrafts] = useState<Record<string, { name: string }>>({})
+  const [adminBadgeReplacementFiles, setAdminBadgeReplacementFiles] = useState<Record<string, File | null>>({})
+  const [adminBadgeReplacementUrls, setAdminBadgeReplacementUrls] = useState<Record<string, string>>({})
+  const [adminBadgeError, setAdminBadgeError] = useState("")
+  const [adminBadgeNotice, setAdminBadgeNotice] = useState("")
+  const [adminBadgeSaving, setAdminBadgeSaving] = useState(false)
+  const [adminBadgeLookup, setAdminBadgeLookup] = useState("")
+  const [selectedAdminBadgeId, setSelectedAdminBadgeId] = useState<string | null>(null)
+  const [adminBadgeGrantName, setAdminBadgeGrantName] = useState("")
+  const [adminBadgeGranting, setAdminBadgeGranting] = useState(false)
+  const [showUserInfoPanel, setShowUserInfoPanel] = useState(false)
+  const userInfoPanelBodyRef = useRef<HTMLDivElement>(null)
+  const onlineUsersScrollRef = useRef<HTMLDivElement>(null)
+  const userInfoPanelRef = useRef({ open: false })
+  const [userInfo, setUserInfo] = useState<ManagedUser | null>(null)
+  const managedUserRef = useRef<ManagedUser | null>(null)
+  const [userInfoLoading, setUserInfoLoading] = useState(false)
+  const [userInfoError, setUserInfoError] = useState("")
+  const [userBadgeSelection, setUserBadgeSelection] = useState("")
+  const [userBadgeSaving, setUserBadgeSaving] = useState(false)
+  const [userRecoveryToken, setUserRecoveryToken] = useState("")
+  const [userRecoveryError, setUserRecoveryError] = useState("")
+  const [userRecoveryNotice, setUserRecoveryNotice] = useState("")
+  const [userRecoveryCopyNotice, setUserRecoveryCopyNotice] = useState("")
+  useLayoutEffect(() => {
+    const card = userInfoPanelBodyRef.current?.closest<HTMLElement>("[data-user-info-panel]")
+    const body = userInfoPanelBodyRef.current
+    if (!card || !body) return
+
+    const desktop = window.matchMedia("(min-width: 1024px)").matches
+    const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches
+    const content = body.querySelector<HTMLElement>("[data-user-info-content]")
+    if (content) content.style.overflowY = "hidden"
+    let animationTimeout = 0
+
+    if (showUserInfoPanel) {
+      const closedCardHeight = Math.max(
+        0,
+        card.getBoundingClientRect().height - body.getBoundingClientRect().height,
+      )
+      const maxHeight = Number.parseFloat(getComputedStyle(card).maxHeight)
+      const targetCardHeight = desktop
+        ? Math.max(closedCardHeight, Math.min(375, Number.isFinite(maxHeight) ? maxHeight : 375))
+        : closedCardHeight + (body.querySelector<HTMLElement>("[data-user-info-content]")?.scrollHeight ?? 0)
+      const targetBodyHeight = targetCardHeight - closedCardHeight
+
+      card.style.height = `${closedCardHeight}px`
+      body.style.height = "0px"
+      void card.offsetHeight
+
+      if (reducedMotion) {
+        card.style.height = desktop ? `${targetCardHeight}px` : "auto"
+        body.style.height = desktop ? `${targetBodyHeight}px` : "auto"
+        if (content) content.style.overflowY = "auto"
+      } else {
+        animationTimeout = window.setTimeout(() => {
+          card.style.height = `${targetCardHeight}px`
+          body.style.height = `${targetBodyHeight}px`
+        }, 16)
+      }
+    } else {
+      const currentCardHeight = card.getBoundingClientRect().height
+      const currentBodyHeight = body.getBoundingClientRect().height
+      const closedCardHeight = Math.max(0, currentCardHeight - currentBodyHeight)
+
+      card.style.height = `${currentCardHeight}px`
+      body.style.height = `${currentBodyHeight}px`
+      void card.offsetHeight
+
+      if (reducedMotion) {
+        card.style.height = "auto"
+        body.style.height = "0px"
+        if (content) content.style.overflowY = "auto"
+      } else {
+        animationTimeout = window.setTimeout(() => {
+          card.style.height = `${closedCardHeight}px`
+          body.style.height = "0px"
+        }, 16)
+      }
+    }
+
+    return () => window.clearTimeout(animationTimeout)
+  }, [showUserInfoPanel])
   const [currentModerationStatus, setCurrentModerationStatus] = useState<{
     chat_timeout_until: string | null
   } | null>(null)
   const [timeoutClock, setTimeoutClock] = useState(() => Date.now())
   const [rankOptions, setRankOptions] = useState<RankOption[]>([])
   const [rankSelection, setRankSelection] = useState("")
-  const [pointsAdjustment, setPointsAdjustment] = useState("0")
-  const [timeoutDurationSeconds, setTimeoutDurationSeconds] = useState("60")
+  const [pointsAdjustment, setPointsAdjustment] = useState("")
+  const [timeoutDurationSeconds, setTimeoutDurationSeconds] = useState("")
   const [adminError, setAdminError] = useState("")
   const [adminNotice, setAdminNotice] = useState("")
   const [confirmingPasswordReset, setConfirmingPasswordReset] = useState(false)
-  const [adminIssuedPasswordResetToken, setAdminIssuedPasswordResetToken] = useState("")
+  const [confirmingEmailReset, setConfirmingEmailReset] = useState(false)
+  const [adminIssuedRecoveryToken, setAdminIssuedRecoveryToken] = useState("")
+  const [adminRecoveryCopyNotice, setAdminRecoveryCopyNotice] = useState("")
   const [pointPricing, setPointPricing] = useState<PointPricing | null>(null)
   const [editedCatalogPrices, setEditedCatalogPrices] = useState<Record<string, string>>({})
   const [pricingLoading, setPricingLoading] = useState(false)
@@ -234,9 +398,11 @@ export default function AnnoyTheStreamer() {
   const [pricingError, setPricingError] = useState("")
   const [pricingNotice, setPricingNotice] = useState("")
   const [newEmojiItem, setNewEmojiItem] = useState("")
-  const [newEmojiItemPrice, setNewEmojiItemPrice] = useState("100")
+  const [newEmojiItemPrice, setNewEmojiItemPrice] = useState("")
   const [newSoundItem, setNewSoundItem] = useState("")
-  const [newSoundItemPrice, setNewSoundItemPrice] = useState("100")
+  const [newSoundItemPrice, setNewSoundItemPrice] = useState("")
+  const [newThemeItem, setNewThemeItem] = useState("")
+  const [newThemeItemPrice, setNewThemeItemPrice] = useState("")
   const [newSoundPlayItem, setNewSoundPlayItem] = useState("")
   const [newSoundPlayItemPrice, setNewSoundPlayItemPrice] = useState("")
   const [newEmojiProposalItem, setNewEmojiProposalItem] = useState("")
@@ -278,6 +444,33 @@ export default function AnnoyTheStreamer() {
     emoji: null,
   })
   const [shopCategory, setShopCategory] = useState<ShopCategory>("emoji")
+  const [themeOptions, setThemeOptions] = useState<ThemeOption[]>([STANDARD_THEME])
+  const [activeThemeId, setActiveThemeId] = useState(STANDARD_THEME_ID)
+  const [savedThemeId, setSavedThemeId] = useState(STANDARD_THEME_ID)
+  const [themePickerOpen, setThemePickerOpen] = useState(false)
+  const [themeSaving, setThemeSaving] = useState(false)
+  const [themeError, setThemeError] = useState("")
+  const [adminThemes, setAdminThemes] = useState<ThemeOption[]>([])
+  const [adminThemeName, setAdminThemeName] = useState("")
+  const [adminThemePrimary, setAdminThemePrimary] = useState("#000000")
+  const [adminThemePanel, setAdminThemePanel] = useState("#171717")
+  const [adminThemeAccent, setAdminThemeAccent] = useState("#f9a8d4")
+  const [adminThemePrice, setAdminThemePrice] = useState("")
+  const [adminThemeBackgroundUrl, setAdminThemeBackgroundUrl] = useState("")
+  const [adminThemeBackgroundFile, setAdminThemeBackgroundFile] = useState<File | null>(null)
+  const adminThemeBackgroundInputRef = useRef<HTMLInputElement>(null)
+  const [adminThemeBackgroundOpacity, setAdminThemeBackgroundOpacity] = useState("")
+  const [adminThemeSaving, setAdminThemeSaving] = useState(false)
+  const [adminThemeCreateError, setAdminThemeCreateError] = useState("")
+  const [adminThemeManageError, setAdminThemeManageError] = useState("")
+  const [adminThemeCreateNotice, setAdminThemeCreateNotice] = useState("")
+  const [adminThemeManageNotice, setAdminThemeManageNotice] = useState("")
+  const [adminThemeLookup, setAdminThemeLookup] = useState("")
+  const [selectedAdminThemeId, setSelectedAdminThemeId] = useState<string | null>(null)
+  const [adminThemeDrafts, setAdminThemeDrafts] = useState<Record<string, AdminThemeDraft>>({})
+  const [adminThemePreview, setAdminThemePreview] = useState<ThemeOption | null>(null)
+  const themePreviewGeneration = useRef(0)
+  const [shopThemePreview, setShopThemePreview] = useState<ThemeOption | null>(null)
   const [proposalDrafts, setProposalDrafts] = useState<Record<"emoji" | "sound", ProposalDraft>>({
     emoji: { name: "", sourceUrl: "", loudness: "", exclusive: false },
     sound: { name: "", sourceUrl: "", loudness: "", exclusive: false },
@@ -289,7 +482,8 @@ export default function AnnoyTheStreamer() {
   const [proposalSaving, setProposalSaving] = useState<"emoji" | "sound" | null>(null)
   const [emojiShopSearch, setEmojiShopSearch] = useState("")
   const [soundShopSearch, setSoundShopSearch] = useState("")
-  const [shopAssets, setShopAssets] = useState<ShopCatalog>({ emoji: [], sound: [] })
+  const [themeShopSearch, setThemeShopSearch] = useState("")
+  const [shopAssets, setShopAssets] = useState<ShopCatalog>({ emoji: [], sound: [], theme: [] })
   const [shopProposalPrices, setShopProposalPrices] = useState<NonNullable<ShopCatalog["proposal_prices"]> | null>(null)
   const [shopLoading, setShopLoading] = useState(false)
   const [shopError, setShopError] = useState("")
@@ -310,8 +504,22 @@ export default function AnnoyTheStreamer() {
   const [assetLoadError, setAssetLoadError] = useState("")
   const [soundSearch, setSoundSearch] = useState("");
   const [activeTab, setActiveTab] = useState("facememe")
-  const [theme, setTheme] = useState<"light" | "dark">("dark")
   const [showOnlineList, setShowOnlineList] = useState(false)
+  useLayoutEffect(() => {
+    const scrollArea = onlineUsersScrollRef.current
+    if (!scrollArea || !window.matchMedia("(min-width: 1024px)").matches) return
+
+    const timeout = window.matchMedia("(prefers-reduced-motion: reduce)").matches
+      ? null
+      : window.setTimeout(() => {
+          scrollArea.style.overflowY = "auto"
+        }, 220)
+
+    scrollArea.style.overflowY = timeout === null ? "auto" : "hidden"
+    return () => {
+      if (timeout !== null) window.clearTimeout(timeout)
+    }
+  }, [showOnlineList])
   const [isStreaming, setIsStreaming] = useState(false)
   const isActiveTimeout = (timeoutUntil: string | null) => {
     if (!timeoutUntil) return false
@@ -356,6 +564,36 @@ export default function AnnoyTheStreamer() {
   const isAdmin = permission("admin_console")
   const canInspectUsers = permission("inspect_users")
   const canManageTimeouts = permission("manage_timeouts")
+  const activeTheme = adminThemePreview ?? shopThemePreview ?? themeOptions.find((themeOption) => themeOption.asset_id === activeThemeId) ?? STANDARD_THEME
+  const renderThemeSwatch = (themeOption: ThemeOption, sizeClass: string, extraClass = "") => (
+    <span
+      aria-hidden="true"
+      className={`relative isolate inline-block flex-shrink-0 ${sizeClass} ${extraClass}`}
+      style={{
+        borderColor: themeOption.primary_color,
+      }}
+    >
+      <span
+        className="absolute inset-0 overflow-hidden rounded-[inherit]"
+        style={{
+          background: `linear-gradient(135deg, ${themeOption.panel_color} 50%, ${themeOption.accent_color} 50%)`,
+        }}
+      >
+        {themeOption.background_image_exists && themeOption.url && (
+          <img
+            src={themeOption.url}
+            alt=""
+            className="pointer-events-none absolute inset-0 h-full w-full rounded-[inherit] object-cover"
+            style={{ opacity: themeOption.background_opacity }}
+          />
+        )}
+      </span>
+      <span
+        className="absolute -right-[4px] -top-[4px] z-10 h-3 w-3 rounded-full border border-card"
+        style={{ backgroundColor: themeOption.primary_color }}
+      />
+    </span>
+  )
   const isFreeAction = (action: string) => {
     const freeActions = currentPermissions?.capabilities.free_actions
     return Array.isArray(freeActions) && freeActions.includes(action)
@@ -400,7 +638,7 @@ export default function AnnoyTheStreamer() {
       : current)
   }
 
-  const updateCatalogDefault = (assetType: "emoji" | "sound", value: number) => {
+  const updateCatalogDefault = (assetType: "emoji" | "sound" | "theme", value: number) => {
     setPointPricing((current) => current
       ? {
           ...current,
@@ -470,7 +708,7 @@ export default function AnnoyTheStreamer() {
   }
 
   const updateCatalogItemPrice = (
-    assetType: "emoji" | "sound",
+    assetType: "emoji" | "sound" | "theme",
     key: string,
     value: number,
   ) => {
@@ -489,7 +727,7 @@ export default function AnnoyTheStreamer() {
   }
 
   const updateEditedCatalogItemPrice = (
-    assetType: "emoji" | "sound",
+    assetType: "emoji" | "sound" | "theme",
     key: string,
     rawValue: string,
   ) => {
@@ -501,7 +739,31 @@ export default function AnnoyTheStreamer() {
     updateCatalogItemPrice(assetType, key, price)
   }
 
-  const removeCatalogItemPrice = (assetType: "emoji" | "sound", key: string) => {
+  const updateEditedThemePrice = (themeId: string, rawValue: string) => {
+    setEditedCatalogPrices((current) => ({ ...current, [`theme:${themeId}`]: rawValue }))
+    if (rawValue.trim() === "") {
+      setPricingError("")
+      setPointPricing((current) => {
+        if (!current) return current
+        const items = { ...current.catalog.theme.items }
+        delete items[themeId]
+        return {
+          ...current,
+          catalog: {
+            ...current.catalog,
+            theme: { ...current.catalog.theme, items },
+          },
+        }
+      })
+      return
+    }
+    const price = parsePointPrice(rawValue)
+    if (price === null) return
+    setPricingError("")
+    updateCatalogItemPrice("theme", themeId, price)
+  }
+
+  const removeCatalogItemPrice = (assetType: "emoji" | "sound" | "theme", key: string) => {
     setEditedCatalogPrices((current) => {
       const updated = { ...current }
       delete updated[`${assetType}:${key}`]
@@ -561,10 +823,138 @@ export default function AnnoyTheStreamer() {
     }
   }, [])
 
+  const loadAdminBadges = useCallback(async () => {
+    setAdminBadgeError("")
+    try {
+      const response = await fetch("/api/admin/badges")
+      const result = await response.json()
+      if (!response.ok || !Array.isArray(result.badges)) {
+        throw new Error(result.message || "Could not load badges")
+      }
+      const badges = result.badges as BadgeAsset[]
+      setAdminBadges(badges)
+      setAdminBadgeDrafts((current) => ({
+        ...current,
+        ...Object.fromEntries(badges.map((badge) => [badge.asset_id, { name: badge.name }])),
+      }))
+    } catch (error) {
+      setAdminBadgeError(error instanceof Error ? error.message : "Could not load badges")
+    }
+  }, [])
+
   useEffect(() => {
     if (isAdmin && adminView === "soundboard") void loadAdminAssets("sound")
     if (isAdmin && adminView === "emoji") void loadAdminAssets("emoji")
-  }, [adminView, isAdmin, loadAdminAssets])
+    if (isAdmin && adminView === "users") void loadAdminBadges()
+    if (isAdmin && adminView === "badges") void loadAdminBadges()
+  }, [adminView, isAdmin, loadAdminAssets, loadAdminBadges])
+
+  const createAdminBadge = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (adminBadgeFile && adminBadgeUrl.trim()) {
+      setAdminBadgeError("Choose an image file or enter an image URL, not both.")
+      return
+    }
+    if (!adminBadgeFile && !adminBadgeUrl.trim()) {
+      setAdminBadgeError("Choose an image file or enter an image URL.")
+      return
+    }
+    const formData = new FormData()
+    formData.set("name", adminBadgeName)
+    if (adminBadgeFile) formData.set("file", adminBadgeFile)
+    if (adminBadgeUrl.trim()) formData.set("source_url", adminBadgeUrl.trim())
+    setAdminBadgeSaving(true)
+    setAdminBadgeError("")
+    setAdminBadgeNotice("")
+    try {
+      const response = await fetch("/api/admin/badges", { method: "POST", body: formData })
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.message || "Could not create badge")
+      setAdminBadgeName("")
+      setAdminBadgeFile(null)
+      setAdminBadgeUrl("")
+      setAdminBadgeNotice("Badge added.")
+      await loadAdminBadges()
+    } catch (error) {
+      setAdminBadgeError(error instanceof Error ? error.message : "Could not create badge")
+    } finally {
+      setAdminBadgeSaving(false)
+    }
+  }
+
+  const saveAdminBadge = async (badge: BadgeAsset) => {
+    const name = adminBadgeDrafts[badge.asset_id]?.name ?? badge.name
+    const file = adminBadgeReplacementFiles[badge.asset_id]
+    const sourceUrl = (adminBadgeReplacementUrls[badge.asset_id] ?? "").trim()
+    if (file && sourceUrl) {
+      setAdminBadgeError("Choose a replacement image file or enter an image URL, not both.")
+      return
+    }
+    setAdminBadgeSaving(true)
+    setAdminBadgeError("")
+    setAdminBadgeNotice("")
+    try {
+      let response: Response
+      if (file || sourceUrl) {
+        const formData = new FormData()
+        formData.set("name", name)
+        if (file) formData.set("file", file)
+        if (sourceUrl) formData.set("source_url", sourceUrl)
+        response = await fetch(`/api/admin/badges/${badge.asset_id}`, { method: "PATCH", body: formData })
+      } else {
+        response = await fetch(`/api/admin/badges/${badge.asset_id}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name }),
+        })
+      }
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.message || "Could not update badge")
+      setAdminBadgeReplacementFiles((current) => ({ ...current, [badge.asset_id]: null }))
+      setAdminBadgeReplacementUrls((current) => ({ ...current, [badge.asset_id]: "" }))
+      setAdminBadgeNotice("Badge updated.")
+      await loadAdminBadges()
+    } catch (error) {
+      setAdminBadgeError(error instanceof Error ? error.message : "Could not update badge")
+    } finally {
+      setAdminBadgeSaving(false)
+    }
+  }
+
+  const removeAdminBadge = async (badge: BadgeAsset) => {
+    if (!window.confirm(`Remove badge "${badge.name}" and revoke it from all users?`)) return
+    setAdminBadgeSaving(true)
+    setAdminBadgeError("")
+    setAdminBadgeNotice("")
+    try {
+      const response = await fetch(`/api/admin/badges/${badge.asset_id}`, { method: "DELETE" })
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.message || "Could not remove badge")
+      setSelectedAdminBadgeId(null)
+      setAdminBadgeNotice("Badge removed.")
+      await loadAdminBadges()
+    } catch (error) {
+      setAdminBadgeError(error instanceof Error ? error.message : "Could not remove badge")
+    } finally {
+      setAdminBadgeSaving(false)
+    }
+  }
+
+  const grantBadgeOnline = async (badge: BadgeAsset) => {
+    setAdminBadgeGranting(true)
+    setAdminBadgeError("")
+    setAdminBadgeNotice("")
+    try {
+      const response = await fetch(`/api/admin/badges/${badge.asset_id}/grant-online`, { method: "POST" })
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.message || "Could not grant badge")
+      setAdminBadgeNotice(`Granted badge to ${result.granted_count} online user${result.granted_count === 1 ? "" : "s"}.`)
+    } catch (error) {
+      setAdminBadgeError(error instanceof Error ? error.message : "Could not grant badge")
+    } finally {
+      setAdminBadgeGranting(false)
+    }
+  }
 
   const uploadAdminAsset = async (
     assetType: "sound" | "emoji",
@@ -573,6 +963,13 @@ export default function AnnoyTheStreamer() {
     event.preventDefault()
     const file = assetType === "sound" ? adminSoundFile : adminEmojiFile
     const sourceUrl = assetType === "sound" ? adminSoundUrl.trim() : adminEmojiUrl.trim()
+    if (file && sourceUrl) {
+      setAdminAssetUploadErrors((current) => ({
+        ...current,
+        [assetType]: "Choose a file or enter a URL to upload, not both.",
+      }))
+      return
+    }
     if (!file && !sourceUrl) {
       setAdminAssetUploadErrors((current) => ({ ...current, [assetType]: "Choose a file or enter a URL to upload." }))
       return
@@ -639,7 +1036,7 @@ export default function AnnoyTheStreamer() {
     if (
       (draft.price !== "" && price === null) ||
       (assetType === "sound" && (!Number.isFinite(loudness) || loudness < 0 || loudness > 2)) ||
-      (assetType === "sound" && !Number.isSafeInteger(playPrice))
+      (assetType === "sound" && draft.play_price !== "" && !Number.isSafeInteger(playPrice))
     ) {
       setAdminAssetManageErrors((current) => ({
         ...current,
@@ -723,52 +1120,42 @@ export default function AnnoyTheStreamer() {
             className="space-y-2 px-3 pb-3"
             onSubmit={(event) => void uploadAdminAsset(assetType, event)}
           >
-          <label className="block space-y-1 text-xs">
-            <span>Name</span>
-            <Input
-              value={isSound ? adminSoundName : adminEmojiName}
-              onChange={(event) => isSound
-                ? setAdminSoundName(event.target.value)
-                : setAdminEmojiName(event.target.value)}
-              placeholder={isSound ? "Sound Name" : "emojiname"}
-              aria-label={isSound ? "Sound display name" : "Emoji name"}
-              required
-            />
-          </label>
+          <Input
+            value={isSound ? adminSoundName : adminEmojiName}
+            onChange={(event) => isSound
+              ? setAdminSoundName(event.target.value)
+              : setAdminEmojiName(event.target.value)}
+            placeholder={isSound ? "Sound Name" : "emojiname"}
+            aria-label={isSound ? "Sound name" : "Emoji name"}
+            required
+          />
           {isSound && (
-            <label className="block space-y-1 text-xs">
-              <span>Loudness (0–2x multiplier)</span>
-              <Input
-                type="text"
-                inputMode="decimal"
-                value={adminSoundLoudness}
-                onChange={(event) => setAdminSoundLoudness(event.target.value)}
-                onBlur={() => {
-                  if (!adminSoundLoudness.trim()) return
-                  const value = Number(adminSoundLoudness)
-                  if (Number.isFinite(value)) setAdminSoundLoudness(value.toFixed(2))
-                }}
-                placeholder="1.00"
-                aria-label="New sound loudness"
-              />
-            </label>
-          )}
-          <label className="block space-y-1 text-xs">
-            <span>Price</span>
             <Input
-              type="number"
-              min={-1}
-              step={1}
-              value={isSound ? adminSoundPrice : adminEmojiPrice}
-              onChange={(event) => isSound
-                ? setAdminSoundPrice(event.target.value)
-                : setAdminEmojiPrice(event.target.value)}
-              placeholder={String(defaultPrice ?? "")}
-              aria-label={`${isSound ? "Sound" : "Emoji"} price exception`}
+              type="text"
+              inputMode="decimal"
+              value={adminSoundLoudness}
+              onChange={(event) => setAdminSoundLoudness(event.target.value)}
+              onBlur={() => {
+                if (!adminSoundLoudness.trim()) return
+                const value = Number(adminSoundLoudness)
+                if (Number.isFinite(value)) setAdminSoundLoudness(value.toFixed(2))
+              }}
+              placeholder="1.00"
+              aria-label="New sound loudness"
             />
-          </label>
-          <div className="space-y-1 text-xs">
-            <span>Upload {isSound ? "sound" : "emoji"} file or URL</span>
+          )}
+          <Input
+            type="number"
+            min={-1}
+            step={1}
+            value={isSound ? adminSoundPrice : adminEmojiPrice}
+            onChange={(event) => isSound
+              ? setAdminSoundPrice(event.target.value)
+              : setAdminEmojiPrice(event.target.value)}
+            placeholder={String(defaultPrice ?? "")}
+            aria-label={`${isSound ? "Sound" : "Emoji"} price exception`}
+          />
+          <div className="space-y-1">
             <div className="flex gap-2">
               <Input
                 type="url"
@@ -783,7 +1170,7 @@ export default function AnnoyTheStreamer() {
                   }
                 }}
                 placeholder="URL..."
-                className="flex-1"
+                className="h-7 flex-1 sm:h-8"
                 aria-label={`${isSound ? "Sound" : "Emoji"} file URL`}
               />
               <div className="relative">
@@ -792,6 +1179,7 @@ export default function AnnoyTheStreamer() {
                   accept={isSound ? ".mp3,audio/mpeg" : ".jpg,.jpeg,.png,.gif,image/jpeg,image/png,image/gif"}
                   onChange={(event) => {
                     const file = event.target.files?.[0] ?? null
+                    event.currentTarget.value = ""
                     if (isSound) {
                       setAdminSoundFile(file)
                       if (file) setAdminSoundUrl("")
@@ -808,7 +1196,7 @@ export default function AnnoyTheStreamer() {
                   type="button"
                   variant="outline"
                   size="icon"
-                  className="h-8 w-8 bg-transparent"
+                  className="h-7 w-7 bg-transparent sm:h-8 sm:w-8"
                   asChild
                 >
                   <label htmlFor={`admin-${assetType}-file`} className="cursor-pointer flex items-center justify-center">
@@ -818,13 +1206,24 @@ export default function AnnoyTheStreamer() {
               </div>
             </div>
             {(isSound ? adminSoundFile : adminEmojiFile) && (
-              <p className="truncate text-muted-foreground">
-                {(isSound ? adminSoundFile : adminEmojiFile)?.name}
-              </p>
+              <div className="flex min-w-0 items-center gap-2 text-xs">
+                <p className="min-w-0 flex-1 truncate text-muted-foreground">
+                  {(isSound ? adminSoundFile : adminEmojiFile)?.name}
+                </p>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="h-7 shrink-0 px-2 sm:h-8"
+                  onClick={() => isSound ? setAdminSoundFile(null) : setAdminEmojiFile(null)}
+                >
+                  Clear file
+                </Button>
+              </div>
             )}
           </div>
           <div className="pt-2">
-            <Button type="submit" disabled={adminAssetSaving}>
+            <Button type="submit" disabled={adminAssetSaving} className="w-full">
               {adminAssetSaving ? "Uploading..." : `Upload ${isSound ? "sound" : "emoji"}`}
             </Button>
           </div>
@@ -865,7 +1264,7 @@ export default function AnnoyTheStreamer() {
                   setAdminAssetLookup((current) => ({ ...current, [assetType]: value }))
                   setSelectedAdminAsset((current) => ({ ...current, [assetType]: null }))
                 }}
-                placeholder={isSound ? "Sound name" : "Emoji name"}
+                placeholder={isSound ? "Sound Name" : "emojiname"}
                 aria-label={`Find ${isSound ? "sound" : "emoji"} by name`}
               />
             </div>
@@ -880,77 +1279,68 @@ export default function AnnoyTheStreamer() {
                   {!isSound && <img src={asset.url} alt="" className="h-8 w-8 rounded object-contain" />}
                   <span className="min-w-0 flex-1 truncate text-xs">{asset.file}</span>
                 </div>
-                <label className="block space-y-1 text-xs">
-                  <span>Name</span>
-                  <Input
-                    value={isSound ? draft.display_name : draft.name}
-                    onChange={(event) => setAdminAssetDrafts((current) => ({
-                      ...current,
-                      [asset.asset_id]: {
-                        ...draft,
-                        [isSound ? "display_name" : "name"]: event.target.value,
-                      },
-                    }))}
-                    aria-label={`${isSound ? "Sound display name" : "Emoji name"} for ${asset.name}`}
-                  />
-                </label>
+                <Input
+                  value={isSound ? draft.display_name : draft.name}
+                  onChange={(event) => setAdminAssetDrafts((current) => ({
+                    ...current,
+                    [asset.asset_id]: {
+                      ...draft,
+                      [isSound ? "display_name" : "name"]: event.target.value,
+                    },
+                  }))}
+                  placeholder={isSound ? "Sound Name" : "emojiname"}
+                  aria-label={`${isSound ? "Sound name" : "Emoji name"} for ${asset.name}`}
+                />
                 {isSound && (
-                  <label className="block space-y-1 text-xs">
-                    <span>Loudness</span>
-                    <Input
-                      type="number"
-                      min={0}
-                      max={2}
-                      step="0.01"
-                      value={draft.loudness}
-                      onChange={(event) => setAdminAssetDrafts((current) => ({
-                        ...current,
-                        [asset.asset_id]: { ...draft, loudness: event.target.value },
-                      }))}
-                      aria-label={`Loudness for ${asset.name}`}
-                    />
-                  </label>
-                )}
-                <label className="block space-y-1 text-xs">
-                  <span>Price</span>
                   <Input
                     type="number"
-                    min={-1}
-                    step={1}
-                    value={draft.price}
+                    min={0}
+                    max={2}
+                    step="0.01"
+                    value={draft.loudness}
                     onChange={(event) => setAdminAssetDrafts((current) => ({
                       ...current,
-                      [asset.asset_id]: { ...draft, price: event.target.value },
+                      [asset.asset_id]: { ...draft, loudness: event.target.value },
                     }))}
-                    placeholder={selectedPricePlaceholder}
-                    aria-label={`Price exception for ${asset.name}`}
+                    placeholder="1.00"
+                    aria-label={`Loudness for ${asset.name}`}
                   />
-                </label>
-                {isSound && (
-                  <label className="block space-y-1 text-xs">
-                    <span>Play price</span>
-                    <Input
-                      type="number"
-                      min={0}
-                      step={1}
-                      value={draft.play_price}
-                      onChange={(event) => setAdminAssetDrafts((current) => ({
-                        ...current,
-                        [asset.asset_id]: { ...draft, play_price: event.target.value },
-                      }))}
-                      placeholder={String(
-                        asset.play_default_price ??
-                        pointPricing?.catalog.sound.play_default ??
-                        10,
-                      )}
-                      aria-label={`Play price exception for ${asset.name}`}
-                    />
-                  </label>
                 )}
-                <div className="flex gap-2 pt-2">
+                <Input
+                  type="number"
+                  min={-1}
+                  step={1}
+                  value={draft.price}
+                  onChange={(event) => setAdminAssetDrafts((current) => ({
+                    ...current,
+                    [asset.asset_id]: { ...draft, price: event.target.value },
+                  }))}
+                  placeholder={selectedPricePlaceholder}
+                  aria-label={`Price exception for ${asset.name}`}
+                />
+                {isSound && (
+                  <Input
+                    type="number"
+                    min={0}
+                    step={1}
+                    value={draft.play_price}
+                    onChange={(event) => setAdminAssetDrafts((current) => ({
+                      ...current,
+                      [asset.asset_id]: { ...draft, play_price: event.target.value },
+                    }))}
+                    placeholder={String(
+                      asset.play_default_price ??
+                      pointPricing?.catalog.sound.play_default ??
+                      10,
+                    )}
+                    aria-label={`Play price exception for ${asset.name}`}
+                  />
+                )}
+                <div className="grid grid-cols-2 gap-2 pt-2">
                   <Button
                     type="button"
                     variant="outline"
+                    className="w-full"
                     disabled={adminAssetSaving}
                     onClick={() => void saveAdminAsset(assetType, asset)}
                   >
@@ -959,6 +1349,7 @@ export default function AnnoyTheStreamer() {
                   <Button
                     type="button"
                     variant="destructive"
+                    className="w-full"
                     disabled={adminAssetSaving}
                     onClick={() => void removeAdminAsset(assetType, asset)}
                   >
@@ -1093,6 +1484,8 @@ export default function AnnoyTheStreamer() {
     if (Object.entries(editedCatalogPrices).some(([key, value]) =>
       key.startsWith("sound-play:")
         ? !/^\d+$/.test(value) || !Number.isSafeInteger(Number(value))
+        : key.startsWith("theme:") && value.trim() === ""
+          ? false
         : parsePointPrice(value) === null,
     )) {
       setPricingError("Enter a valid price of -1 or a non-negative whole number.")
@@ -1124,11 +1517,40 @@ export default function AnnoyTheStreamer() {
   const fetchShopCatalog = useCallback(async (): Promise<ShopCatalog> => {
     const response = await fetch("/api/shop/catalog")
     const result = await response.json()
-    if (!response.ok || !result.emoji || !result.sound || !result.proposal_prices) {
+    if (!response.ok || !result.emoji || !result.sound || !result.theme || !result.proposal_prices) {
       throw new Error(result.message || "Could not load the Point Shop")
     }
     setShopProposalPrices(result.proposal_prices)
     return result as ShopCatalog
+  }, [])
+
+  const loadAccountTheme = useCallback(async (): Promise<{
+    themes: ThemeOption[]
+    selected_theme_id: string
+  }> => {
+    const response = await fetch("/api/account/theme", { cache: "no-store" })
+    const result = await response.json()
+    if (!response.ok || !Array.isArray(result.themes) || typeof result.selected_theme_id !== "string") {
+      throw new Error(result.message || "Could not load the selected theme")
+    }
+    return { themes: result.themes as ThemeOption[], selected_theme_id: result.selected_theme_id }
+  }, [])
+
+  const refreshAccountThemes = useCallback(async () => {
+    const accountTheme = await loadAccountTheme()
+    const { themes, selected_theme_id } = accountTheme
+    setThemeOptions(themes)
+    setSavedThemeId(selected_theme_id)
+    return accountTheme
+  }, [loadAccountTheme])
+
+  const loadAdminThemes = useCallback(async () => {
+    const response = await fetch("/api/admin/themes")
+    const result = await response.json()
+    if (!response.ok || !Array.isArray(result.themes)) {
+      throw new Error(result.message || "Could not load themes")
+    }
+    setAdminThemes(result.themes)
   }, [])
 
   const refreshPublicEmojiUrls = useCallback(async () => {
@@ -1175,11 +1597,63 @@ export default function AnnoyTheStreamer() {
 
   // THEME HANDLER
   useEffect(() => {
-    if (theme === "dark") document.documentElement.classList.add("dark")
-    else document.documentElement.classList.remove("dark")
-  }, [theme])
+    const root = document.documentElement
+    root.classList.add("dark")
+    const backgroundText = contrastingTextColor(activeTheme.primary_color)
+    const panelText = contrastingTextColor(activeTheme.panel_color)
+    const mutedText = `color-mix(in srgb, ${panelText}, ${panelText === "#ffffff" ? "#000000" : "#ffffff"} 40%)`
+    const accentText = contrastingTextColor(activeTheme.accent_color)
+    const borderColor = `color-mix(in srgb, ${activeTheme.panel_color}, ${panelText} 35%)`
+    const systemMessageBackground = `color-mix(in srgb, ${activeTheme.panel_color}, ${panelText === "#ffffff" ? "#000000" : "#ffffff"} 10%)`
+    const systemMessageForeground = mutedText
+
+    root.style.setProperty("--background", activeTheme.primary_color)
+    root.style.setProperty("--foreground", backgroundText)
+    root.style.setProperty("--card", activeTheme.panel_color)
+    root.style.setProperty("--card-foreground", panelText)
+    root.style.setProperty("--popover", activeTheme.panel_color)
+    root.style.setProperty("--popover-foreground", panelText)
+    root.style.setProperty("--primary", activeTheme.accent_color)
+    root.style.setProperty("--primary-foreground", accentText)
+    root.style.setProperty("--ring", activeTheme.accent_color)
+    root.style.setProperty("--secondary", activeTheme.panel_color)
+    root.style.setProperty("--secondary-foreground", panelText)
+    root.style.setProperty("--muted", activeTheme.panel_color)
+    root.style.setProperty("--muted-foreground", mutedText)
+    root.style.setProperty("--accent", activeTheme.accent_color)
+    root.style.setProperty("--accent-foreground", accentText)
+    root.style.setProperty("--destructive-foreground", "#ffffff")
+    root.style.setProperty("--border", borderColor)
+    root.style.setProperty("--input", borderColor)
+    root.style.setProperty("--sidebar", activeTheme.panel_color)
+    root.style.setProperty("--sidebar-foreground", panelText)
+    root.style.setProperty("--sidebar-primary", activeTheme.accent_color)
+    root.style.setProperty("--sidebar-primary-foreground", accentText)
+    root.style.setProperty("--sidebar-accent", activeTheme.panel_color)
+    root.style.setProperty("--sidebar-accent-foreground", panelText)
+    root.style.setProperty("--sidebar-border", borderColor)
+    root.style.setProperty("--sidebar-ring", activeTheme.accent_color)
+    root.style.setProperty("--chat-system-message-background", systemMessageBackground)
+    root.style.setProperty("--chat-system-message-foreground", systemMessageForeground)
+  }, [activeTheme])
+
+  useEffect(() => {
+    if (!shopThemePreview) return
+    const timeout = window.setTimeout(() => setShopThemePreview(null), 3000)
+    return () => window.clearTimeout(timeout)
+  }, [shopThemePreview])
+
+  useEffect(() => {
+    return () => {
+      if (adminThemePreview?.url.startsWith("blob:")) URL.revokeObjectURL(adminThemePreview.url)
+    }
+  }, [adminThemePreview])
 
   // USERNAME COOKIE HANDLER
+  useEffect(() => {
+    setIsChatOnly(window.location.pathname === "/chat")
+  }, [])
+
   useEffect(() => {
     const savedUsername = getCookie("ats_username")
     if (savedUsername) setUsernameInput(savedUsername)
@@ -1274,6 +1748,14 @@ export default function AnnoyTheStreamer() {
     if (isChatRestricted) setShowEmojiPanel(false)
   }, [isChatRestricted])
 
+  useEffect(() => {
+    userInfoPanelRef.current = { open: showUserInfoPanel }
+  }, [showUserInfoPanel])
+
+  useEffect(() => {
+    managedUserRef.current = managedUser
+  }, [managedUser])
+
 // SOCKET CONNECTION
 useEffect(() => {
   if (!username) return;
@@ -1289,6 +1771,22 @@ useEffect(() => {
 
   const socket = socketRef.current;
 
+  const refreshVisibleUserInfo = async (changedUsername?: string) => {
+    if (!userInfoPanelRef.current.open || !username ||
+      (changedUsername && changedUsername.toLowerCase() !== username.toLowerCase())) return
+    try {
+      const response = await fetch("/api/account/profile")
+      const result = await response.json()
+      if (!response.ok || !result.user) throw new Error(result.message || "Could not refresh profile")
+      setUserInfo(result.user)
+      setUserInfoError("")
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Could not refresh profile"
+      setUserInfoError(message)
+      console.error("Could not refresh account information:", error)
+    }
+  }
+
 
 	socket.on('connect', () => {
 	  socket.emit('getusers');
@@ -1296,6 +1794,7 @@ useEffect(() => {
 
   socket.on('points_changed', () => {
     void refreshCurrentPoints()
+    void refreshVisibleUserInfo(username)
   });
 
   socket.on('usage_costs_changed', () => {
@@ -1327,6 +1826,9 @@ useEffect(() => {
 
   socket.on('chat_message', (msg: ChatMessage) => {
     setChatMessages(prev => [...prev, msg]);
+    if (msg.system || (msg.user && msg.user.toLowerCase() === username.toLowerCase())) {
+      void refreshVisibleUserInfo()
+    }
   });
 
   socket.on('chat_message_rejected', (result: { message: string; text?: string }) => {
@@ -1338,7 +1840,7 @@ useEffect(() => {
     setChatMessages(msgs);
   });
 
-  socket.on('asset_catalog_changed', (event: { asset_type: "sound" | "emoji" }) => {
+  socket.on('asset_catalog_changed', (event: { asset_type: "sound" | "emoji" | "theme" }) => {
     void refreshOwnedAssetLists().catch((error) => {
       console.error("Could not refresh usable assets:", error)
     })
@@ -1346,6 +1848,42 @@ useEffect(() => {
       void refreshPublicEmojiUrls().catch((error) => {
         console.error("Could not refresh public emoji images:", error)
       })
+    }
+    if (event?.asset_type === "theme") {
+      void refreshAccountThemes()
+        .catch((error) => {
+          console.error("Could not refresh themes:", error)
+        })
+    }
+  })
+
+  socket.on('badge_catalog_changed', () => {
+    if (isAdmin) void loadAdminBadges()
+  })
+
+  socket.on('badge_data_changed', (event: { usernames?: string[] }) => {
+    const usernames = event?.usernames ?? []
+    if (usernames.some((changed) => changed.toLowerCase() === username.toLowerCase())) {
+      void fetch("/api/account/profile")
+        .then(async (response) => {
+          const result = await response.json()
+          if (!response.ok || !result.user) throw new Error(result.message || "Could not refresh profile")
+          setUserInfo((current) => current?.username === username ? result.user : current)
+          setUserBadgeSelection(result.user.visible_badge_id ?? "")
+        })
+        .catch((error) => console.error("Could not refresh badge ownership:", error))
+    }
+    const managedUsername = managedUserRef.current?.username
+    if (managedUsername && usernames.some((changed) => changed.toLowerCase() === managedUsername.toLowerCase())) {
+      void fetch(`/api/admin/users/${encodeURIComponent(managedUsername)}`)
+        .then(async (response) => {
+          const result = await response.json()
+          if (!response.ok || !result.user) throw new Error(result.message || "Could not refresh managed user badges")
+          setManagedUser((current) =>
+            current?.username.toLowerCase() === managedUsername.toLowerCase() ? result.user : current,
+          )
+        })
+        .catch((error) => console.error("Could not refresh managed user badges:", error))
     }
   })
 
@@ -1356,8 +1894,13 @@ useEffect(() => {
     permissions?: RolePermissions | null
     usage_costs?: Record<string, number>
   }) => {
+    void refreshVisibleUserInfo(change.username)
     setChatMessages((messages) =>
-      messages.map((message) => message.user === change.username ? { ...message, rank: change.rank, rank_color: change.rank_color } : message)
+      messages.map((message) =>
+        !message.system && message.user === change.username
+          ? { ...message, rank: change.rank, rank_color: change.rank_color }
+          : message
+      )
     );
     setOnlineUserRanks((ranks) => ({
       ...ranks,
@@ -1388,7 +1931,7 @@ useEffect(() => {
   return () => {
     socket.disconnect();
   };
-}, [username, isAdmin, fetchShopCatalog, refreshCurrentPoints, refreshPublicEmojiUrls, refreshOwnedAssetLists]);
+}, [username, isAdmin, fetchShopCatalog, refreshAccountThemes, refreshCurrentPoints, refreshPublicEmojiUrls, refreshOwnedAssetLists, loadAdminBadges]);
 
 // CHAT
 useEffect(() => {
@@ -1492,7 +2035,7 @@ useEffect(() => {
 }, [username, currentPermissions])
 
 useEffect(() => {
-  setShopAssets({ emoji: [], sound: [] })
+  setShopAssets({ emoji: [], sound: [], theme: [] })
   setShopError("")
   if (!username || isAdmin) {
     setShopLoading(false)
@@ -1519,6 +2062,51 @@ useEffect(() => {
   }
 }, [fetchShopCatalog, username, isAdmin])
 
+useEffect(() => {
+  if (!username) {
+    setThemeOptions([STANDARD_THEME])
+    setActiveThemeId(STANDARD_THEME_ID)
+    setSavedThemeId(STANDARD_THEME_ID)
+    setThemePickerOpen(false)
+    return
+  }
+
+  let cancelled = false
+  void loadAccountTheme()
+    .then(({ themes, selected_theme_id }) => {
+      if (cancelled) return
+      setThemeOptions(themes)
+      setSavedThemeId(selected_theme_id)
+      setActiveThemeId(selected_theme_id)
+      setThemeError("")
+    })
+    .catch((error) => {
+      if (!cancelled) {
+        setThemeError(error instanceof Error ? error.message : "Could not load the selected theme")
+        console.error("Could not load the selected theme:", error)
+      }
+    })
+  return () => {
+    cancelled = true
+  }
+}, [loadAccountTheme, username])
+
+useEffect(() => {
+  if (!isAdmin || (adminView !== "pricing" && adminView !== "themes")) return
+  void loadAdminThemes().catch((error) => {
+    setAdminThemeManageError(error instanceof Error ? error.message : "Could not load themes")
+    console.error("Could not load themes:", error)
+  })
+}, [adminView, isAdmin, loadAdminThemes])
+
+useEffect(() => {
+  if (themePickerOpen) {
+    setThemePickerOpen(false)
+    setActiveThemeId(savedThemeId)
+  }
+  setAdminThemePreview(null)
+}, [activeTab, adminView, shopCategory])
+
 
 
   // STATE: Meme + TTS inputs
@@ -1532,8 +2120,14 @@ useEffect(() => {
   const [ttsLanguage, setTtsLanguage] = useState("en")
 
   const filteredSounds = sounds.filter((s) => s.title.toLowerCase().includes(soundSearch.toLowerCase()))
-  const filteredShopAssets = (category: "emoji" | "sound") => {
-    const query = (category === "emoji" ? emojiShopSearch : soundShopSearch).trim().toLowerCase()
+  const filteredShopAssets = (category: "emoji" | "sound" | "theme") => {
+    const query = (
+      category === "emoji"
+        ? emojiShopSearch
+        : category === "sound"
+          ? soundShopSearch
+          : themeShopSearch
+    ).trim().toLowerCase()
     const statusOrder = { available: 0, owned: 1, unavailable: 2 }
     return shopAssets[category]
       .filter((asset) => `${asset.title ?? ""} ${asset.name}`.toLowerCase().includes(query))
@@ -1544,10 +2138,16 @@ useEffect(() => {
       )
   }
   const editableStaffRoleIds = currentPermissions?.capabilities.edit_staff_role_ids
+  const assignableRankOptions = rankOptions.filter((option) =>
+    option.staff === false && permission("assign_non_staff_rank")
+    || option.staff === true
+      && Array.isArray(editableStaffRoleIds)
+      && editableStaffRoleIds.includes(option.id),
+  )
   const canChangeManagedUserRank = Boolean(
     managedUser
     && permission("manage_ranks")
-    && permission("assign_non_staff_rank")
+    && assignableRankOptions.length > 0
     && !managedUser.rank_immutable
     && (managedUser.staff
       ? Array.isArray(editableStaffRoleIds) && editableStaffRoleIds.includes(managedUser.rank_id)
@@ -1663,6 +2263,7 @@ useEffect(() => {
       setPasswordResetAccount(null)
       setResetPasswordInput("")
       setResetPasswordConfirmation("")
+      setResetEmailInput("")
       setShowRegistrationForm(false)
       setPasswordResetMode(false)
     } catch (error) {
@@ -1675,7 +2276,7 @@ useEffect(() => {
     setAuthError("")
     if (!passwordResetAccount) {
       if (!passwordResetToken.trim()) {
-        setAuthError("Enter the one-time reset code provided by an Admin.")
+        setAuthError("Enter the one-time account recovery code.")
         return
       }
       try {
@@ -1689,22 +2290,33 @@ useEffect(() => {
         })
         const result = await response.json()
         if (!response.ok) throw new Error(result.message || "Could not verify reset code")
+        if (result.recovery_type !== "password" && result.recovery_type !== "email") {
+          throw new Error("The recovery code has an invalid purpose.")
+        }
         setPasswordResetUsername(result.username)
         setPasswordResetAccount({
           username: result.username,
-          email: typeof result.email === "string" ? result.email : null,
+          recoveryType: result.recovery_type,
         })
+        setResetPasswordInput("")
+        setResetPasswordConfirmation("")
+        setResetEmailInput("")
       } catch (error) {
         setAuthError(error instanceof Error ? error.message : "Could not verify reset code")
       }
       return
     }
-    if (resetPasswordInput.length < 8 || resetPasswordInput.length > 256) {
-      setAuthError("Password must be between 8 and 256 characters.")
-      return
-    }
-    if (resetPasswordInput !== resetPasswordConfirmation) {
-      setAuthError("Passwords do not match.")
+    if (passwordResetAccount.recoveryType === "password") {
+      if (resetPasswordInput.length < 8 || resetPasswordInput.length > 256) {
+        setAuthError("Password must be between 8 and 256 characters.")
+        return
+      }
+      if (resetPasswordInput !== resetPasswordConfirmation) {
+        setAuthError("Passwords do not match.")
+        return
+      }
+    } else if (!resetEmailInput.trim()) {
+      setAuthError("Enter a valid email address.")
       return
     }
     try {
@@ -1712,17 +2324,21 @@ useEffect(() => {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          username: passwordResetAccount.username,
           reset_token: passwordResetToken,
-          password: resetPasswordInput,
-          confirmation: resetPasswordConfirmation,
+          ...(passwordResetAccount.recoveryType === "password"
+            ? {
+                password: resetPasswordInput,
+                confirmation: resetPasswordConfirmation,
+              }
+            : { email: resetEmailInput }),
         }),
       })
       const result = await response.json()
-      if (!response.ok) throw new Error(result.message || "Password reset failed")
+      if (!response.ok) throw new Error(result.message || "Account recovery failed")
+      if (document.activeElement instanceof HTMLElement) document.activeElement.blur()
       window.location.replace("/")
     } catch (error) {
-      setAuthError(error instanceof Error ? error.message : "Password reset failed")
+      setAuthError(error instanceof Error ? error.message : "Account recovery failed")
     }
   }
 
@@ -1750,6 +2366,13 @@ useEffect(() => {
       socketRef.current = null
       document.cookie = "ats_username=; Max-Age=0; path=/"
       setUsername("")
+      setUserInfo(null)
+      setShowUserInfoPanel(false)
+      setUserInfoError("")
+      setUserRecoveryToken("")
+      setUserRecoveryError("")
+      setUserRecoveryNotice("")
+      setUserRecoveryCopyNotice("")
       setUsernameInput("")
       setEmailInput("")
       setRegistrationUsername("")
@@ -1763,7 +2386,7 @@ useEffect(() => {
       setPointsError(false)
       setUsageCosts({})
       setActionError("")
-      setAdminIssuedPasswordResetToken("")
+      setAdminIssuedRecoveryToken("")
       setShowRegistrationForm(false)
       setPasswordResetMode(false)
       setPasswordResetUsername("")
@@ -1782,18 +2405,45 @@ useEffect(() => {
     }
   }
 
+  const openChatWindow = () => {
+    const chatUrl = `${window.location.origin}/chat`
+    if (window.matchMedia("(max-width: 767px)").matches) {
+      window.location.assign(chatUrl)
+      return
+    }
+
+    const width = Math.min(460, window.screen.availWidth)
+    const height = Math.min(820, window.screen.availHeight)
+    const left = window.screenX + Math.max(0, (window.outerWidth - width) / 2)
+    const top = window.screenY + Math.max(0, (window.outerHeight - height) / 2)
+    const popup = window.open(
+      chatUrl,
+      "ats-chat",
+      `popup=yes,resizable=yes,width=${width},height=${height},left=${left},top=${top}`,
+    )
+    setChatPopoutBlocked(!popup)
+    popup?.focus()
+  }
+
   const loadManagedUserByUsername = async (targetUsername: string) => {
+    const target = targetUsername.trim()
     setAdminError("")
     setAdminNotice("")
-    setAdminIssuedPasswordResetToken("")
+    setAdminIssuedRecoveryToken("")
+    setAdminRecoveryCopyNotice("")
     try {
-      const response = await fetch(`/api/admin/users/${encodeURIComponent(targetUsername.trim())}`)
+      const response = await fetch(`/api/admin/users/${encodeURIComponent(target)}`)
       const result = await response.json()
       if (!response.ok) throw new Error(result.message || "Could not load user")
-      setManagedUser(result.user)
+      setManagedUser((current) =>
+        current?.username === result.user.username
+          ? { ...current, ...result.user }
+          : result.user,
+      )
       if (result.user.username === username) acceptPointBalance(result.user.points)
       setRankSelection(result.user.rank_immutable ? "" : result.user.rank)
       setConfirmingPasswordReset(false)
+      setConfirmingEmailReset(false)
     } catch (error) {
       setManagedUser(null)
       setAdminError(error instanceof Error ? error.message : "Could not load user")
@@ -1810,13 +2460,154 @@ useEffect(() => {
     setLookupUsername(targetUsername)
     setAdminView("users")
     void loadManagedUserByUsername(targetUsername)
+    if (permission("admin_console")) void loadAdminBadges()
+  }
+
+  const loadUserInfo = async (targetUsername: string) => {
+    if (!username || targetUsername.toLowerCase() !== username.toLowerCase()) return
+    setUserInfoLoading(true)
+    setUserInfoError("")
+    setUserRecoveryToken("")
+    setUserRecoveryError("")
+    setUserRecoveryNotice("")
+    setUserRecoveryCopyNotice("")
+    try {
+      const response = await fetch("/api/account/profile")
+      const result = await response.json()
+      if (!response.ok || !result.user) throw new Error(result.message || "Could not load profile")
+      setUserInfo(result.user)
+      setUserBadgeSelection(result.user.visible_badge_id ?? "")
+    } catch (error) {
+      setUserInfo(null)
+      setUserInfoError(error instanceof Error ? error.message : "Could not load profile")
+    } finally {
+      setUserInfoLoading(false)
+    }
+  }
+
+  const toggleUserInfoPanel = () => {
+    const opening = !showUserInfoPanel
+    setShowUserInfoPanel(opening)
+    if (opening && (!userInfo || userInfo.username !== username)) void loadUserInfo(username)
+  }
+
+  const saveUserBadgeSelection = async () => {
+    setUserBadgeSaving(true)
+    setUserInfoError("")
+    try {
+      const response = await fetch("/api/account/profile/badge", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ badge_id: userBadgeSelection || null }),
+      })
+      const result = await response.json()
+      if (!response.ok || !result.user) throw new Error(result.message || "Could not update badge")
+      setUserInfo(result.user)
+      setUserBadgeSelection(result.user.visible_badge_id ?? "")
+      if (managedUser?.username === result.user.username) setManagedUser(result.user)
+    } catch (error) {
+      setUserInfoError(error instanceof Error ? error.message : "Could not update badge")
+    } finally {
+      setUserBadgeSaving(false)
+    }
+  }
+
+  const issueUserRecoveryCode = async (recoveryType: "password" | "email") => {
+    setUserRecoveryError("")
+    setUserRecoveryNotice("")
+    setUserRecoveryCopyNotice("")
+    setUserRecoveryToken("")
+    try {
+      const response = await fetch("/api/account/recovery", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ recovery_type: recoveryType }),
+      })
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.message || "Could not create recovery code")
+      setUserRecoveryToken(result.reset_token)
+      setUserRecoveryNotice(`${recoveryType === "password" ? "Password" : "Email"} recovery code created. It expires in 30 minutes; log out before using it.`)
+    } catch (error) {
+      setUserRecoveryError(error instanceof Error ? error.message : "Could not create recovery code")
+    }
+  }
+
+  const copyRecoveryCode = async (
+    token: string,
+    setNotice: React.Dispatch<React.SetStateAction<string>>,
+    setError: React.Dispatch<React.SetStateAction<string>>,
+  ) => {
+    setNotice("")
+    setError("")
+    try {
+      await navigator.clipboard.writeText(token)
+      setNotice("Recovery code copied.")
+    } catch (error) {
+      setError("Could not copy the recovery code. Select and copy it manually.")
+      console.error("Could not copy recovery code:", error)
+    }
+  }
+
+  const changeBadgeForInspectedUser = async (action: "grant" | "remove") => {
+    const matches = adminBadges.filter(
+      (badge) => badge.name.trim().toLocaleLowerCase() === adminBadgeGrantName.trim().toLocaleLowerCase(),
+    )
+    if (!managedUser || matches.length !== 1) {
+      setAdminError(matches.length > 1 ? "More than one badge matches that name." : "Enter an existing badge name.")
+      return
+    }
+    const badgeId = matches[0].asset_id
+    setAdminError("")
+    setAdminNotice("")
+    setAdminBadgeGranting(true)
+    try {
+      const response = await fetch(`/api/admin/users/${encodeURIComponent(managedUser.username)}/badges`, {
+        method: action === "grant" ? "POST" : "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ badge_id: badgeId }),
+      })
+      let result: { message?: string; granted?: boolean; removed?: boolean; user?: ManagedUser }
+      try {
+        result = await response.json()
+      } catch {
+        if (response.status === 405) {
+          throw new Error("The running Flask service does not support badge removal yet. Restart Flask and try again.")
+        }
+        throw new Error(`Could not ${action} badge (HTTP ${response.status})`)
+      }
+      if (!response.ok) throw new Error(result.message || `Could not ${action} badge`)
+      if (action === "remove" && result.removed !== true) {
+        setAdminNotice(`${managedUser.username} does not have that badge.`)
+        return
+      }
+      if (action === "grant" && result.granted !== true) {
+        setAdminNotice(`${managedUser.username} already has that badge.`)
+        return
+      }
+      const updatedUser = action === "remove" && result.user
+        ? result.user
+        : {
+            ...managedUser,
+            badges: [...managedUser.badges, matches[0]],
+          }
+      setManagedUser(updatedUser)
+      setAdminBadgeGrantName("")
+      setAdminNotice(`${action === "grant" ? "Granted" : "Removed"} badge ${action === "grant" ? "to" : "from"} ${managedUser.username}.`)
+    } catch (error) {
+      setAdminError(error instanceof Error ? error.message : `Could not ${action} badge`)
+    } finally {
+      setAdminBadgeGranting(false)
+    }
   }
 
   const updateManagedUser = async (operation: string, body: Record<string, string | number | boolean>) => {
     if (!managedUser) return
     setAdminError("")
     setAdminNotice("")
-    if (operation === "reset-password") setAdminIssuedPasswordResetToken("")
+    if (operation === "reset-password" || operation === "reset-email") {
+      setAdminIssuedRecoveryToken("")
+      setAdminRecoveryCopyNotice("")
+    }
     try {
       const response = await fetch(`/api/admin/users/${encodeURIComponent(managedUser.username)}/${operation}`, {
         method: "POST",
@@ -1838,6 +2629,11 @@ useEffect(() => {
         if (pending?.requestId === body.request_id) pendingPointAdjustment.current = null
       }
       setManagedUser(result.user)
+      setUserInfo((current) =>
+        current?.username === result.user.username
+          ? { ...current, ...result.user }
+          : current,
+      )
       if (result.user.username === username) acceptPointBalance(result.user.points)
       if (result.user.username === username) {
         setCurrentModerationStatus({
@@ -1851,11 +2647,16 @@ useEffect(() => {
         if (result.usage_costs) setUsageCosts(result.usage_costs)
       }
       setConfirmingPasswordReset(false)
-      if (operation === "reset-password") {
-        setAdminIssuedPasswordResetToken(
+      setConfirmingEmailReset(false)
+      if (operation === "reset-password" || operation === "reset-email") {
+        setAdminIssuedRecoveryToken(
           typeof result.reset_token === "string" ? result.reset_token : "",
         )
-        setAdminNotice("One-time reset code generated. Share it with the user; it expires in 30 minutes.")
+        setAdminNotice(
+          operation === "reset-email"
+            ? "Email recovery code generated. Share it with the user; it expires in 30 minutes."
+            : "Password recovery code generated. Share it with the user; it expires in 30 minutes.",
+        )
       } else {
         setAdminNotice("User updated.")
       }
@@ -1879,7 +2680,325 @@ useEffect(() => {
     }
   }
 
-  const toggleTheme = () => setTheme((p) => (p === "dark" ? "light" : "dark"))
+  const handleThemePickerOpenChange = (open: boolean) => {
+    setThemeError("")
+    if (!open) setActiveThemeId(savedThemeId)
+    else setActiveThemeId(savedThemeId)
+    setThemePickerOpen(open)
+  }
+
+  const saveSelectedTheme = async () => {
+    const themeToSave = activeThemeId
+    setThemeSaving(true)
+    setThemeError("")
+    try {
+      const response = await fetch("/api/account/theme", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ theme_id: themeToSave }),
+      })
+      const result = await response.json()
+      if (!response.ok || result.selected_theme_id !== themeToSave) {
+        throw new Error(result.message || "Could not save the selected theme")
+      }
+      setSavedThemeId(themeToSave)
+      setActiveThemeId(themeToSave)
+      setThemePickerOpen(false)
+    } catch (error) {
+      setThemeError(error instanceof Error ? error.message : "Could not save the selected theme")
+    } finally {
+      setThemeSaving(false)
+    }
+  }
+
+  const createAdminTheme = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (adminThemeBackgroundFile && adminThemeBackgroundUrl.trim()) {
+      setAdminThemeCreateError("Choose a background file or enter a URL, not both.")
+      return
+    }
+    const form = event.currentTarget
+    setAdminThemeSaving(true)
+    setAdminThemeCreateError("")
+    setAdminThemeCreateNotice("")
+    setAdminThemePreview(null)
+    const formData = new FormData()
+    formData.set("name", adminThemeName)
+    formData.set("primary_color", adminThemePrimary)
+    formData.set("panel_color", adminThemePanel)
+    formData.set("accent_color", adminThemeAccent)
+    formData.set("price", adminThemePrice)
+    if (adminThemeBackgroundFile) {
+      formData.set("background", adminThemeBackgroundFile)
+      formData.set("background_opacity", adminThemeBackgroundOpacity || "0.2")
+    } else if (adminThemeBackgroundUrl.trim()) {
+      formData.set("background_url", adminThemeBackgroundUrl.trim())
+      formData.set("background_opacity", adminThemeBackgroundOpacity || "0.2")
+    }
+
+    try {
+      const response = await fetch("/api/admin/themes", { method: "POST", body: formData })
+      const responseText = await response.text()
+      let result: { message?: string; theme?: ThemeOption; price_overridden?: boolean }
+      try {
+        result = JSON.parse(responseText)
+      } catch {
+        const responseMessage = responseText
+          .replace(/<[^>]*>/g, " ")
+          .replace(/\s+/g, " ")
+          .trim()
+          .slice(0, 240)
+        throw new Error(
+          responseMessage
+            ? `Theme creation failed (${response.status}): ${responseMessage}`
+            : `Theme creation failed (${response.status})`,
+        )
+      }
+      if (!response.ok || !result.theme) {
+        throw new Error(result.message || "Could not create theme")
+      }
+      const createdTheme: ThemeOption = {
+        ...result.theme,
+        price_overridden: result.price_overridden === true,
+      }
+      setAdminThemes((current) => [...current, createdTheme].sort((left, right) => left.name.localeCompare(right.name)))
+      setAdminThemeName("")
+      setAdminThemePrice("")
+      setAdminThemeBackgroundUrl("")
+      setAdminThemeBackgroundFile(null)
+      form.reset()
+      setAdminThemePrimary("#000000")
+      setAdminThemePanel("#171717")
+      setAdminThemeAccent("#f9a8d4")
+      setAdminThemeBackgroundOpacity("0.2")
+      setAdminThemeCreateNotice("Theme created.")
+      try {
+        await refreshAccountThemes()
+      } catch (error) {
+        console.error("Theme was created, but the picker could not be refreshed:", error)
+        setAdminThemeCreateNotice("Theme created, but the theme picker could not be refreshed.")
+      }
+      await loadPointPricing()
+    } catch (error) {
+      setAdminThemeCreateError(error instanceof Error ? error.message : "Could not create theme")
+    } finally {
+      setAdminThemeSaving(false)
+    }
+  }
+
+  const createThemePreviewUrl = async (file: File) => {
+    const bitmap = await createImageBitmap(file)
+    try {
+      const maxDimension = 1600
+      const scale = Math.min(1, maxDimension / Math.max(bitmap.width, bitmap.height))
+      if (scale === 1) return URL.createObjectURL(file)
+
+      const canvas = document.createElement("canvas")
+      canvas.width = Math.max(1, Math.round(bitmap.width * scale))
+      canvas.height = Math.max(1, Math.round(bitmap.height * scale))
+      const context = canvas.getContext("2d")
+      if (!context) throw new Error("Could not prepare the theme background preview")
+      context.drawImage(bitmap, 0, 0, canvas.width, canvas.height)
+
+      const previewBlob = await new Promise<Blob>((resolve, reject) => {
+        canvas.toBlob(
+          (blob) => blob
+            ? resolve(blob)
+            : reject(new Error("Could not prepare the theme background preview")),
+          "image/webp",
+          0.82,
+        )
+      })
+      return URL.createObjectURL(previewBlob)
+    } finally {
+      bitmap.close()
+    }
+  }
+
+  const previewAdminTheme = async () => {
+    const generation = ++themePreviewGeneration.current
+    setAdminThemeCreateError("")
+    try {
+      const backgroundUrl = adminThemeBackgroundFile
+        ? await createThemePreviewUrl(adminThemeBackgroundFile)
+        : adminThemeBackgroundUrl.trim()
+      if (generation !== themePreviewGeneration.current) {
+        if (backgroundUrl.startsWith("blob:")) URL.revokeObjectURL(backgroundUrl)
+        return
+      }
+      setAdminThemePreview({
+        asset_id: "admin-theme-preview",
+        name: adminThemeName.trim() || "Theme preview",
+        title: adminThemeName.trim() || "Theme preview",
+        price: 0,
+        owned: true,
+        status: "owned",
+        primary_color: adminThemePrimary,
+        panel_color: adminThemePanel,
+        accent_color: adminThemeAccent,
+        background_image_exists: Boolean(backgroundUrl),
+        background_opacity: backgroundUrl ? Number(adminThemeBackgroundOpacity || "0.2") : 0,
+        background_image_name: null,
+        is_standard: false,
+        url: backgroundUrl,
+      })
+    } catch (error) {
+      if (generation === themePreviewGeneration.current) {
+        setAdminThemeCreateError(error instanceof Error ? error.message : "Could not prepare the theme background preview")
+      }
+    }
+  }
+
+  const previewManagedAdminTheme = async (themeOption: ThemeOption, draft: AdminThemeDraft) => {
+    const generation = ++themePreviewGeneration.current
+    setAdminThemeManageError("")
+    try {
+      const backgroundUrl = draft.background_file
+        ? await createThemePreviewUrl(draft.background_file)
+        : draft.background_url.trim()
+          ? draft.background_url.trim()
+          : !draft.remove_background && themeOption.background_image_exists
+            ? themeOption.url
+            : ""
+      if (generation !== themePreviewGeneration.current) {
+        if (backgroundUrl.startsWith("blob:")) URL.revokeObjectURL(backgroundUrl)
+        return
+      }
+      setAdminThemePreview({
+        ...themeOption,
+        name: draft.name.trim() || themeOption.name,
+        title: draft.name.trim() || themeOption.name,
+        primary_color: draft.primary_color,
+        panel_color: draft.panel_color,
+        accent_color: draft.accent_color,
+        background_image_exists: Boolean(backgroundUrl),
+        background_opacity: backgroundUrl ? Number(draft.background_opacity) : 0,
+        url: backgroundUrl,
+      })
+    } catch (error) {
+      if (generation === themePreviewGeneration.current) {
+        setAdminThemeManageError(error instanceof Error ? error.message : "Could not prepare the theme background preview")
+      }
+    }
+  }
+
+  const clearAdminThemePreview = () => {
+    themePreviewGeneration.current += 1
+    setAdminThemePreview(null)
+  }
+
+  const saveAdminTheme = async (theme: ThemeOption) => {
+    const draft = adminThemeDrafts[theme.asset_id]
+    if (!draft) return
+    if (draft.background_file && draft.background_url.trim()) {
+      setAdminThemeManageError("Choose a background file or enter a URL, not both.")
+      return
+    }
+    setAdminThemeSaving(true)
+    setAdminThemeManageError("")
+    setAdminThemeManageNotice("")
+    const formData = new FormData()
+    formData.set("name", draft.name)
+    formData.set("primary_color", draft.primary_color)
+    formData.set("panel_color", draft.panel_color)
+    formData.set("accent_color", draft.accent_color)
+    formData.set("price", draft.price)
+    formData.set("background_opacity", draft.background_opacity)
+    formData.set("remove_background", String(draft.remove_background))
+    if (draft.background_file) formData.set("background", draft.background_file)
+    if (draft.background_url.trim()) formData.set("background_url", draft.background_url.trim())
+
+    try {
+      const response = await fetch(`/api/admin/themes/${theme.asset_id}`, {
+        method: "PATCH",
+        body: formData,
+      })
+      const result = await response.json()
+      if (!response.ok || !result.theme) {
+        throw new Error(result.message || "Could not update theme")
+      }
+
+      const updatedTheme: ThemeOption = {
+        ...result.theme,
+        price_overridden: result.price_overridden === true,
+      }
+      setAdminThemeManageNotice("Theme updated.")
+      setAdminThemeLookup(result.theme.name)
+      setSelectedAdminThemeId(result.theme.asset_id)
+      setAdminThemes((current) => current.map((themeOption) =>
+        themeOption.asset_id === updatedTheme.asset_id ? updatedTheme : themeOption,
+      ))
+      setShopAssets((current) => ({
+        ...current,
+        theme: current.theme.map((themeOption) =>
+          themeOption.asset_id === updatedTheme.asset_id ? updatedTheme : themeOption,
+        ),
+      }))
+      setAdminThemeDrafts((current) => ({
+        ...current,
+        [result.theme.asset_id]: {
+          name: result.theme.name,
+          primary_color: result.theme.primary_color,
+          panel_color: result.theme.panel_color,
+          accent_color: result.theme.accent_color,
+          price: result.price_overridden ? String(result.theme.price) : "",
+          background_url: "",
+          background_opacity: String(result.theme.background_opacity),
+          background_file: null,
+          remove_background: false,
+        },
+      }))
+      await Promise.all([loadAdminThemes(), loadPointPricing(), fetchShopCatalog().then(setShopAssets)])
+      const accountTheme = await refreshAccountThemes()
+      setThemeOptions(accountTheme.themes.map((themeOption) =>
+        themeOption.asset_id === updatedTheme.asset_id
+          ? {
+              ...themeOption,
+              ...updatedTheme,
+              owned: themeOption.owned,
+              status: themeOption.status,
+            }
+          : themeOption,
+      ))
+      setSavedThemeId(accountTheme.selected_theme_id)
+      setActiveThemeId(accountTheme.selected_theme_id)
+      setShopThemePreview(null)
+    } catch (error) {
+      setAdminThemeManageError(error instanceof Error ? error.message : "Could not update theme")
+    } finally {
+      setAdminThemeSaving(false)
+    }
+  }
+
+  const removeAdminTheme = async (theme: ThemeOption) => {
+    if (!window.confirm(`Remove theme "${theme.name}"?`)) return
+    setAdminThemeSaving(true)
+    setAdminThemeManageError("")
+    setAdminThemeManageNotice("")
+    try {
+      const response = await fetch(`/api/admin/themes/${theme.asset_id}`, { method: "DELETE" })
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.message || "Could not remove theme")
+      setAdminThemeManageNotice("Theme removed.")
+      setAdminThemes((current) => current.filter((item) => item.asset_id !== theme.asset_id))
+      setAdminThemeDrafts((current) => {
+        const updated = { ...current }
+        delete updated[theme.asset_id]
+        return updated
+      })
+      setSelectedAdminThemeId(null)
+      setAdminThemeLookup("")
+      await Promise.all([loadAdminThemes(), loadPointPricing(), fetchShopCatalog().then(setShopAssets)])
+      const accountTheme = await refreshAccountThemes()
+      setActiveThemeId(accountTheme.selected_theme_id)
+      setShopThemePreview(null)
+    } catch (error) {
+      setAdminThemeManageError(error instanceof Error ? error.message : "Could not remove theme")
+    } finally {
+      setAdminThemeSaving(false)
+    }
+  }
+
 	// --- Chat handling ---
 	const sendChatMessage = () => {
     if (isChatRestricted) return
@@ -2113,7 +3232,7 @@ useEffect(() => {
     })
   }
 
-  const purchaseShopAsset = async (assetType: "sound" | "emoji", asset: ShopAsset) => {
+  const purchaseShopAsset = async (assetType: "sound" | "emoji" | "theme", asset: ShopAsset) => {
     const requestKey = `${assetType}:${asset.asset_id}`
     let requestId = pendingShopRequestIds.current[requestKey]
     if (!requestId) {
@@ -2177,12 +3296,23 @@ useEffect(() => {
       } catch {
         // Storage is optional; the backend remains authoritative.
       }
-      setShopNotice(`${asset.title || asset.name} added to your ${assetType === "sound" ? "soundboard" : "emojis"}.`)
+      setShopNotice(
+        assetType === "theme"
+          ? `${asset.title || asset.name} theme purchased.`
+          : `${asset.title || asset.name} added to your ${assetType === "sound" ? "soundboard" : "emojis"}.`,
+      )
 
       try {
         const catalog = await fetchShopCatalog()
         setShopAssets(catalog)
-        await refreshOwnedAssetLists()
+        if (assetType === "theme") {
+          const accountTheme = await loadAccountTheme()
+          setThemeOptions(accountTheme.themes)
+          setSavedThemeId(accountTheme.selected_theme_id)
+          setActiveThemeId(accountTheme.selected_theme_id)
+        } else {
+          await refreshOwnedAssetLists()
+        }
       } catch (error) {
         setShopError(error instanceof Error ? error.message : "Purchased asset lists could not be refreshed")
         console.error("Purchased asset lists could not be refreshed:", error)
@@ -2199,6 +3329,10 @@ useEffect(() => {
     const form = event.currentTarget
     const draft = proposalDrafts[assetType]
     const file = proposalFiles[assetType]
+    if (file && draft.sourceUrl.trim()) {
+      setShopError("Choose a file or enter a URL, not both.")
+      return
+    }
     if (!file && !draft.sourceUrl.trim()) {
       setShopError("Choose a file or enter a URL.")
       return
@@ -2279,7 +3413,7 @@ if (!username) {
       <div className="min-h-screen gradient-bg flex items-center justify-center p-4">
         <Card className="w-full max-w-md glow-primary">
           <CardHeader className="text-center">
-            <CardTitle className="text-3xl font-bold bg-gradient-to-r from-primary to-accent bg-clip-text text-transparent">
+            <CardTitle className="text-3xl font-bold text-card-foreground">
               Annoy the Streamer
             </CardTitle>
             <CardDescription>Log in or create an account to join the chaos.</CardDescription>
@@ -2349,7 +3483,7 @@ if (!username) {
                     setAuthError("")
                   }}
                 >
-                  Reset password
+                  Account recovery
                 </Button>
               </div>
             )}
@@ -2423,25 +3557,22 @@ if (!username) {
             )}
 
             {passwordResetMode && (
-              <section aria-label="Set a new password" className="space-y-3 border-t pt-3">
+              <section aria-label="Account recovery" className="space-y-3 border-t pt-3">
                 <h2 className="text-sm font-semibold">
-                  {passwordResetAccount ? "Set a new password" : "Verify password reset"}
+                  {passwordResetAccount
+                    ? passwordResetAccount.recoveryType === "email"
+                      ? "Change account email"
+                      : "Set a new password"
+                    : "Verify account recovery"}
                 </h2>
                 <p className="text-xs text-muted-foreground">
-                  Enter the one-time reset code provided by an Admin to securely access this reset.
+                  Enter the one-time account recovery code.
                 </p>
                 <p className="text-sm">
                   Account: <span className="font-medium">
                     {passwordResetAccount?.username || passwordResetUsername}
                   </span>
                 </p>
-                {passwordResetAccount && (
-                  <p className="text-sm">
-                    Email on file: <span className="font-medium">
-                      {passwordResetAccount.email || "No email address on file"}
-                    </span>
-                  </p>
-                )}
                 <form
                   id="password-reset-form"
                   data-bwignore="true"
@@ -2451,7 +3582,7 @@ if (!username) {
                 >
                   <Input
                     name="reset-token"
-                    placeholder="One-time reset code"
+                    placeholder="One-time recovery code"
                     data-bwignore="true"
                     autoComplete="off"
                     value={passwordResetToken}
@@ -2460,37 +3591,57 @@ if (!username) {
                       setPasswordResetAccount(null)
                       setResetPasswordInput("")
                       setResetPasswordConfirmation("")
+                      setResetEmailInput("")
                     }}
                     className="text-lg"
                     required
                   />
                   {passwordResetAccount && (
-                    <>
+                    passwordResetAccount.recoveryType === "email" ? (
                       <Input
-                        type="password"
-                        name="new-password"
-                        placeholder="New password"
-                        autoComplete="new-password"
-                        value={resetPasswordInput}
-                        onChange={(event) => setResetPasswordInput(event.target.value)}
-                        className="text-lg"
-                        required
-                      />
-                      <Input
-                        type="password"
+                        type="email"
+                        name="new-email"
+                        placeholder="New email address"
                         data-bwignore="true"
-                        name="new-password-confirmation"
-                        placeholder="Confirm new password"
-                        autoComplete="new-password"
-                        value={resetPasswordConfirmation}
-                        onChange={(event) => setResetPasswordConfirmation(event.target.value)}
+                        autoComplete="email"
+                        value={resetEmailInput}
+                        onChange={(event) => setResetEmailInput(event.target.value)}
                         className="text-lg"
                         required
                       />
-                    </>
+                    ) : (
+                      <>
+                        <Input
+                          type="password"
+                          name="new-password"
+                          data-bwignore="true"
+                          placeholder="New password"
+                          autoComplete="new-password"
+                          value={resetPasswordInput}
+                          onChange={(event) => setResetPasswordInput(event.target.value)}
+                          className="text-lg"
+                          required
+                        />
+                        <Input
+                          type="password"
+                          data-bwignore="true"
+                          name="new-password-confirmation"
+                          placeholder="Confirm new password"
+                          autoComplete="new-password"
+                          value={resetPasswordConfirmation}
+                          onChange={(event) => setResetPasswordConfirmation(event.target.value)}
+                          className="text-lg"
+                          required
+                        />
+                      </>
+                    )
                   )}
                   <Button type="submit" className="w-full" size="lg">
-                    {passwordResetAccount ? "Set new password" : "Verify reset code"}
+                    {passwordResetAccount
+                      ? passwordResetAccount.recoveryType === "email"
+                        ? "Change email"
+                        : "Set new password"
+                      : "Verify recovery code"}
                   </Button>
                 </form>
                 <Button
@@ -2520,19 +3671,84 @@ if (!username) {
   // Main Page Render (chat + memes + stream)
   // ----------------------------
   return (
-    <div className="min-h-screen gradient-bg p-2 sm:p-4">
-      <div className="max-w-[2000px] mx-auto">
-        <div className="mb-4 sm:mb-6 text-center relative">
-          <Button
-            variant="outline"
-            size="icon"
-            onClick={toggleTheme}
-            className="absolute right-0 top-0 bg-transparent"
-            title={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
-          >
-            {theme === "dark" ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
-          </Button>
-          <h1 className="text-2xl sm:text-4xl font-bold bg-gradient-to-r from-primary via-accent to-primary bg-clip-text text-transparent mb-2">
+    <div
+      data-chat-only={isChatOnly}
+      className="relative isolate min-h-screen gradient-bg p-2 sm:p-4"
+      style={{ background: activeTheme.primary_color }}
+    >
+      {isChatOnly && (
+        <style>{`
+          [data-chat-only="true"] { height: 100dvh; min-height: 100dvh; overflow: hidden; padding: 0.5rem; }
+          [data-chat-only="true"] > [data-chat-shell] { max-width: none; height: 100%; margin: 0; }
+          [data-chat-only="true"] [data-site-header] { display: none; }
+          [data-chat-only="true"] [data-chat-layout] { display: block; height: 100%; }
+          [data-chat-only="true"] [data-chat-layout] > :not([data-chat-panel]) { display: none !important; }
+          [data-chat-only="true"] [data-chat-panel] { height: 100%; width: 100%; }
+          [data-chat-only="true"] [data-online-users] { display: none; }
+          [data-chat-only="true"] [data-chat-panel] > [data-chat-card] { height: 100%; max-height: none; flex: 1; min-height: 0; }
+        `}</style>
+      )}
+      {activeTheme.background_image_exists && activeTheme.url && (
+        <img
+          aria-hidden="true"
+          data-theme-background
+          src={activeTheme.url}
+          alt=""
+          className="pointer-events-none absolute inset-0 z-0 h-full w-full object-cover object-center"
+          style={{ opacity: activeTheme.background_opacity }}
+        />
+      )}
+      <div data-chat-shell className="relative z-10 mx-auto max-w-[2000px]">
+        <div data-site-header className="mb-4 sm:mb-6 text-center relative">
+          {username && (
+            <Popover open={themePickerOpen} onOpenChange={handleThemePickerOpenChange}>
+              <PopoverTrigger asChild>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="icon"
+                  className="absolute right-0 top-0 bg-transparent"
+                  aria-label="Choose theme"
+                  title="Choose theme"
+                >
+                  {renderThemeSwatch(activeTheme, "h-5 w-5", "rounded-sm border")}
+                </Button>
+              </PopoverTrigger>
+              <PopoverContent align="end" className="w-64 space-y-3">
+                <div>
+                  <h2 className="text-sm font-semibold">Choose a theme</h2>
+                </div>
+                <div className="grid max-h-64 grid-cols-[repeat(5,2.25rem)] justify-center gap-1.5 overflow-y-auto">
+                  {themeOptions.filter((themeOption) => themeOption.owned).map((themeOption) => (
+                    <button
+                      key={themeOption.asset_id}
+                      type="button"
+                      disabled={themeSaving}
+                      title={themeOption.name}
+                      aria-label={themeOption.name}
+                      aria-pressed={activeThemeId === themeOption.asset_id}
+                      onClick={() => setActiveThemeId(themeOption.asset_id)}
+                      className={`rounded-md border p-0.5 ${
+                        activeThemeId === themeOption.asset_id ? "border-primary bg-muted" : "border-transparent"
+                      }`}
+                    >
+                      {renderThemeSwatch(themeOption, "h-7 w-7", "rounded-sm border")}
+                    </button>
+                  ))}
+                </div>
+                {themeError && <p role="alert" className="text-xs text-destructive">{themeError}</p>}
+                <Button
+                  type="button"
+                  className="w-full"
+                  disabled={themeSaving || activeThemeId === savedThemeId}
+                  onClick={() => void saveSelectedTheme()}
+                >
+                  {themeSaving ? "Saving..." : "Save Changes"}
+                </Button>
+              </PopoverContent>
+            </Popover>
+          )}
+          <h1 className="text-2xl sm:text-4xl font-bold text-foreground mb-2">
             Annoy the Streamer
           </h1>
           <div className="flex flex-col items-center">
@@ -2544,8 +3760,11 @@ if (!username) {
                 </span>
               </span>
               <Badge
-                className={`ml-2 ${isAdmin ? "bg-pink-300 text-pink-900" : "text-zinc-900"}`}
-                style={{ backgroundColor: getUserColor(username, currentRank) }}
+                className="ml-2"
+                style={{
+                  backgroundColor: getUserColor(username, currentRank),
+                  color: contrastingTextColor(getUserColor(username, currentRank) || activeTheme.panel_color),
+                }}
               >
                 {isAdmin ? "Admin" : currentRank}
               </Badge>
@@ -2572,9 +3791,9 @@ if (!username) {
           {logoutError && <p role="alert" className="mt-2 text-sm text-destructive">{logoutError}</p>}
         </div>
 
-        <div className="flex flex-col md:grid md:grid-cols-1 lg:grid lg:grid-cols-[repeat(auto-fit,320px)] gap-3 sm:gap-4 lg:items-start lg:justify-center">
+        <div data-chat-layout className="relative flex flex-col md:grid md:grid-cols-1 lg:grid lg:grid-cols-[repeat(auto-fit,320px)] gap-3 sm:gap-4 lg:items-start lg:justify-center">
           {/* --- Left Column: Send Chaos --- */}
-          <div className="order-1 md:order-1 lg:order-3">
+          <div className="relative z-10 order-1 md:order-1 lg:order-3">
             <Card className={`card-hover flex flex-col h-auto max-h-[80dvh] overflow-hidden lg:h-[calc(100dvh_-_18rem)] lg:max-h-none lg:overflow-visible lg:!transition-[transform,box-shadow] ${isChatRestricted ? "opacity-60 grayscale" : ""}`}>
               <CardHeader className="pb-2 sm:pb-3 flex-shrink-0">
                 <CardTitle className="text-base sm:text-lg">Send Your Chaos</CardTitle>
@@ -2586,7 +3805,7 @@ if (!username) {
               >
                 {actionError && <p role="alert" className="mb-2 text-xs text-destructive">{actionError}</p>}
                 <Tabs value={activeTab} onValueChange={setActiveTab} className="flex flex-col lg:h-full">
-                  <TabsList className="grid w-full grid-cols-4 mb-3 sm:mb-4 h-8 sm:h-10 flex-shrink-0">
+                  <TabsList data-columns="4" className="joined-tabs grid w-full grid-cols-4 mb-3 sm:mb-4 h-8 sm:h-10 flex-shrink-0">
                     <TabsTrigger value="facememe" className="gap-1 text-[10px] sm:text-xs px-1">
                       <MessageSquare className="h-3 w-3" /> <span className="hidden sm:inline">Face</span>
                     </TabsTrigger>
@@ -2804,36 +4023,49 @@ if (!username) {
           </div>
 
           {username && permission("panel_access") && (
-          <div className="order-3 md:order-3 lg:order-1">
+          <div className="relative z-10 order-3 md:order-3 lg:order-1">
             <Card className="card-hover flex flex-col h-auto max-h-[80dvh] overflow-hidden lg:h-[calc(100dvh_-_18rem)] lg:max-h-none lg:overflow-visible lg:!transition-[transform,box-shadow]">
               <CardHeader className="pb-2 sm:pb-3 flex-shrink-0">
                 <CardTitle className="text-base sm:text-lg">{isAdmin ? "Admin" : "Moderation"}</CardTitle>
                 <CardDescription className="text-xs">{isAdmin ? "Manage users and account settings" : "Inspect users and manage chat moderation"}</CardDescription>
               </CardHeader>
-              <CardContent className="min-h-0 flex-1 overflow-y-auto p-3 sm:p-6 lg:overflow-hidden">
-                <Tabs value={adminView} onValueChange={(value) => setAdminView(value as "users" | "admin" | "pricing" | "soundboard" | "emoji")} className="flex flex-col lg:h-full">
-                  <TabsList className={`grid w-full ${isAdmin ? "grid-cols-6" : "grid-cols-1"} mb-3 sm:mb-4 h-auto flex-shrink-0`}>
-                    <TabsTrigger value="users" className={`gap-1 text-[10px] sm:text-xs px-1 ${isAdmin ? "col-span-2" : ""}`}>
+              <CardContent data-chaos-control-sizing className="min-h-0 flex-1 overflow-y-auto p-3 sm:p-6 lg:overflow-hidden">
+                <Tabs value={adminView} onValueChange={(value) => setAdminView(value as "users" | "admin" | "pricing" | "soundboard" | "emoji" | "themes" | "badges")} className="flex flex-col lg:h-full">
+                  <TabsList
+                    data-columns={isAdmin ? "3" : "1"}
+                    className={`joined-tabs grid w-full ${isAdmin ? "grid-cols-3" : "grid-cols-1"} mb-3 sm:mb-4 h-auto flex-shrink-0`}
+                  >
+                    <TabsTrigger value="users" className="gap-1 text-[10px] sm:text-xs px-1">
                       <Users className="h-3 w-3" /> Users
                     </TabsTrigger>
                     {permission("admin_console") && (
-                      <TabsTrigger value="admin" className="col-span-2 gap-1 text-[10px] sm:text-xs px-1">
+                      <TabsTrigger value="admin" className="gap-1 text-[10px] sm:text-xs px-1">
                         <Shield className="h-3 w-3" /> Admin
                       </TabsTrigger>
                     )}
                     {permission("admin_console") && (
-                      <TabsTrigger value="pricing" className="col-span-2 gap-1 text-[10px] sm:text-xs px-1">
+                      <TabsTrigger value="pricing" className="gap-1 text-[10px] sm:text-xs px-1">
                         ❖ Pricing
                       </TabsTrigger>
                     )}
                     {permission("admin_console") && (
-                      <TabsTrigger value="soundboard" className="col-start-2 col-span-2 gap-1 text-[10px] sm:text-xs px-1">
-                        <Music className="h-3 w-3" /> Soundboard
+                      <TabsTrigger value="soundboard" className="gap-1 text-[10px] sm:text-xs px-1">
+                        <Music className="h-3 w-3 shrink-0" /> Soundboard
                       </TabsTrigger>
                     )}
                     {permission("admin_console") && (
-                      <TabsTrigger value="emoji" className="col-start-4 col-span-2 gap-1 text-[10px] sm:text-xs px-1">
+                      <TabsTrigger value="emoji" className="gap-1 text-[10px] sm:text-xs px-1">
                         <Smile className="h-3 w-3" /> Emoji
+                      </TabsTrigger>
+                    )}
+                    {permission("admin_console") && (
+                      <TabsTrigger value="themes" className="gap-1 text-[10px] sm:text-xs px-1">
+                        <Palette className="h-3 w-3" /> Themes
+                      </TabsTrigger>
+                    )}
+                    {permission("admin_console") && (
+                      <TabsTrigger value="badges" className="gap-1 text-[10px] sm:text-xs px-1">
+                        <Award className="h-3 w-3" /> Badges
                       </TabsTrigger>
                     )}
                   </TabsList>
@@ -2868,7 +4100,48 @@ if (!username) {
                                 ? new Date(managedUser.chat_timeout_until).toLocaleString()
                                 : "No"}
                             </p>
+                            <div className="flex flex-wrap items-center gap-1">
+                              <span>Badges:</span>
+                              {managedUser.badges.length
+                                ? managedUser.badges.map((badge) => (
+                                  <img key={badge.asset_id} src={badge.url} alt={badge.name} title={badge.name} className="h-4 w-4 object-contain" />
+                                ))
+                                : <span className="text-muted-foreground">None</span>}
+                            </div>
                           </div>
+                          {permission("admin_console") && (
+                            <form
+                              className="flex items-end gap-2"
+                              onSubmit={(event) => {
+                                event.preventDefault()
+                                void changeBadgeForInspectedUser("grant")
+                              }}
+                            >
+                              <label className="min-w-0 flex-1 space-y-1 text-xs">
+                                <span>Badge</span>
+                                <Input
+                                  value={adminBadgeGrantName}
+                                  onChange={(event) => setAdminBadgeGrantName(event.target.value)}
+                                  placeholder="Badge name"
+                                  className="h-8"
+                                  aria-label="Badge name to grant to inspected user"
+                                />
+                              </label>
+                              <Button type="submit" variant="outline" size="sm" className="h-8" disabled={!adminBadgeGrantName.trim() || adminBadgeGranting}>
+                                {adminBadgeGranting ? "Granting…" : "Grant"}
+                              </Button>
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                className="h-8"
+                                disabled={!adminBadgeGrantName.trim() || adminBadgeGranting}
+                                onClick={() => void changeBadgeForInspectedUser("remove")}
+                              >
+                                {adminBadgeGranting ? "Removing…" : "Remove"}
+                              </Button>
+                            </form>
+                          )}
                           {permission("adjust_points") && <form
                             autoComplete="off"
                             className="flex items-end gap-2"
@@ -2911,7 +4184,7 @@ if (!username) {
                           >
                             <label className="flex-1 space-y-1 text-xs">
                               <span>Adjust points</span>
-                              <Input type="number" step="1" value={pointsAdjustment} onChange={(event) => setPointsAdjustment(event.target.value)} aria-label="Point adjustment" />
+                              <Input type="number" step="1" value={pointsAdjustment} onChange={(event) => setPointsAdjustment(event.target.value)} placeholder="0" aria-label="Point adjustment (default 0)" />
                             </label>
                             <Button type="submit" variant="outline">Adjust</Button>
                           </form>}
@@ -2925,7 +4198,7 @@ if (!username) {
                                 className="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-2 text-sm"
                               >
                                 <option value="">Select rank</option>
-                                {rankOptions.filter((option) => option.staff === false).map((option) => (
+                                {assignableRankOptions.map((option) => (
                                   <option key={option.id} value={option.rank}>
                                     {option.rank}
                                   </option>
@@ -2955,7 +4228,7 @@ if (!username) {
                                 className="flex flex-nowrap items-end gap-2"
                                 onSubmit={(event) => {
                                   event.preventDefault()
-                                  const durationSeconds = Number(timeoutDurationSeconds)
+                                  const durationSeconds = Number(timeoutDurationSeconds || "60")
                                   if (!Number.isSafeInteger(durationSeconds) || durationSeconds <= 0) {
                                     setAdminError("Enter a whole number of seconds greater than zero.")
                                     return
@@ -2971,6 +4244,7 @@ if (!username) {
                                     step="1"
                                     value={timeoutDurationSeconds}
                                     onChange={(event) => setTimeoutDurationSeconds(event.target.value)}
+                                    placeholder="60"
                                     aria-label="Chat timeout duration in seconds"
                                   />
                                 </label>
@@ -2986,19 +4260,36 @@ if (!username) {
                               </form>
                             </>
                           )}
-                          {permission("reset_password") && <div className="flex items-center justify-between gap-2">
-                            <span className="text-sm">Reset password</span>
-                            {!confirmingPasswordReset ? (
-                              <Button variant="outline" onClick={() => setConfirmingPasswordReset(true)}>
-                                Reset password
-                              </Button>
-                            ) : (
-                              <div className="flex gap-2">
-                                <Button variant="outline" onClick={() => setConfirmingPasswordReset(false)}>Cancel</Button>
-                                <Button variant="destructive" onClick={() => void updateManagedUser("reset-password", {})}>Confirm</Button>
+                          {permission("reset_password") && (
+                            <div className="space-y-2">
+                              <div className="flex items-center justify-between gap-2">
+                                <span className="text-sm">Reset password</span>
+                                {!confirmingPasswordReset ? (
+                                  <Button variant="outline" className="w-32" onClick={() => setConfirmingPasswordReset(true)}>
+                                    Reset password
+                                  </Button>
+                                ) : (
+                                  <div className="flex gap-2">
+                                    <Button variant="outline" onClick={() => setConfirmingPasswordReset(false)}>Cancel</Button>
+                                    <Button variant="destructive" onClick={() => void updateManagedUser("reset-password", {})}>Confirm</Button>
+                                  </div>
+                                )}
                               </div>
-                            )}
-                          </div>}
+                              <div className="flex items-center justify-between gap-2">
+                                <span className="text-sm">Reset email</span>
+                                {!confirmingEmailReset ? (
+                                  <Button variant="outline" className="w-32" onClick={() => setConfirmingEmailReset(true)}>
+                                    Reset email
+                                  </Button>
+                                ) : (
+                                  <div className="flex gap-2">
+                                    <Button variant="outline" onClick={() => setConfirmingEmailReset(false)}>Cancel</Button>
+                                    <Button variant="destructive" onClick={() => void updateManagedUser("reset-email", {})}>Confirm</Button>
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                          )}
                         </div>
                       )}
                     </>
@@ -3008,11 +4299,29 @@ if (!username) {
                     {adminNotice && (
                       <div role="status" className="space-y-1 text-sm text-muted-foreground">
                         <p>{adminNotice}</p>
-                        {adminIssuedPasswordResetToken && (
-                          <p className="break-all">
-                            Reset code (shown once):{" "}
-                            <code className="select-all">{adminIssuedPasswordResetToken}</code>
-                          </p>
+                        {adminIssuedRecoveryToken && (
+                          <>
+                            <p className="break-all text-sm text-muted-foreground">
+                              Recovery code:{" "}
+                              <code
+                                className="select-all cursor-pointer"
+                                role="button"
+                                tabIndex={0}
+                                aria-label="Copy one-time account recovery code"
+                                onClick={() => void copyRecoveryCode(adminIssuedRecoveryToken, setAdminRecoveryCopyNotice, setAdminError)}
+                                onKeyDown={(event) => {
+                                  if (event.key === "Enter" || event.key === " ") {
+                                    event.preventDefault()
+                                    void copyRecoveryCode(adminIssuedRecoveryToken, setAdminRecoveryCopyNotice, setAdminError)
+                                  }
+                                }}
+                              >
+                                {adminIssuedRecoveryToken}
+                              </code>
+                            </p>
+                            <p className="text-sm text-muted-foreground">After copying the recovery code, log out and press &quot;Account recovery&quot; button.</p>
+                            {adminRecoveryCopyNotice && <p role="status" className="text-sm text-muted-foreground">{adminRecoveryCopyNotice}</p>}
+                          </>
                         )}
                       </div>
                     )}
@@ -3031,7 +4340,7 @@ if (!username) {
                       <div className="space-y-4">
                         <section className="space-y-2">
                           <h3 className="text-sm font-semibold">Send Your Chaos</h3>
-                          <div className="grid grid-cols-2 gap-2">
+                          <div className="grid grid-cols-2 gap-2 pt-2">
                             {SEND_YOUR_CHAOS_ACTIONS.map(({ key, label }) => (
                               <label key={key} className="space-y-1 text-xs">
                                 <span>{label}</span>
@@ -3069,14 +4378,14 @@ if (!username) {
                             <summary className="cursor-pointer text-xs font-medium">
                               Exceptions ({Object.keys(pointPricing.catalog.emoji.items).length})
                             </summary>
-                            <div className="space-y-2 pt-2">
+                            <div className="space-y-2">
                               <form
                                 autoComplete="off"
                                 className="flex flex-col gap-2"
                                 onSubmit={(event) => {
                                   event.preventDefault()
                                   const item = newEmojiItem.trim()
-                                  const price = parsePointPrice(newEmojiItemPrice)
+                                  const price = parsePointPrice(newEmojiItemPrice.trim() || "100")
                                   if (!item || Object.prototype.hasOwnProperty.call(pointPricing.catalog.emoji.items, item) || price === null) {
                                     setPricingError("Enter a new item name and a valid price of -1 or a non-negative whole number.")
                                     return
@@ -3087,7 +4396,7 @@ if (!username) {
                               >
                                 <Input value={newEmojiItem} onChange={(event) => setNewEmojiItem(event.target.value)} placeholder="Emoji name" aria-label="New emoji exception name" className="w-full" />
                                 <div className="flex items-center gap-2">
-                                  <Input type="number" min={-1} step={1} value={newEmojiItemPrice} onChange={(event) => setNewEmojiItemPrice(event.target.value)} aria-label="New emoji exception price" className="w-full [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none" />
+                                  <Input type="number" min={-1} step={1} value={newEmojiItemPrice} onChange={(event) => setNewEmojiItemPrice(event.target.value)} placeholder="100" aria-label="New emoji exception price (default 100)" className="w-full [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none" />
                                   <Button type="submit" variant="outline">Add</Button>
                                 </div>
                               </form>
@@ -3257,7 +4566,7 @@ if (!username) {
                                 onSubmit={(event) => {
                                   event.preventDefault()
                                   const item = newSoundItem.trim()
-                                  const price = parsePointPrice(newSoundItemPrice)
+                                  const price = parsePointPrice(newSoundItemPrice.trim() || "100")
                                   if (!item || Object.prototype.hasOwnProperty.call(pointPricing.catalog.sound.items, item) || price === null) {
                                     setPricingError("Enter a sound filename and a valid price of -1 or a non-negative whole number.")
                                     return
@@ -3268,7 +4577,7 @@ if (!username) {
                               >
                                 <Input value={newSoundItem} onChange={(event) => setNewSoundItem(event.target.value)} placeholder="Sound filename (e.g. 21.mp3)" aria-label="New sound exception filename" className="w-full" />
                                 <div className="flex items-center gap-2">
-                                  <Input type="number" min={-1} step={1} value={newSoundItemPrice} onChange={(event) => setNewSoundItemPrice(event.target.value)} aria-label="New sound exception price" className="w-full [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none" />
+                                  <Input type="number" min={-1} step={1} value={newSoundItemPrice} onChange={(event) => setNewSoundItemPrice(event.target.value)} placeholder="100" aria-label="New sound exception price (default 100)" className="w-full [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none" />
                                   <Button type="submit" variant="outline">Add</Button>
                                 </div>
                               </form>
@@ -3497,6 +4806,101 @@ if (!username) {
                           </section>
                         </details>
 
+                        <details className="border-t pt-3">
+                          <summary className="cursor-pointer text-sm font-semibold">Themes</summary>
+                          <section className="space-y-2 pt-3">
+                            <label className="block space-y-1 text-xs">
+                              <span>Default price</span>
+                              <Input
+                                aria-label="Default theme price"
+                                type="number"
+                                min={-1}
+                                step={1}
+                                value={pointPricing.catalog.theme.default}
+                                onChange={(event) => updateCatalogDefault("theme", event.target.valueAsNumber)}
+                                className="[appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                              />
+                            </label>
+                            <details className="rounded-md border px-3 py-2">
+                              <summary className="cursor-pointer text-xs font-medium">
+                                Exceptions ({Object.keys(pointPricing.catalog.theme.items).length})
+                              </summary>
+                              <div className="space-y-2 pt-2">
+                                <form
+                                  autoComplete="off"
+                                  className="flex flex-col gap-2"
+                                  onSubmit={(event) => {
+                                    event.preventDefault()
+                                    const theme = adminThemes.find((themeOption) =>
+                                      !themeOption.is_standard &&
+                                      themeOption.name.trim().toLocaleLowerCase() === newThemeItem.trim().toLocaleLowerCase(),
+                                    )
+                                    const price = parsePointPrice(newThemeItemPrice)
+                                    if (!theme || price === null) {
+                                      setPricingError("Enter an existing theme name and a valid price of -1 or a non-negative whole number.")
+                                      return
+                                    }
+                                    if (Object.prototype.hasOwnProperty.call(pointPricing.catalog.theme.items, theme.asset_id)) {
+                                      setPricingError("That theme already has a price exception.")
+                                      return
+                                    }
+                                    updateEditedThemePrice(theme.asset_id, newThemeItemPrice)
+                                    setNewThemeItem("")
+                                    setNewThemeItemPrice("")
+                                  }}
+                                >
+                                  <Input
+                                    value={newThemeItem}
+                                    onChange={(event) => setNewThemeItem(event.target.value)}
+                                    placeholder="Theme Name"
+                                    aria-label="Theme price exception name"
+                                    className="w-full"
+                                  />
+                                  <div className="flex items-center gap-2">
+                                    <Input
+                                      type="number"
+                                      min={-1}
+                                      step={1}
+                                      value={newThemeItemPrice}
+                                      onChange={(event) => setNewThemeItemPrice(event.target.value)}
+                                      aria-label="New theme exception price"
+                                      className="w-full [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                                    />
+                                    <Button type="submit" variant="outline">Add</Button>
+                                  </div>
+                                </form>
+                                {Object.entries(pointPricing.catalog.theme.items).map(([themeId, price]) => {
+                                  const themeOption = adminThemes.find((theme) => theme.asset_id === themeId)
+                                  const themeName = themeOption?.name ?? themeId
+                                  return (
+                                    <div key={themeId} className="flex items-center gap-2">
+                                      <span className="min-w-0 flex-1 truncate text-xs">{themeName}</span>
+                                      <Input
+                                        aria-label={`${themeName} theme price`}
+                                        type="number"
+                                        min={-1}
+                                        step={1}
+                                        value={editedCatalogPrices[`theme:${themeId}`] ?? String(price)}
+                                        onChange={(event) => updateEditedThemePrice(themeId, event.target.value)}
+                                        className="w-24 [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                                      />
+                                      <Button
+                                        type="button"
+                                        variant="ghost"
+                                        size="icon"
+                                        aria-label={`Remove ${themeName} theme price exception`}
+                                        onClick={() => removeCatalogItemPrice("theme", themeId)}
+                                      >
+                                        <Trash2 className="h-3 w-3" />
+                                      </Button>
+                                    </div>
+                                  )
+                                })}
+                              </div>
+                            </details>
+                          </section>
+                        </details>
+
                         <div className="space-y-2 border-t pt-3">
                           <Button type="button" onClick={() => void savePointPricing()} disabled={pricingSaving || pricingLoading}>
                             {pricingSaving ? "Saving..." : "Save"}
@@ -3523,6 +4927,644 @@ if (!username) {
                       {renderAdminAssetManagement("emoji")}
                     </TabsContent>
                   )}
+                  {permission("admin_console") && (
+                    <TabsContent value="themes" className="mt-0 space-y-4 lg:flex-1 lg:min-h-0 lg:overflow-y-auto lg:pr-3">
+                      <details
+                        className="rounded-md border"
+                        onToggle={(event) => {
+                          if (!event.currentTarget.open) clearAdminThemePreview()
+                        }}
+                      >
+                        <summary className="cursor-pointer px-3 py-2 text-sm font-semibold">Upload theme</summary>
+                        <form className="space-y-2 px-3 pb-3" onSubmit={(event) => void createAdminTheme(event)}>
+                          <Input
+                            value={adminThemeName}
+                            onChange={(event) => setAdminThemeName(event.target.value)}
+                            maxLength={80}
+                            placeholder="Theme Name"
+                            required
+                            aria-label="Theme name"
+                          />
+                          <div className="grid grid-cols-3 gap-2">
+                            <label className="block space-y-1 text-xs">
+                              <span>Background</span>
+                              <Input
+                                type="color"
+                                value={adminThemePrimary}
+                                onChange={(event) => setAdminThemePrimary(event.target.value)}
+                                aria-label="Theme background color"
+                                className="h-9 p-1"
+                              />
+                            </label>
+                            <label className="block space-y-1 text-xs">
+                              <span>Panels</span>
+                              <Input
+                                type="color"
+                                value={adminThemePanel}
+                                onChange={(event) => setAdminThemePanel(event.target.value)}
+                                aria-label="Theme panel color"
+                                className="h-9 p-1"
+                              />
+                            </label>
+                            <label className="block space-y-1 text-xs">
+                              <span>Accents</span>
+                              <Input
+                                type="color"
+                                value={adminThemeAccent}
+                                onChange={(event) => setAdminThemeAccent(event.target.value)}
+                                aria-label="Theme accent color"
+                                className="h-9 p-1"
+                              />
+                            </label>
+                          </div>
+                          <div className="space-y-1">
+                            <div className="flex gap-2">
+                              <Input
+                                type="url"
+                                value={adminThemeBackgroundUrl}
+                                onChange={(event) => {
+                                  setAdminThemeBackgroundUrl(event.target.value)
+                                  if (event.target.value) {
+                                    setAdminThemeBackgroundFile(null)
+                                    if (adminThemeBackgroundInputRef.current) {
+                                      adminThemeBackgroundInputRef.current.value = ""
+                                    }
+                                  }
+                                }}
+                                placeholder="URL..."
+                                className="h-7 flex-1 sm:h-8"
+                                aria-label="Theme background image URL"
+                              />
+                              <div className="relative">
+                                <Input
+                                  type="file"
+                                  accept=".jpg,.jpeg,.png,.gif,image/jpeg,image/png,image/gif"
+                                  ref={adminThemeBackgroundInputRef}
+                                  onChange={(event) => {
+                                    const file = event.target.files?.[0] ?? null
+                                    event.currentTarget.value = ""
+                                    setAdminThemeBackgroundFile(file)
+                                    if (file) setAdminThemeBackgroundUrl("")
+                                  }}
+                                  className="hidden"
+                                  id="admin-theme-background-file"
+                                  aria-label="Theme background image file"
+                                />
+                                <Button
+                                  type="button"
+                                  variant="outline"
+                                  size="icon"
+                                  className="h-7 w-7 bg-transparent sm:h-8 sm:w-8"
+                                  asChild
+                                >
+                                  <label htmlFor="admin-theme-background-file" className="flex cursor-pointer items-center justify-center">
+                                    <Upload className="h-3 w-3" />
+                                  </label>
+                                </Button>
+                              </div>
+                            </div>
+                            {adminThemeBackgroundFile && (
+                              <div className="flex min-w-0 items-center gap-2 text-xs">
+                                <p className="min-w-0 flex-1 truncate text-muted-foreground">{adminThemeBackgroundFile.name}</p>
+                                <Button
+                                  type="button"
+                                  variant="outline"
+                                  size="sm"
+                                  className="h-7 shrink-0 px-2 sm:h-8"
+                                  onClick={() => {
+                                    setAdminThemeBackgroundFile(null)
+                                    if (adminThemeBackgroundInputRef.current) {
+                                      adminThemeBackgroundInputRef.current.value = ""
+                                    }
+                                    clearAdminThemePreview()
+                                  }}
+                                >
+                                  Clear file
+                                </Button>
+                              </div>
+                            )}
+                          </div>
+                          {(adminThemeBackgroundFile || adminThemeBackgroundUrl.trim()) && (
+                            <Button
+                              type="button"
+                              variant="outline"
+                              className="w-full"
+                              onClick={() => {
+                                setAdminThemeBackgroundFile(null)
+                                setAdminThemeBackgroundUrl("")
+                                if (adminThemeBackgroundInputRef.current) {
+                                  adminThemeBackgroundInputRef.current.value = ""
+                                }
+                                clearAdminThemePreview()
+                              }}
+                            >
+                              Remove background
+                            </Button>
+                          )}
+                          {(adminThemeBackgroundFile || adminThemeBackgroundUrl.trim()) && (
+                            <Input
+                              type="number"
+                              min={0}
+                              max={1}
+                              step={0.05}
+                              value={adminThemeBackgroundOpacity}
+                              onChange={(event) => setAdminThemeBackgroundOpacity(event.target.value)}
+                              placeholder="0.2"
+                              aria-label="Theme background opacity"
+                            />
+                          )}
+                          <Input
+                            type="number"
+                            min={-1}
+                            step={1}
+                            value={adminThemePrice}
+                            onChange={(event) => setAdminThemePrice(event.target.value)}
+                            placeholder={String(pointPricing?.catalog.theme.default ?? 10_000)}
+                            aria-label="Theme price"
+                          />
+                          <div className="space-y-2 pt-2">
+                            <div className="grid grid-cols-2 gap-2">
+                              <Button type="button" variant="outline" className="w-full" onClick={() => void previewAdminTheme()}>
+                                Preview
+                              </Button>
+                              <Button type="button" variant="outline" className="w-full" onClick={clearAdminThemePreview}>
+                                Clear
+                              </Button>
+                            </div>
+                            <Button type="submit" className="w-full" disabled={adminThemeSaving}>
+                              {adminThemeSaving ? "Uploading..." : "Upload theme"}
+                            </Button>
+                          </div>
+                          {adminThemeCreateError && <p role="alert" className="text-xs text-destructive">{adminThemeCreateError}</p>}
+                          {adminThemeCreateNotice && <p role="status" className="text-xs text-muted-foreground">{adminThemeCreateNotice}</p>}
+                        </form>
+                      </details>
+                      <section className="space-y-2 rounded-md border p-3">
+                        <h3 className="text-sm font-semibold">Manage existing themes</h3>
+                        <form
+                          className="flex gap-2"
+                          onSubmit={(event) => {
+                            event.preventDefault()
+                            const match = adminThemes.find((themeOption) =>
+                              themeOption.name.trim().toLocaleLowerCase() === adminThemeLookup.trim().toLocaleLowerCase(),
+                            )
+                            setSelectedAdminThemeId(match?.asset_id ?? null)
+                            setAdminThemeManageError(match ? "" : "No theme found with that name.")
+                            if (match) {
+                              setAdminThemeDrafts((current) => ({
+                                ...current,
+                                [match.asset_id]: {
+                                  name: match.name,
+                                  primary_color: match.primary_color,
+                                  panel_color: match.panel_color,
+                                  accent_color: match.accent_color,
+                                  price: match.price_overridden ? String(match.price) : "",
+                                  background_url: "",
+                                  background_opacity: String(match.background_opacity),
+                                  background_file: null,
+                                  remove_background: false,
+                                },
+                              }))
+                            }
+                          }}
+                        >
+                          <div className="min-w-0 flex-1">
+                            <Input
+                              value={adminThemeLookup}
+                              onChange={(event) => {
+                                setAdminThemeLookup(event.target.value)
+                                setSelectedAdminThemeId(null)
+                              }}
+                              placeholder="Theme name"
+                              aria-label="Find theme by name"
+                            />
+                          </div>
+                          <Button type="submit">Load</Button>
+                        </form>
+                        {selectedAdminThemeId && !adminThemes.find((item) => item.asset_id === selectedAdminThemeId) && (
+                          <p className="text-xs text-muted-foreground">No themes available.</p>
+                        )}
+                        {selectedAdminThemeId && adminThemeDrafts[selectedAdminThemeId] && (() => {
+                          const themeOption = adminThemes.find((item) => item.asset_id === selectedAdminThemeId)
+                          const draft = adminThemeDrafts[selectedAdminThemeId]
+                          if (!themeOption) return null
+                          return (
+                            <form
+                              className="space-y-2 border-t pt-3"
+                              onSubmit={(event) => {
+                                event.preventDefault()
+                                void saveAdminTheme(themeOption)
+                              }}
+                            >
+                              <div className="flex items-center gap-2">
+                                {renderThemeSwatch(themeOption, "h-8 w-8", "rounded-sm border")}
+                                <span className="min-w-0 flex-1 truncate text-xs">{themeOption.name}</span>
+                              </div>
+                              <Input
+                                value={draft.name}
+                                onChange={(event) => setAdminThemeDrafts((current) => ({
+                                  ...current,
+                                  [themeOption.asset_id]: { ...draft, name: event.target.value },
+                                }))}
+                                maxLength={80}
+                                placeholder="Theme Name"
+                                required
+                                aria-label="Edit theme name"
+                              />
+                              <div className="grid grid-cols-3 gap-2">
+                                <label className="block space-y-1 text-xs">
+                                  <span>Background</span>
+                                  <Input
+                                    type="color"
+                                    value={draft.primary_color}
+                                    onChange={(event) => setAdminThemeDrafts((current) => ({
+                                      ...current,
+                                      [themeOption.asset_id]: { ...draft, primary_color: event.target.value },
+                                    }))}
+                                    aria-label="Edit theme background color"
+                                    className="h-9 p-1"
+                                  />
+                                </label>
+                                <label className="block space-y-1 text-xs">
+                                  <span>Panels</span>
+                                  <Input
+                                    type="color"
+                                    value={draft.panel_color}
+                                    onChange={(event) => setAdminThemeDrafts((current) => ({
+                                      ...current,
+                                      [themeOption.asset_id]: { ...draft, panel_color: event.target.value },
+                                    }))}
+                                    aria-label="Edit theme panel color"
+                                    className="h-9 p-1"
+                                  />
+                                </label>
+                                <label className="block space-y-1 text-xs">
+                                  <span>Accents</span>
+                                  <Input
+                                    type="color"
+                                    value={draft.accent_color}
+                                    onChange={(event) => setAdminThemeDrafts((current) => ({
+                                      ...current,
+                                      [themeOption.asset_id]: { ...draft, accent_color: event.target.value },
+                                    }))}
+                                    aria-label="Edit theme accent color"
+                                    className="h-9 p-1"
+                                  />
+                                </label>
+                              </div>
+                              {!themeOption.is_standard && (
+                                <Input
+                                  type="number"
+                                  min={-1}
+                                  step={1}
+                                  value={draft.price}
+                                  placeholder={String(pointPricing?.catalog.theme.default ?? 10_000)}
+                                  onChange={(event) => setAdminThemeDrafts((current) => ({
+                                    ...current,
+                                    [themeOption.asset_id]: { ...draft, price: event.target.value },
+                                  }))}
+                                  aria-label="Edit theme price"
+                                />
+                              )}
+                              <div className="space-y-1">
+                                <div className="flex gap-2">
+                                  <Input
+                                    type="url"
+                                    value={draft.background_url}
+                                    onChange={(event) => setAdminThemeDrafts((current) => ({
+                                      ...current,
+                                      [themeOption.asset_id]: {
+                                        ...draft,
+                                        background_url: event.target.value,
+                                        ...(event.target.value ? { background_file: null } : {}),
+                                        ...(event.target.value ? { remove_background: false } : {}),
+                                      },
+                                    }))}
+                                    placeholder="URL..."
+                                    className="h-7 flex-1 sm:h-8"
+                                    aria-label="Edit theme background URL"
+                                  />
+                                  <div className="relative">
+                                    <Input
+                                      type="file"
+                                      accept=".jpg,.jpeg,.png,.gif,image/jpeg,image/png,image/gif"
+                                      onChange={(event) => {
+                                        const file = event.target.files?.[0] ?? null
+                                        event.currentTarget.value = ""
+                                        setAdminThemeDrafts((current) => ({
+                                          ...current,
+                                          [themeOption.asset_id]: {
+                                            ...draft,
+                                            background_file: file,
+                                            ...(file ? { background_url: "" } : {}),
+                                            ...(file ? { remove_background: false } : {}),
+                                          },
+                                        }))
+                                      }}
+                                      className="hidden"
+                                      id={`admin-theme-background-file-${themeOption.asset_id}`}
+                                      aria-label="Edit theme background upload"
+                                    />
+                                    <Button
+                                      type="button"
+                                      variant="outline"
+                                      size="icon"
+                                      className="h-7 w-7 bg-transparent sm:h-8 sm:w-8"
+                                      asChild
+                                    >
+                                      <label
+                                        htmlFor={`admin-theme-background-file-${themeOption.asset_id}`}
+                                        className="flex cursor-pointer items-center justify-center"
+                                      >
+                                        <Upload className="h-3 w-3" />
+                                      </label>
+                                    </Button>
+                                  </div>
+                                </div>
+                                {draft.background_file && (
+                                  <div className="flex min-w-0 items-center gap-2 text-xs">
+                                    <p className="min-w-0 flex-1 truncate text-muted-foreground">{draft.background_file.name}</p>
+                                    <Button
+                                      type="button"
+                                      variant="outline"
+                                      size="sm"
+                                      className="h-7 shrink-0 px-2 sm:h-8"
+                                      onClick={() => setAdminThemeDrafts((current) => ({
+                                        ...current,
+                                        [themeOption.asset_id]: { ...draft, background_file: null },
+                                      }))}
+                                    >
+                                      Clear file
+                                    </Button>
+                                  </div>
+                                )}
+                              </div>
+                              {themeOption.background_image_exists && (
+                                <label className="flex items-center gap-2 text-xs">
+                                  <input
+                                    type="checkbox"
+                                    checked={draft.remove_background}
+                                    onChange={(event) => setAdminThemeDrafts((current) => ({
+                                      ...current,
+                                      [themeOption.asset_id]: { ...draft, remove_background: event.target.checked },
+                                    }))}
+                                  />
+                                  Remove background
+                                </label>
+                              )}
+                              {(themeOption.background_image_exists || draft.background_file || draft.background_url.trim()) && (
+                                <Input
+                                  type="number"
+                                  min={0}
+                                  max={1}
+                                  step={0.05}
+                                  value={draft.background_opacity}
+                                  onChange={(event) => setAdminThemeDrafts((current) => ({
+                                    ...current,
+                                    [themeOption.asset_id]: { ...draft, background_opacity: event.target.value },
+                                  }))}
+                                  aria-label="Edit theme background opacity"
+                                />
+                              )}
+                              <div className="space-y-2 pt-2">
+                                <div className="grid grid-cols-2 gap-2">
+                                  <Button
+                                    type="button"
+                                    variant="outline"
+                                    className="w-full"
+                                    onClick={() => void previewManagedAdminTheme(themeOption, draft)}
+                                  >
+                                    Preview
+                                  </Button>
+                                  <Button
+                                    type="button"
+                                    variant="outline"
+                                    className="w-full"
+                                    onClick={clearAdminThemePreview}
+                                  >
+                                    Clear
+                                  </Button>
+                                </div>
+                                <div className="grid grid-cols-2 gap-2">
+                                  <Button
+                                    type="button"
+                                    variant="outline"
+                                    className="w-full"
+                                    disabled={adminThemeSaving}
+                                    onClick={() => void saveAdminTheme(themeOption)}
+                                  >
+                                    {adminThemeSaving ? "Saving..." : "Save changes"}
+                                  </Button>
+                                  <Button
+                                    type="button"
+                                    variant="destructive"
+                                    className="w-full"
+                                    disabled={adminThemeSaving}
+                                    onClick={() => void removeAdminTheme(themeOption)}
+                                  >
+                                    Remove
+                                  </Button>
+                                </div>
+                              </div>
+                            </form>
+                          )
+                        })()}
+                        {adminThemeManageError && <p role="alert" className="text-sm text-destructive">{adminThemeManageError}</p>}
+                        {adminThemeManageNotice && <p role="status" className="text-sm text-muted-foreground">{adminThemeManageNotice}</p>}
+                      </section>
+                    </TabsContent>
+                  )}
+                  {permission("admin_console") && (
+                    <TabsContent value="badges" className="mt-0 space-y-4 lg:flex-1 lg:min-h-0 lg:overflow-y-auto lg:pr-3">
+                      <details className="rounded-md border">
+                        <summary className="cursor-pointer px-3 py-2 text-sm font-semibold">Upload badge</summary>
+                        <form className="space-y-2 px-3 pb-3" onSubmit={(event) => void createAdminBadge(event)}>
+                          <Input
+                            value={adminBadgeName}
+                            onChange={(event) => setAdminBadgeName(event.target.value)}
+                            maxLength={120}
+                            placeholder="Badge Name"
+                            aria-label="Badge name"
+                            required
+                          />
+                          <div className="space-y-1">
+                            <div className="flex gap-2">
+                              <Input
+                                type="url"
+                                value={adminBadgeUrl}
+                                onChange={(event) => {
+                                  setAdminBadgeUrl(event.target.value)
+                                  if (event.target.value) setAdminBadgeFile(null)
+                                }}
+                                placeholder="URL..."
+                                className="h-7 flex-1 sm:h-8"
+                                aria-label="Badge image URL"
+                              />
+                              <div className="relative">
+                                <Input
+                                  type="file"
+                                  accept=".jpg,.jpeg,.png,.gif,image/jpeg,image/png,image/gif"
+                                  onChange={(event) => {
+                                    const file = event.target.files?.[0] ?? null
+                                    event.currentTarget.value = ""
+                                    setAdminBadgeFile(file)
+                                    if (file) setAdminBadgeUrl("")
+                                  }}
+                                  className="hidden"
+                                  id="admin-badge-file"
+                                  aria-label="Badge image file"
+                                />
+                                <Button type="button" variant="outline" size="icon" className="h-7 w-7 bg-transparent sm:h-8 sm:w-8" asChild>
+                                  <label htmlFor="admin-badge-file" className="flex cursor-pointer items-center justify-center">
+                                    <Upload className="h-3 w-3" />
+                                  </label>
+                                </Button>
+                              </div>
+                            </div>
+                            {adminBadgeFile && (
+                              <div className="flex min-w-0 items-center gap-2 text-xs">
+                                <p className="min-w-0 flex-1 truncate text-muted-foreground">{adminBadgeFile.name}</p>
+                                <Button
+                                  type="button"
+                                  variant="outline"
+                                  size="sm"
+                                  className="h-7 shrink-0 px-2 sm:h-8"
+                                  onClick={() => setAdminBadgeFile(null)}
+                                >
+                                  Clear file
+                                </Button>
+                              </div>
+                            )}
+                          </div>
+                          <Button type="submit" className="w-full" disabled={adminBadgeSaving}>
+                            {adminBadgeSaving ? "Uploading…" : "Upload badge"}
+                          </Button>
+                        </form>
+                      </details>
+
+                      <section className="space-y-2 rounded-md border p-3">
+                        <h3 className="text-sm font-semibold">Manage existing badges</h3>
+                        {adminBadgeError && <p role="alert" className="text-sm text-destructive">{adminBadgeError}</p>}
+                        {adminBadgeNotice && <p role="status" className="text-sm text-muted-foreground">{adminBadgeNotice}</p>}
+                        <form
+                          className="flex gap-2"
+                          onSubmit={(event) => {
+                            event.preventDefault()
+                            const match = adminBadges.find((badge) =>
+                              badge.name.trim().toLocaleLowerCase() === adminBadgeLookup.trim().toLocaleLowerCase(),
+                            )
+                            setSelectedAdminBadgeId(match?.asset_id ?? null)
+                            setAdminBadgeError(match ? "" : "No badge found with that name.")
+                          }}
+                        >
+                          <Input
+                            value={adminBadgeLookup}
+                            onChange={(event) => {
+                              setAdminBadgeLookup(event.target.value)
+                              setSelectedAdminBadgeId(null)
+                            }}
+                            placeholder="Badge Name"
+                            aria-label="Find badge by name"
+                          />
+                          <Button type="submit">Load</Button>
+                        </form>
+                        {!adminBadges.length && <p className="text-xs text-muted-foreground">No badges have been created.</p>}
+                      </section>
+                      {selectedAdminBadgeId && adminBadges.filter((badge) => badge.asset_id === selectedAdminBadgeId).map((badge) => (
+                        <section key={badge.asset_id} className="space-y-2 rounded-md border p-3">
+                          <div className="flex items-center gap-2">
+                            <img src={badge.url} alt="" className="h-8 w-8 object-contain" />
+                            <Input
+                              value={adminBadgeDrafts[badge.asset_id]?.name ?? badge.name}
+                              onChange={(event) => setAdminBadgeDrafts((current) => ({
+                                ...current,
+                                [badge.asset_id]: { name: event.target.value },
+                              }))}
+                              maxLength={120}
+                              placeholder="Badge Name"
+                              aria-label={`Edit ${badge.name} badge name`}
+                            />
+                          </div>
+                          <div className="space-y-1">
+                            <div className="flex gap-2">
+                              <Input
+                                type="url"
+                                value={adminBadgeReplacementUrls[badge.asset_id] ?? ""}
+                                onChange={(event) => {
+                                  setAdminBadgeReplacementUrls((current) => ({ ...current, [badge.asset_id]: event.target.value }))
+                                  if (event.target.value) setAdminBadgeReplacementFiles((current) => ({ ...current, [badge.asset_id]: null }))
+                                }}
+                                placeholder="URL..."
+                                className="h-7 flex-1 sm:h-8"
+                                aria-label={`Replace ${badge.name} image URL`}
+                              />
+                              <div className="relative">
+                                <Input
+                                  type="file"
+                                  accept=".jpg,.jpeg,.png,.gif,image/jpeg,image/png,image/gif"
+                                  onChange={(event) => {
+                                    const file = event.target.files?.[0] ?? null
+                                    event.currentTarget.value = ""
+                                    setAdminBadgeReplacementFiles((current) => ({ ...current, [badge.asset_id]: file }))
+                                    if (file) setAdminBadgeReplacementUrls((current) => ({ ...current, [badge.asset_id]: "" }))
+                                  }}
+                                  className="hidden"
+                                  id={`admin-badge-replacement-${badge.asset_id}`}
+                                  aria-label={`Replace ${badge.name} image file`}
+                                />
+                                <Button type="button" variant="outline" size="icon" className="h-7 w-7 bg-transparent sm:h-8 sm:w-8" asChild>
+                                  <label htmlFor={`admin-badge-replacement-${badge.asset_id}`} className="flex cursor-pointer items-center justify-center">
+                                    <Upload className="h-3 w-3" />
+                                  </label>
+                                </Button>
+                              </div>
+                            </div>
+                            {adminBadgeReplacementFiles[badge.asset_id] && (
+                              <div className="flex min-w-0 items-center gap-2 text-xs">
+                                <p className="min-w-0 flex-1 truncate text-muted-foreground">
+                                  {adminBadgeReplacementFiles[badge.asset_id]?.name}
+                                </p>
+                                <Button
+                                  type="button"
+                                  variant="outline"
+                                  size="sm"
+                                  className="h-7 shrink-0 px-2 sm:h-8"
+                                  onClick={() => setAdminBadgeReplacementFiles((current) => ({
+                                    ...current,
+                                    [badge.asset_id]: null,
+                                  }))}
+                                >
+                                  Clear file
+                                </Button>
+                              </div>
+                            )}
+                          </div>
+                          <div className="grid grid-cols-2 gap-2">
+                            <Button type="button" variant="outline" disabled={adminBadgeSaving} onClick={() => void saveAdminBadge(badge)}>
+                              Save changes
+                            </Button>
+                            <Button
+                              type="button"
+                              variant="destructive"
+                              disabled={adminBadgeSaving}
+                              onClick={() => void removeAdminBadge(badge)}
+                            >
+                              Remove
+                            </Button>
+                          </div>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            className="w-full"
+                            disabled={adminBadgeGranting}
+                            onClick={() => void grantBadgeOnline(badge)}
+                          >
+                            {adminBadgeGranting ? "Granting…" : "Grant to currently online users"}
+                          </Button>
+                        </section>
+                      ))}
+                    </TabsContent>
+                  )}
                 </Tabs>
               </CardContent>
             </Card>
@@ -3530,7 +5572,7 @@ if (!username) {
           )}
 
           {username && !isAdmin && (
-            <div className="order-4 md:order-4 lg:order-2">
+            <div className="relative z-10 order-4 md:order-4 lg:order-2">
               <Card className="card-hover flex flex-col h-auto max-h-[80dvh] overflow-hidden lg:h-[calc(100dvh_-_18rem)] lg:max-h-none lg:overflow-visible lg:!transition-[transform,box-shadow]">
                 <CardHeader className="pb-2 sm:pb-3 flex-shrink-0">
                   <CardTitle className="text-base sm:text-lg">Point Shop</CardTitle>
@@ -3542,18 +5584,21 @@ if (!username) {
                     onValueChange={(value) => setShopCategory(value as ShopCategory)}
                     className="flex h-full flex-col"
                   >
-                    <TabsList className="grid w-full grid-cols-3 mb-3 h-8 sm:h-10 flex-shrink-0">
+                    <TabsList data-columns="4" className="joined-tabs grid w-full grid-cols-4 mb-3 h-8 sm:h-10 flex-shrink-0">
                       <TabsTrigger value="emoji" className="gap-1 text-[10px] sm:text-xs px-1">
                         <Smile className="h-3 w-3" /> Emojis
                       </TabsTrigger>
                       <TabsTrigger value="sound" className="gap-1 text-[10px] sm:text-xs px-1">
                         <Volume2 className="h-3 w-3" /> Sounds
                       </TabsTrigger>
+                      <TabsTrigger value="theme" className="gap-1 text-[10px] sm:text-xs px-1">
+                        <Palette className="h-3 w-3" /> Themes
+                      </TabsTrigger>
                       <TabsTrigger value="add" className="gap-1 text-[10px] sm:text-xs px-1">
                         <Upload className="h-3 w-3" /> Add
                       </TabsTrigger>
                     </TabsList>
-                    {(["emoji", "sound", "add"] as const).map((category) => (
+                    {(["emoji", "sound", "theme", "add"] as const).map((category) => (
                       <TabsContent
                         key={category}
                         value={category}
@@ -3582,43 +5627,37 @@ if (!username) {
                                 return (
                                   <form
                                     key={assetType}
+                                    data-chaos-control-sizing
                                     className="space-y-2 rounded-md border p-3"
                                     autoComplete="off"
                                     onSubmit={(event) => void submitAssetProposal(event, assetType)}
                                   >
                                     <h3 className="text-sm font-semibold">{title}</h3>
-                                    <label className="block space-y-1 text-xs">
-                                      <span>Name</span>
+                                    <Input
+                                      value={draft.name}
+                                      onChange={(event) => setProposalDrafts((current) => ({
+                                        ...current,
+                                        [assetType]: { ...current[assetType], name: event.target.value },
+                                      }))}
+                                      maxLength={120}
+                                      placeholder={assetType === "emoji" ? "emojiname" : "Sound Name"}
+                                      aria-label={assetType === "emoji" ? "Emoji name" : "Sound name"}
+                                      required
+                                    />
+                                    {assetType === "sound" && (
                                       <Input
-                                        value={draft.name}
+                                        type="text"
+                                        inputMode="decimal"
+                                        value={draft.loudness}
                                         onChange={(event) => setProposalDrafts((current) => ({
                                           ...current,
-                                          [assetType]: { ...current[assetType], name: event.target.value },
+                                          sound: { ...current.sound, loudness: event.target.value },
                                         }))}
-                                        maxLength={120}
-                                        placeholder={assetType === "emoji" ? "emojiname" : "Sound Name"}
-                                        aria-label={assetType === "emoji" ? "Emoji name" : "Sound display name"}
-                                        required
+                                        placeholder="1.00"
+                                        aria-label="New sound loudness"
                                       />
-                                    </label>
-                                    {assetType === "sound" && (
-                                      <label className="block space-y-1 text-xs">
-                                        <span>Loudness (0–2x multiplier)</span>
-                                        <Input
-                                          type="text"
-                                          inputMode="decimal"
-                                          value={draft.loudness}
-                                          onChange={(event) => setProposalDrafts((current) => ({
-                                            ...current,
-                                            sound: { ...current.sound, loudness: event.target.value },
-                                          }))}
-                                          placeholder="1.00"
-                                          aria-label="New sound loudness"
-                                        />
-                                      </label>
                                     )}
-                                    <div className="space-y-1 text-xs">
-                                      <span>Upload {assetType} file or URL</span>
+                                    <div className="space-y-1">
                                       <div className="flex gap-2">
                                         <Input
                                           type="url"
@@ -3633,7 +5672,7 @@ if (!username) {
                                               setProposalFiles((current) => ({ ...current, [assetType]: null }))
                                             }
                                           }}
-                                          className="flex-1"
+                                          className="h-7 flex-1 sm:h-8"
                                           aria-label={`${assetType === "sound" ? "Sound" : "Emoji"} file URL`}
                                         />
                                         <div className="relative">
@@ -3642,6 +5681,7 @@ if (!username) {
                                             accept={assetType === "sound" ? ".mp3,audio/mpeg" : ".jpg,.jpeg,.png,.gif,image/jpeg,image/png,image/gif"}
                                             onChange={(event) => {
                                               const file = event.target.files?.[0] ?? null
+                                              event.currentTarget.value = ""
                                               setProposalFiles((current) => ({ ...current, [assetType]: file }))
                                               if (file) {
                                                 setProposalDrafts((current) => ({
@@ -3658,7 +5698,7 @@ if (!username) {
                                             type="button"
                                             variant="outline"
                                             size="icon"
-                                            className="h-8 w-8 bg-transparent"
+                                            className="h-7 w-7 bg-transparent sm:h-8 sm:w-8"
                                             asChild
                                           >
                                             <label htmlFor={`proposal-${assetType}-file`} className="flex cursor-pointer items-center justify-center">
@@ -3668,7 +5708,21 @@ if (!username) {
                                         </div>
                                       </div>
                                       {proposalFiles[assetType] && (
-                                        <p className="truncate text-muted-foreground">{proposalFiles[assetType]?.name}</p>
+                                        <div className="flex min-w-0 items-center gap-2 text-xs">
+                                          <p className="min-w-0 flex-1 truncate text-muted-foreground">{proposalFiles[assetType]?.name}</p>
+                                          <Button
+                                            type="button"
+                                            variant="outline"
+                                            size="sm"
+                                            className="h-7 shrink-0 px-2 sm:h-8"
+                                            onClick={() => setProposalFiles((current) => ({
+                                              ...current,
+                                              [assetType]: null,
+                                            }))}
+                                          >
+                                            Clear file
+                                          </Button>
+                                        </div>
                                       )}
                                     </div>
                                     <label className="flex items-center gap-2 text-xs">
@@ -3685,7 +5739,7 @@ if (!username) {
                                     <Button
                                       type="submit"
                                       disabled={proposalSaving !== null || submissionPrice === null || submissionPrice === -1}
-                                      className="mt-3 h-7 w-full text-xs sm:h-8 sm:text-sm disabled:grayscale"
+                                      className="mt-3 h-7 w-full text-xs disabled:grayscale sm:h-8 sm:text-sm"
                                     >
                                       {proposalSaving === assetType ? "Adding..." : submitText}
                                     </Button>
@@ -3697,13 +5751,20 @@ if (!username) {
                         ) : (
                           <div className="flex h-full flex-col gap-2">
                             <Input
-                              value={category === "emoji" ? emojiShopSearch : soundShopSearch}
+                              value={
+                                category === "emoji"
+                                  ? emojiShopSearch
+                                  : category === "sound"
+                                    ? soundShopSearch
+                                    : themeShopSearch
+                              }
                               onChange={(event) => {
                                 if (category === "emoji") setEmojiShopSearch(event.target.value)
-                                else setSoundShopSearch(event.target.value)
+                                else if (category === "sound") setSoundShopSearch(event.target.value)
+                                else setThemeShopSearch(event.target.value)
                               }}
-                              placeholder={`Search ${category === "sound" ? "sounds" : "emojis"}...`}
-                              aria-label={`Search shop ${category === "sound" ? "sounds" : "emojis"}`}
+                              placeholder={`Search ${category === "theme" ? "themes" : category === "sound" ? "sounds" : "emojis"}...`}
+                              aria-label={`Search shop ${category === "theme" ? "themes" : category === "sound" ? "sounds" : "emojis"}`}
                               className="h-7 flex-shrink-0 text-xs sm:h-8 sm:text-sm"
                             />
                             <ScrollArea className="min-h-0 flex-1 pr-2">
@@ -3715,63 +5776,82 @@ if (!username) {
                               {!shopLoading && filteredShopAssets(category).length === 0 && (
                                 <p className="py-4 text-center text-xs text-muted-foreground">
                                   {shopAssets[category].length === 0
-                                    ? `No ${category === "sound" ? "sounds" : "emojis"} available.`
-                                    : `No ${category === "sound" ? "sounds" : "emojis"} match your search.`}
+                                    ? `No ${category === "theme" ? "themes" : category === "sound" ? "sounds" : "emojis"} available.`
+                                    : `No ${category === "theme" ? "themes" : category === "sound" ? "sounds" : "emojis"} match your search.`}
                                 </p>
                               )}
                               <div className="space-y-2" data-testid={`shop-${category}-items`}>
-                                {filteredShopAssets(category).map((asset) => (
-                                <div
-                                  key={asset.asset_id}
-                                  className="flex items-center gap-2 rounded-md border p-2"
-                                >
-                                  {category === "emoji" ? (
-                                    <img
-                                      src={asset.url}
-                                      alt={asset.name}
-                                      className="h-8 w-8 flex-shrink-0 object-contain"
-                                    />
-                                  ) : (
-                                    <Button
-                                      type="button"
-                                      size="icon"
-                                      variant="outline"
-                                      aria-label={`Preview ${asset.title || asset.name}`}
-                                      onClick={() => previewShopSound(asset)}
-                                      className="h-8 w-8 flex-shrink-0"
+                                {filteredShopAssets(category).map((asset) => {
+                                  const themeOption = category === "theme"
+                                    ? shopAssets.theme.find((option) => option.asset_id === asset.asset_id)
+                                    : undefined
+                                  return (
+                                    <div
+                                      key={asset.asset_id}
+                                      className="flex items-center gap-2 rounded-md border p-2"
                                     >
-                                      <Volume2 className="h-3 w-3" />
-                                    </Button>
-                                  )}
-                                  <div className="min-w-0 flex-1">
-                                    <p className="truncate text-xs font-medium">
-                                      {asset.title || asset.name}
-                                    </p>
-                                    <p className="text-[10px] text-muted-foreground">
-                                      {asset.status === "owned"
-                                        ? "Owned"
-                                        : asset.status === "unavailable"
-                                          ? "Unavailable"
-                                          : `${asset.price}❖`}
-                                    </p>
-                                  </div>
-                                  {asset.status === "available" && (
-                                    <Button
-                                      type="button"
-                                      size="sm"
-                                      disabled={
-                                        purchasingAssetId === asset.asset_id
-                                        || currentPoints === null
-                                        || currentPoints < asset.price
-                                      }
-                                      onClick={() => void purchaseShopAsset(category, asset)}
-                                      className="h-7 px-2 text-[10px] sm:text-xs"
-                                    >
-                                      {purchasingAssetId === asset.asset_id ? "Buying..." : "Buy"}
-                                    </Button>
-                                  )}
-                                </div>
-                                ))}
+                                      {category === "emoji" ? (
+                                        <img
+                                          src={asset.url}
+                                          alt={asset.name}
+                                          className="h-8 w-8 flex-shrink-0 object-contain"
+                                        />
+                                      ) : themeOption ? (
+                                        <Button
+                                          type="button"
+                                          size="icon"
+                                          variant="ghost"
+                                          aria-label={`Preview ${themeOption.name} theme`}
+                                          onClick={() => {
+                                            clearAdminThemePreview()
+                                            setShopThemePreview({ ...themeOption })
+                                          }}
+                                          className="h-8 w-8 flex-shrink-0 p-0"
+                                        >
+                                          {renderThemeSwatch(themeOption, "h-8 w-8", "rounded-sm border")}
+                                        </Button>
+                                      ) : (
+                                        <Button
+                                          type="button"
+                                          size="icon"
+                                          variant="outline"
+                                          aria-label={`Preview ${asset.title || asset.name}`}
+                                          onClick={() => previewShopSound(asset)}
+                                          className="h-8 w-8 flex-shrink-0"
+                                        >
+                                          <Volume2 className="h-3 w-3" />
+                                        </Button>
+                                      )}
+                                      <div className="min-w-0 flex-1">
+                                        <p className="truncate text-xs font-medium">
+                                          {asset.title || asset.name}
+                                        </p>
+                                        <p className="text-[10px] text-muted-foreground">
+                                          {asset.status === "owned"
+                                            ? "Owned"
+                                            : asset.status === "unavailable"
+                                              ? "Unavailable"
+                                              : `${asset.price}❖`}
+                                        </p>
+                                      </div>
+                                      {asset.status === "available" && (
+                                        <Button
+                                          type="button"
+                                          size="sm"
+                                          disabled={
+                                            purchasingAssetId === asset.asset_id
+                                            || currentPoints === null
+                                            || currentPoints < asset.price
+                                          }
+                                          onClick={() => void purchaseShopAsset(category, asset)}
+                                          className="h-7 px-2 text-[10px] sm:text-xs"
+                                        >
+                                          {purchasingAssetId === asset.asset_id ? "Buying..." : "Buy"}
+                                        </Button>
+                                      )}
+                                    </div>
+                                  )
+                                })}
                               </div>
                             </ScrollArea>
                           </div>
@@ -3787,18 +5867,38 @@ if (!username) {
           )}
 
           {/* --- Right Column: Chat + Online Users --- */}
-          <div className="order-2 md:order-2 lg:order-4 flex flex-col gap-3 sm:gap-4 lg:h-[calc(100dvh_-_18rem)]">
-            <Card className="card-hover flex max-h-[80dvh] flex-col overflow-hidden lg:flex-1 lg:min-h-0 lg:max-h-none lg:!transition-[transform,box-shadow]">
+          <div data-chat-panel className="relative z-10 order-2 md:order-2 lg:order-4 flex flex-col gap-3 sm:gap-4 lg:h-[calc(100dvh_-_18rem)]">
+            <Card data-chat-card className="card-hover flex max-h-[80dvh] flex-col overflow-hidden lg:flex-1 lg:min-h-0 lg:max-h-none lg:!transition-[transform,box-shadow]">
               <CardHeader className="flex flex-row items-center justify-between pb-1 sm:pb-2 flex-shrink-0">
-                <CardTitle className="flex items-center gap-2 text-base sm:text-lg">
+                <CardTitle className={`flex items-center gap-2 ${isChatOnly ? "text-lg" : "text-base sm:text-lg"}`}>
                   <MessageSquare className="h-3 w-3 sm:h-4 sm:w-4 text-primary" /> Chat
                 </CardTitle>
-                <span className="flex items-center gap-2 text-xs text-muted-foreground" title={isStreaming ? "Streaming on" : "Streaming off"}>
-                  <span className={`h-2.5 w-2.5 rounded-full ${isStreaming ? "bg-green-500 shadow-[0_0_8px_2px_rgba(34,197,94,0.75)]" : "bg-red-500"}`} />
-                  <span className="sr-only">{isStreaming ? "Streaming on" : "Streaming off"}</span>
-                </span>
+                <div className="flex items-center gap-2">
+                  {!isChatOnly && (
+                    <Button
+                      type="button"
+                      size="icon"
+                      variant="ghost"
+                      className="h-7 w-7"
+                      aria-label="Open chat in a separate window"
+                      title="Open chat in a separate window"
+                      onClick={openChatWindow}
+                    >
+                      <ExternalLink className="h-3.5 w-3.5" />
+                    </Button>
+                  )}
+                  <span className="flex items-center gap-2 text-xs text-muted-foreground" title={isStreaming ? "Streaming on" : "Streaming off"}>
+                    <span className={`h-2.5 w-2.5 rounded-full ${isStreaming ? "bg-green-500 shadow-[0_0_8px_2px_rgba(34,197,94,0.75)]" : "bg-red-500"}`} />
+                    <span className="sr-only">{isStreaming ? "Streaming on" : "Streaming off"}</span>
+                  </span>
+                </div>
               </CardHeader>
               <CardContent className="flex min-h-0 flex-1 flex-col space-y-2 overflow-hidden p-3 sm:p-4 lg:max-h-full">
+                {chatPopoutBlocked && !isChatOnly && (
+                  <p role="status" className="text-xs text-muted-foreground">
+                    Pop-up blocked. <a href="/chat" className="underline">Open chat page</a>
+                  </p>
+                )}
                 <div
 			  className="min-h-0 flex-1 overflow-y-auto pr-2"
 			  ref={chatBoxRef}
@@ -3807,12 +5907,28 @@ if (!username) {
 			  <div className="space-y-1.5 sm:space-y-2">
 				{Array.isArray(chatMessages) && chatMessages.length > 0 ? (
 				  [...chatMessages].map((msg, idx) => {
+					if (msg.system) {
+					  return (
+						<div
+						  key={msg.id || idx}
+						  className={`rounded px-1 py-0.5 leading-tight sm:px-1.5 sm:py-0.5 ${isChatOnly ? "text-[13px]" : "text-[10px] sm:text-[13px]"}`}
+						  style={{
+                backgroundColor: "var(--chat-system-message-background)",
+                color: "var(--chat-system-message-foreground)",
+              }}
+						>
+						  {msg.actor && <span>{msg.actor}: </span>}
+						  <span className="break-words">{msg.message}</span>
+						</div>
+					  )
+					}
+
 					const isMentioned = new RegExp(`@${username}\\b`, "i").test(msg.message)
 
 					return (
 					  <div
 						key={idx} // Add stable key
-						className={`group text-[11px] sm:text-sm p-1.5 sm:p-2 rounded flex items-start justify-between gap-2 ${
+						className={`group ${isChatOnly ? "text-sm" : "text-[11px] sm:text-sm"} p-1.5 sm:p-2 rounded flex items-start justify-between gap-2 ${
 						  isMentioned ? "mention-highlight-self" : ""
 						}`}
 					  >
@@ -3823,8 +5939,17 @@ if (!username) {
                 onMouseLeave={() => setHoveredChatMessage(null)}
               >
                 <span style={{ color: msg.rank_color ?? undefined }} className="font-semibold">
-                  {msg.user}:
+                  {msg.user}
                 </span>
+                {msg.badge && (
+                  <img
+                    src={msg.badge.url}
+                    alt=""
+                    title={msg.badge.name}
+                    className="mx-0.5 inline-block h-3.5 w-3.5 align-[-2px] object-contain"
+                  />
+                )}
+                <span>:</span>
                 <span className={`absolute bottom-full left-0 z-20 inline-flex items-baseline gap-1 whitespace-nowrap ${hoveredChatMessage === idx ? "pointer-events-auto" : "pointer-events-none"}`}>
                   <Button
                     type="button"
@@ -3848,7 +5973,9 @@ if (!username) {
                   )}
                 </span>
               </span>{" "}
-						  <span className="text-foreground break-words">{renderMessageWithEmojis(msg.message, msg.literal_emojis, msg.user)}</span>
+						  <span className="break-words" style={{ color: "var(--card-foreground)" }}>
+                {renderMessageWithEmojis(msg.message, msg.literal_emojis, msg.user)}
+              </span>
 						</div>
 
             {msg.id && (
@@ -3876,9 +6003,16 @@ if (!username) {
                   disabled={isChatRestricted}
                   className={`flex flex-col gap-2 border-0 p-0 ${isChatRestricted ? "opacity-50 grayscale pointer-events-none" : ""}`}
                 >
-                  {showEmojiPanel && (
-                    <div className="relative">
-                      <Card className="absolute bottom-full left-0 right-0 mb-2 z-10 gap-0 py-1">
+                  <div className="relative">
+                    <Card
+                      aria-hidden={!showEmojiPanel}
+                      inert={!showEmojiPanel}
+                      className={`absolute bottom-full left-0 right-0 z-10 mb-2 gap-0 py-1 origin-bottom transition-all duration-200 ease-out motion-reduce:transition-none ${
+                        showEmojiPanel
+                          ? "visible translate-y-0 opacity-100"
+                          : "invisible translate-y-2 opacity-0"
+                      }`}
+                    >
                         <CardContent className="p-2">
                           <div className="flex items-center justify-between mb-2">
                             <span className="text-xs font-medium">Emojis (A-Z)</span>
@@ -3922,9 +6056,8 @@ if (!username) {
 
 
                         </CardContent>
-                      </Card>
-                    </div>
-                  )}
+                    </Card>
+                  </div>
 
                 <div className="flex gap-2">
                   <Button
@@ -3949,7 +6082,7 @@ if (!username) {
                     placeholder="Type a message..."
                     maxLength={100}
                     disabled={isChatRestricted}
-                    className="flex-1 h-7 sm:h-8 text-xs sm:text-sm"
+                    className={`flex-1 h-7 sm:h-8 ${isChatOnly ? "text-sm" : "text-xs sm:text-sm"}`}
                   />
                   <Button disabled={isChatRestricted} onClick={sendChatMessage} size="icon" className="h-7 w-7 sm:h-8 sm:w-8">
                     <Send className="h-3 w-3" />
@@ -3960,8 +6093,214 @@ if (!username) {
               </CardContent>
             </Card>
 
+            {username && !isChatOnly && (
+              <Card
+                data-user-info-panel
+                onTransitionEnd={(event) => {
+                  if (event.target !== event.currentTarget || event.propertyName !== "height") return
+                  const content = event.currentTarget.querySelector<HTMLElement>("[data-user-info-content]")
+                  if (content) content.style.overflowY = "auto"
+                  if (!showUserInfoPanel || !window.matchMedia("(min-width: 1024px)").matches) {
+                    event.currentTarget.style.height = "auto"
+                  }
+                }}
+                className={`card-hover flex flex-col gap-0 overflow-hidden transition-[height,transform,box-shadow] duration-300 ease-in-out motion-reduce:transition-none lg:flex-shrink-0 lg:!transition-[height,transform,box-shadow] ${
+                  showUserInfoPanel ? "lg:max-h-[calc(100dvh_-_28rem)]" : ""
+                }`}
+              >
+                <CardHeader
+                  className="flex cursor-pointer flex-row items-center justify-between py-2 sm:py-3 flex-shrink-0"
+                  role="button"
+                  tabIndex={0}
+                  aria-expanded={showUserInfoPanel}
+                  aria-label={showUserInfoPanel ? "Collapse account information" : "Expand account information"}
+                  onClick={toggleUserInfoPanel}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault()
+                      toggleUserInfoPanel()
+                    }
+                  }}
+                >
+                  <div className="flex min-w-0 items-center gap-2">
+                    <Users className="h-3 w-3 sm:h-4 sm:w-4 text-primary" />
+                    <CardTitle className="truncate text-xs sm:text-sm">
+                      Account information
+                    </CardTitle>
+                  </div>
+                  <span className="flex h-5 w-5 items-center justify-center sm:h-6 sm:w-6" aria-hidden="true">
+                    {showUserInfoPanel
+                      ? <ChevronDown className="h-2.5 w-2.5 sm:h-3 sm:w-3" />
+                      : <ChevronUp className="h-2.5 w-2.5 sm:h-3 sm:w-3" />}
+                  </span>
+                </CardHeader>
+                <div
+                  ref={userInfoPanelBodyRef}
+                  aria-hidden={!showUserInfoPanel}
+                  inert={!showUserInfoPanel}
+                  onTransitionEnd={(event) => {
+                    if (event.target === event.currentTarget && event.propertyName === "height" && showUserInfoPanel && !window.matchMedia("(min-width: 1024px)").matches) {
+                      event.currentTarget.style.height = "auto"
+                    }
+                  }}
+                  className="min-h-0 overflow-hidden transition-[height] duration-300 ease-in-out motion-reduce:transition-none lg:flex-none"
+                  style={{ height: 0 }}
+                >
+                  <div className="flex h-full min-h-0 flex-col overflow-hidden">
+                  <CardContent
+                    data-user-info-content
+                    className="min-h-0 space-y-3 overflow-y-auto p-3 pt-6 text-xs sm:p-4 sm:pt-6 lg:flex-1"
+                  >
+                    {userInfoLoading && <p role="status">Loading profile…</p>}
+                    {userInfoError && <p role="alert" className="text-destructive">{userInfoError}</p>}
+                    {userInfo && (
+                      <>
+                        <details>
+                          <summary className="cursor-pointer font-medium">{userInfo.username}</summary>
+                          <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1">
+                            <dt className="text-muted-foreground">Rank</dt>
+                            <dd>{userInfo.rank}</dd>
+                            <dt className="text-muted-foreground">Messages</dt>
+                            <dd>{userInfo.message_count}</dd>
+                            <dt className="text-muted-foreground">Email</dt>
+                            <dd className="break-all">{userInfo.email || "Not set"}</dd>
+                            <dt className="text-muted-foreground">Ban status</dt>
+                            <dd>{userInfo.banned ? "Banned" : "Not banned"}</dd>
+                            <dt className="text-muted-foreground">Chat timeout</dt>
+                            <dd>
+                              {userInfo.chat_timeout_until && isActiveTimeout(userInfo.chat_timeout_until)
+                                ? new Date(userInfo.chat_timeout_until).toLocaleString()
+                                : "None"}
+                            </dd>
+                            <dt className="text-muted-foreground">Points</dt>
+                            <dd>{userInfo.points}❖</dd>
+                          </dl>
+                        </details>
+
+                        <details
+                          className="border-t pt-2"
+                          onToggle={(event) => {
+                            if (event.currentTarget.open) {
+                              setUserBadgeSelection(userInfo.visible_badge_id ?? "")
+                            }
+                          }}
+                        >
+                          <summary className="cursor-pointer font-medium">Badges</summary>
+                          <div className="space-y-2 pt-2">
+                            <div className="flex flex-wrap gap-2">
+                              {userInfo.badges.length ? (
+                                userInfo.badges.map((badge) => (
+                                  <button
+                                    key={badge.asset_id}
+                                    type="button"
+                                    className={`flex h-8 w-8 items-center justify-center rounded border p-1 ${
+                                      userInfo.username === username && userBadgeSelection === badge.asset_id
+                                        ? "border-primary"
+                                        : "border-border"
+                                    }`}
+                                    aria-pressed={userInfo.username === username && userBadgeSelection === badge.asset_id}
+                                    disabled={userInfo.username !== username}
+                                    onClick={() => {
+                                      setUserBadgeSelection(badge.asset_id)
+                                    }}
+                                    title={badge.name}
+                                    aria-label={badge.name}
+                                  >
+                                    <img src={badge.url} alt="" className="h-full w-full object-contain" />
+                                  </button>
+                                ))
+                              ) : (
+                                <p className="basis-full text-muted-foreground">No badges yet.</p>
+                              )}
+                              {userInfo.username === username && (
+                                <Button
+                                  type="button"
+                                  variant="outline"
+                                  size="icon"
+                                  className={`h-8 w-8 p-1 ${!userBadgeSelection ? "border-primary dark:border-primary" : "border-border"}`}
+                                  aria-pressed={!userBadgeSelection}
+                                  aria-label="No badge"
+                                  onClick={() => {
+                                    setUserBadgeSelection("")
+                                  }}
+                                >
+                                  <X className="h-4 w-4" />
+                                </Button>
+                              )}
+                              <p className="basis-full">
+                                {userBadgeSelection
+                                  ? userInfo.badges.find((badge) => badge.asset_id === userBadgeSelection)?.name ?? "No badge"
+                                  : "No badge"}
+                              </p>
+                            </div>
+                            {userInfo.username === username && (
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                className="h-7 w-full px-2 text-[10px]"
+                                disabled={userBadgeSaving || userBadgeSelection === (userInfo.visible_badge_id ?? "")}
+                                onClick={() => void saveUserBadgeSelection()}
+                              >
+                                {userBadgeSaving ? "Saving…" : "Save visible badge"}
+                              </Button>
+                            )}
+                          </div>
+                        </details>
+
+                        {userInfo.username === username && (
+                          <details className="border-t pt-2">
+                            <summary className="cursor-pointer font-medium">Account recovery</summary>
+                            <div className="space-y-2 pt-2">
+                            <div className="flex flex-wrap gap-2">
+                              <Button type="button" variant="outline" size="sm" onClick={() => void issueUserRecoveryCode("password")}>
+                                Reset password
+                              </Button>
+                              <Button type="button" variant="outline" size="sm" onClick={() => void issueUserRecoveryCode("email")}>
+                                Reset email
+                              </Button>
+                            </div>
+                            {userRecoveryNotice && <p role="status" className="text-muted-foreground">{userRecoveryNotice}</p>}
+                            {userRecoveryError && <p role="alert" className="text-destructive">{userRecoveryError}</p>}
+                            {userRecoveryToken && (
+                              <p className="break-all text-sm text-muted-foreground">
+                                Recovery code:{" "}
+                                <code
+                                  className="select-all cursor-pointer"
+                                  role="button"
+                                  tabIndex={0}
+                                  aria-label="Copy one-time account recovery code"
+                                  onClick={() => void copyRecoveryCode(userRecoveryToken, setUserRecoveryCopyNotice, setUserRecoveryError)}
+                                  onKeyDown={(event) => {
+                                    if (event.key === "Enter" || event.key === " ") {
+                                      event.preventDefault()
+                                      void copyRecoveryCode(userRecoveryToken, setUserRecoveryCopyNotice, setUserRecoveryError)
+                                    }
+                                  }}
+                                >
+                                  {userRecoveryToken}
+                                </code>
+                              </p>
+                            )}
+                            {userRecoveryToken && (
+                              <>
+                                <p className="text-sm text-muted-foreground">After copying the recovery code, log out and press &quot;Account recovery&quot; button.</p>
+                                {userRecoveryCopyNotice && <p role="status" className="text-sm text-muted-foreground">{userRecoveryCopyNotice}</p>}
+                              </>
+                            )}
+                            </div>
+                          </details>
+                        )}
+                      </>
+                    )}
+                  </CardContent>
+                  </div>
+                </div>
+              </Card>
+            )}
+
             {/* Online Users */}
-            <Card className="card-hover flex flex-col lg:flex-shrink-0 lg:max-h-[250px] lg:!transition-[transform,box-shadow]">
+            <Card data-online-users className="card-hover flex flex-col gap-0 transition-all duration-200 ease-in-out motion-reduce:!transition-none lg:flex-shrink-0 lg:max-h-[250px] lg:!transition-all">
               <CardHeader
                 className="flex flex-row items-center justify-between pb-2 sm:pb-3 cursor-pointer py-2 sm:py-3 flex-shrink-0"
                 onClick={() => setShowOnlineList(!showOnlineList)}
@@ -3970,7 +6309,13 @@ if (!username) {
                   <Users className="h-3 w-3 sm:h-4 sm:w-4 text-primary" />
                   <CardTitle className="text-xs sm:text-sm">Online {onlineUsers.length}</CardTitle>
                 </div>
-                <Button variant="ghost" size="icon" className="h-5 w-5 sm:h-6 sm:w-6">
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-5 w-5 sm:h-6 sm:w-6"
+                  aria-label={showOnlineList ? "Collapse online users" : "Expand online users"}
+                  aria-expanded={showOnlineList}
+                >
                   {showOnlineList ? (
                     <ChevronDown className="h-2.5 w-2.5 sm:h-3 sm:w-3" />
                   ) : (
@@ -3978,9 +6323,19 @@ if (!username) {
                   )}
                 </Button>
               </CardHeader>
-              {showOnlineList && (
-                <CardContent className="pt-0 p-3 sm:p-6 lg:flex-1 lg:min-h-0 lg:overflow-hidden">
-                  <div className="pr-2 lg:h-full lg:max-h-[180px] lg:overflow-y-auto">
+              <div
+                aria-hidden={!showOnlineList}
+                inert={!showOnlineList}
+                className="grid min-h-0 overflow-hidden transition-all duration-200 ease-in-out motion-reduce:transition-none lg:flex-1"
+                style={{ gridTemplateRows: showOnlineList ? "1fr" : "0fr" }}
+              >
+                <div className="flex min-h-0 flex-col overflow-hidden">
+                <CardContent className="pt-6 p-3 sm:p-6 lg:flex-1 lg:min-h-0 lg:overflow-hidden">
+                  <div
+                    ref={onlineUsersScrollRef}
+                    data-online-users-scroll
+                    className="pr-2 lg:h-full lg:max-h-[180px] lg:overflow-y-auto"
+                  >
                     <div className="flex flex-wrap gap-1 sm:gap-1.5">
                       {onlineUsers.map((user, idx) => (
                         <Badge
@@ -4001,7 +6356,8 @@ if (!username) {
                     </div>
                   </div>
                 </CardContent>
-              )}
+                </div>
+              </div>
             </Card>
           </div>
         </div>

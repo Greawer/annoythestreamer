@@ -20,9 +20,11 @@ from client import (
     colpricing,
     colsounds,
     colemojis,
+    colthemes,
     colassetownership,
     colshoppurchases,
     colsoundfavorites,
+    colbadges,
     lastfacememe,
     lastnormalmeme,
 )
@@ -56,13 +58,61 @@ ACTION_COSTS = {
     'tts': 5,
 }
 MAX_POINT_PRICE = 9_007_199_254_740_991
+MAX_THEME_BACKGROUND_BYTES = 50 * 1024 * 1024
+MAX_THEME_BACKGROUND_REQUEST_BYTES = MAX_THEME_BACKGROUND_BYTES + 1024 * 1024
 PASSWORD_RESET_TOKEN_TTL = timedelta(minutes=30)
+STANDARD_THEME_ID = ObjectId('65f0a0000000000000000001')
+DEFAULT_THEMES = (
+    {
+        '_id': STANDARD_THEME_ID,
+        'name': 'Standard',
+        'name_key': 'standard',
+        'price': 0,
+        'price_overridden': False,
+        'primary_color': '#000000',
+        'panel_color': '#171717',
+        'accent_color': '#f9a8d4',
+        'background_image_exists': False,
+        'background_opacity': 0.0,
+        'background_image_name': None,
+        'is_standard': True,
+    },
+    {
+        '_id': ObjectId('65f0a0000000000000000002'),
+        'name': 'Ocean',
+        'name_key': 'ocean',
+        'price': 10_000,
+        'price_overridden': False,
+        'primary_color': '#38bdf8',
+        'panel_color': '#0f172a',
+        'accent_color': '#14b8a6',
+        'background_image_exists': False,
+        'background_opacity': 0.0,
+        'background_image_name': None,
+        'is_standard': False,
+    },
+    {
+        '_id': ObjectId('65f0a0000000000000000003'),
+        'name': 'Sunset',
+        'name_key': 'sunset',
+        'price': 10_000,
+        'price_overridden': False,
+        'primary_color': '#fb923c',
+        'panel_color': '#1c1917',
+        'accent_color': '#f43f5e',
+        'background_image_exists': False,
+        'background_opacity': 0.0,
+        'background_image_name': None,
+        'is_standard': False,
+    },
+)
 ASSET_PRICE_UNCHANGED = object()
 POINT_PRICING_ID = 'point_pricing'
 DEFAULT_POINT_PRICING = {
     'send_your_chaos': dict(ACTION_COSTS),
     'catalog': {
         'emoji': {'default': 100, 'categories': {}, 'items': {}},
+        'theme': {'default': 10_000, 'categories': {}, 'items': {}},
         'sound': {
             'default': 100,
             'categories': {},
@@ -85,6 +135,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PUBLIC_DIR = os.path.abspath(os.path.join(BASE_DIR, '..', 'public'))
 SOUNDDIR = os.path.join(PUBLIC_DIR, 'sounds', 'soundboard')
 EMOJIDIR = os.path.join(PUBLIC_DIR, 'img', 'emoji')
+BADGEDIR = os.path.join(PUBLIC_DIR, 'img', 'badges')
 onlineusers = set()  # GLOBAL FIXED
 socket_users = {}  # sid -> {'user_id': str, 'username': str}, verified at connect
 
@@ -134,6 +185,48 @@ def serialize_user(user):
         'registered_at': registered_at.isoformat() if hasattr(registered_at, 'isoformat') else registered_at,
         'message_count': colchat.count_documents({'user': user.get('username', '')}),
     }
+
+
+def serialize_badge(badge):
+    if not isinstance(badge, dict) or not isinstance(badge.get('file'), str):
+        return None
+    return {
+        'asset_id': str(badge['_id']),
+        'name': badge.get('name', ''),
+        'file': badge['file'],
+        'url': f"/static/img/badges/{badge['file']}",
+    }
+
+
+def user_badges(user):
+    badge_ids = user.get('badges', [])
+    if not isinstance(badge_ids, list):
+        return []
+    result = []
+    for badge_id in badge_ids:
+        try:
+            badge_oid = badge_id if isinstance(badge_id, ObjectId) else ObjectId(str(badge_id))
+        except Exception:
+            continue
+        badge = colbadges.find_one({'_id': badge_oid})
+        serialized = serialize_badge(badge)
+        if serialized:
+            result.append(serialized)
+    return result
+
+
+def serialize_user_profile(user):
+    profile = serialize_user(user)
+    profile.update({
+        'email': user.get('email') if isinstance(user.get('email'), str) else None,
+        'badges': user_badges(user),
+        'visible_badge_id': (
+            str(user['visible_badge_id'])
+            if user.get('visible_badge_id') is not None
+            else None
+        ),
+    })
+    return profile
 
 
 def active_chat_timeout_until(user, now=None):
@@ -366,8 +459,8 @@ def validate_point_pricing(value):
     }
 
     catalog = value['catalog']
-    if not isinstance(catalog, dict) or set(catalog) != {'emoji', 'sound'}:
-        raise ValueError('Catalog pricing must include emoji and sound')
+    if not isinstance(catalog, dict) or set(catalog) != {'emoji', 'sound', 'theme'}:
+        raise ValueError('Catalog pricing must include emoji, sound, and theme')
     normalized_catalog = {}
     for asset_type, asset_prices in catalog.items():
         required_fields = {'default', 'categories', 'items'}
@@ -458,12 +551,25 @@ def load_point_pricing():
     if document is None:
         return copy.deepcopy(DEFAULT_POINT_PRICING)
     pricing = document.get('pricing')
+    legacy_missing_theme = (
+        isinstance(pricing, dict)
+        and isinstance(pricing.get('catalog'), dict)
+        and 'theme' not in pricing['catalog']
+    )
+    if legacy_missing_theme:
+        pricing = copy.deepcopy(pricing)
+        pricing.setdefault('catalog', {})['theme'] = copy.deepcopy(DEFAULT_POINT_PRICING['catalog']['theme'])
     try:
         normalized = validate_point_pricing(pricing)
     except ValueError as error:
         logger.error('Stored point pricing is invalid: %s', error)
         raise ValueError('Stored point pricing is invalid; an administrator must correct it') from error
     if isinstance(pricing, dict):
+        if legacy_missing_theme:
+            colpricing.update_one(
+                {'_id': POINT_PRICING_ID, 'pricing.catalog.theme': {'$exists': False}},
+                {'$set': {'pricing.catalog.theme': normalized['catalog']['theme']}},
+            )
         if 'asset_limits' not in pricing:
             colpricing.update_one(
                 {'_id': POINT_PRICING_ID, 'pricing.asset_limits': {'$exists': False}},
@@ -496,7 +602,25 @@ def load_point_pricing():
     return normalized
 
 
+def sync_theme_price_fields(pricing):
+    theme_prices = pricing['catalog']['theme']
+    for theme in colthemes.find({}):
+        if theme.get('is_standard') is True:
+            price = 0
+            overridden = False
+        else:
+            theme_id = str(theme['_id'])
+            overridden = theme_id in theme_prices['items']
+            price = theme_prices['items'].get(theme_id, theme_prices['default'])
+        colthemes.update_one(
+            {'_id': theme['_id']},
+            {'$set': {'price': price, 'price_overridden': overridden}},
+        )
+
+
 def resolve_catalog_asset_price(asset_type, asset, pricing=None):
+    if asset_type == 'theme' and asset.get('is_standard') is True:
+        return 0
     if asset.get('exclusive') is True:
         return -1
     settings = pricing if pricing is not None else load_point_pricing()
@@ -527,6 +651,8 @@ def resolve_sound_play_price(asset, pricing):
 def catalog_asset_exception_key(asset_type, asset, pricing, map_name='items'):
     asset_pricing = pricing['catalog'][asset_type]
     candidates = []
+    if asset_type == 'theme':
+        candidates.append(str(asset['_id']))
     filename = asset.get('file')
     if asset_type == 'sound' and isinstance(filename, str):
         candidates.extend((filename, os.path.splitext(filename)[0]))
@@ -559,6 +685,8 @@ def asset_collection(asset_type):
         return colsounds
     if asset_type == 'emoji':
         return colemojis
+    if asset_type == 'theme':
+        return colthemes
     raise ValueError(f'Unsupported asset type: {asset_type}')
 
 
@@ -569,6 +697,12 @@ def normalize_asset_name(value):
     if not name or len(name) > 80:
         raise ValueError('Asset name must contain 1 to 80 letters or numbers')
     return name
+
+
+def normalize_theme_color(value, label):
+    if not isinstance(value, str) or not re.fullmatch(r'#[0-9a-fA-F]{6}', value.strip()):
+        raise ValueError(f'{label} must be a 6-digit hex color')
+    return value.strip().lower()
 
 
 def parse_asset_price(value):
@@ -591,10 +725,14 @@ def parse_play_price(value):
     return validate_play_price(value, 'Play price')
 
 
-def inspect_emoji_file(path):
+def inspect_emoji_file(
+    path,
+    max_file_size=16 * 1024 * 1024,
+    max_file_size_message='Emoji files must be no larger than 16 MB',
+):
     size = os.path.getsize(path)
-    if size > 16 * 1024 * 1024:
-        raise ValueError('Emoji files must be no larger than 16 MB')
+    if max_file_size is not None and size > max_file_size:
+        raise ValueError(max_file_size_message)
     with open(path, 'rb') as image:
         header = image.read(32)
         if header.startswith(b'\x89PNG\r\n\x1a\n') and len(header) >= 24:
@@ -633,7 +771,15 @@ def inspect_emoji_file(path):
     raise ValueError('Emoji must be a valid JPG, PNG, or GIF image')
 
 
-def validate_uploaded_asset(upload, asset_type, directory, maximum=None):
+def validate_uploaded_asset(
+    upload,
+    asset_type,
+    directory,
+    maximum=None,
+    max_file_size=16 * 1024 * 1024,
+    max_file_size_message='Emoji files must be no larger than 16 MB',
+    dimension_label='Emoji',
+):
     if not upload or not upload.filename:
         raise ValueError('Choose a file to upload')
     if maximum is None:
@@ -659,9 +805,15 @@ def validate_uploaded_asset(upload, asset_type, directory, maximum=None):
                 raise ValueError(f'Sound uploads must be valid MP3 audio no longer than {maximum} seconds')
             return temporary_path, 'mp3'
 
-        extension, width, height = inspect_emoji_file(temporary_path)
-        if not 0 < width <= maximum or not 0 < height <= maximum:
-            raise ValueError(f'Emoji dimensions must not exceed {maximum} by {maximum} pixels')
+        extension, width, height = inspect_emoji_file(
+            temporary_path,
+            max_file_size,
+            max_file_size_message,
+        )
+        if width <= 0 or height <= 0:
+            raise ValueError('Image dimensions must be positive')
+        if width > maximum or height > maximum:
+            raise ValueError(f'{dimension_label} dimensions must not exceed {maximum} by {maximum} pixels')
         return temporary_path, extension
     except Exception:
         if os.path.exists(temporary_path):
@@ -683,7 +835,7 @@ def connect_admin_asset_address(address_info, timeout, source_address, context, 
         raise
 
 
-def fetch_admin_asset_url(source_url, asset_type):
+def fetch_admin_asset_url(source_url, asset_type, maximum_bytes=16 * 1024 * 1024):
     if not isinstance(source_url, str) or not source_url.strip():
         raise ValueError('Enter a valid HTTPS asset URL')
     try:
@@ -745,13 +897,13 @@ def fetch_admin_asset_url(source_url, asset_type):
         with connection.getresponse() as response:
             if response.status != 200:
                 raise ValueError('The asset URL did not return a successful response')
-            content = response.read(16 * 1024 * 1024 + 1)
+            content = response.read(maximum_bytes + 1)
     except (http.client.HTTPException, TimeoutError, OSError) as error:
         raise ValueError('The asset URL could not be downloaded') from error
     finally:
         connection.close()
-    if len(content) > 16 * 1024 * 1024:
-        raise ValueError('The asset URL file is too large')
+    if len(content) > maximum_bytes:
+        raise ValueError(f'The asset URL file must be no larger than {maximum_bytes // (1024 * 1024)} MB')
 
     path_name = os.path.basename(parsed.path)
     if not path_name or '.' not in path_name:
@@ -858,6 +1010,22 @@ def list_usable_assets(account, asset_type):
 def serialize_asset(asset, asset_type, pricing):
     name = asset['name']
     price = resolve_catalog_asset_price(asset_type, asset, pricing)
+    if asset_type == 'theme':
+        image_name = asset.get('background_image_name')
+        return {
+            'asset_id': str(asset['_id']),
+            'name': name,
+            'price': price,
+            'owned': False,
+            'primary_color': asset['primary_color'],
+            'panel_color': asset.get('panel_color', '#171717'),
+            'accent_color': asset['accent_color'],
+            'background_image_exists': asset.get('background_image_exists') is True,
+            'background_opacity': asset.get('background_opacity', 0),
+            'background_image_name': image_name,
+            'url': f"/img/backgrounds/{image_name}" if image_name else '',
+            'is_standard': asset.get('is_standard') is True,
+        }
     if asset_type == 'sound':
         filename = asset['file']
         return {
@@ -958,11 +1126,29 @@ def register_legacy_assets():
     return registered
 
 
+def register_default_themes():
+    for theme in DEFAULT_THEMES:
+        colthemes.update_one(
+            {'_id': theme['_id']},
+            {'$setOnInsert': copy.deepcopy(theme)},
+            upsert=True,
+        )
+        colthemes.update_one(
+            {'_id': theme['_id']},
+            {'$set': {
+                'primary_color': theme['primary_color'],
+                'panel_color': theme['panel_color'],
+                'accent_color': theme['accent_color'],
+            }},
+        )
+    sync_theme_price_fields(load_point_pricing())
+
+
 def list_shop_assets(account):
     pricing = load_point_pricing()
     assets = {}
     status_order = {'available': 0, 'owned': 1, 'unavailable': 2}
-    for asset_type in ('emoji', 'sound'):
+    for asset_type in ('emoji', 'sound', 'theme'):
         collection = asset_collection(asset_type)
         owned_ids = {
             ownership['asset_id']
@@ -977,7 +1163,11 @@ def list_shop_assets(account):
             if asset.get('proposal_state') == 'processing':
                 continue
             item = serialize_asset(asset, asset_type, pricing)
-            owned = asset['_id'] in owned_ids
+            owned = (
+                asset.get('is_standard') is True
+                or asset['_id'] in owned_ids
+                or has_permission(account, 'admin_console')
+            )
             unavailable = item['price'] == -1 or asset.get('exclusive') is True
             if asset.get('exclusive') is True:
                 item['price'] = -1
@@ -1026,7 +1216,7 @@ def purchase_catalog_asset(account, asset_type, asset_id, request_id, expected_p
         return {'status': 'error', 'message': 'Login required'}, 401
     if has_permission(account, 'admin_console'):
         return {'status': 'error', 'message': 'Admins already have access to all assets'}, 403
-    if asset_type not in {'sound', 'emoji'}:
+    if asset_type not in {'sound', 'emoji', 'theme'}:
         return {'status': 'error', 'message': 'Unsupported asset type'}, 400
     request_id = normalize_request_id(request_id)
     if not request_id:
@@ -1816,33 +2006,113 @@ def get_online_user_ranks():
 
 
 def add_current_ranks(messages):
-    usernames = {message.get('user') for message in messages if message.get('user')}
-    ranks = {
-        user['username']: user.get('rank', 'User')
+    usernames = {
+        message.get('user')
+        for message in messages
+        if message.get('system') is not True and message.get('user')
+    }
+    users = {
+        user['username']: user
         for user in colusers.find(
             {'username': {'$in': list(usernames)}},
-            {'username': 1, 'rank': 1},
+            {'username': 1, 'rank': 1, 'visible_badge_id': 1},
         )
     }
     rank_colors = {
         rank['rank'].casefold(): rank.get('color')
         for rank in colranks.find({}, {'rank': 1, 'color': 1})
     }
-    return [
-        {
+    enriched = []
+    for message in messages:
+        if message.get('system') is True:
+            enriched.append({
+                key: value
+                for key, value in message.items()
+                if key not in {'rank', 'rank_color'}
+            })
+            continue
+
+        user = users.get(message.get('user'))
+        rank = user.get('rank', 'User') if user else None
+        badge = None
+        if user and user.get('visible_badge_id') is not None:
+            try:
+                badge_id = user['visible_badge_id']
+                badge_id = badge_id if isinstance(badge_id, ObjectId) else ObjectId(str(badge_id))
+                badge = serialize_badge(colbadges.find_one({'_id': badge_id}))
+            except Exception:
+                badge = None
+        enriched_message = {
             **message,
-            'rank': ranks.get(message.get('user')),
-            'rank_color': rank_colors.get(ranks[message['user']].casefold()) if message.get('user') in ranks else None,
+            'rank': rank,
+            'rank_color': rank_colors.get(rank.casefold()) if rank else None,
         }
-        for message in messages
-    ]
+        if badge:
+            enriched_message['badge'] = badge
+        else:
+            enriched_message.pop('badge', None)
+        enriched.append(enriched_message)
+    return enriched
+
+
+def emit_chat_activity(socketio, message, actor=None):
+    if not isinstance(message, str) or not message.strip():
+        raise ValueError('Chat activity message must not be empty')
+    if actor is not None and (not isinstance(actor, str) or not actor.strip()):
+        raise ValueError('Chat activity actor must be a non-empty username')
+
+    activity = {
+        'system': True,
+        'message': message.strip(),
+        'timestamp': datetime.now(timezone.utc),
+    }
+    if actor is not None:
+        activity['actor'] = actor
+
+    try:
+        colchat.insert_one(activity)
+    except Exception:
+        logger.exception('Could not persist chat activity')
+        return False
+
+    public_activity = {
+        key: activity[key]
+        for key in ('system', 'actor', 'message')
+        if key in activity
+    }
+    lastmessages.append(public_activity)
+    if socketio:
+        try:
+            socketio.emit('chat_message', public_activity)
+        except Exception:
+            logger.exception('Could not broadcast chat activity')
+    return True
+
+
+def moderation_activity_prefix(actor):
+    if not isinstance(actor, dict) or has_permission(actor, 'admin_console'):
+        return ''
+    role = find_role(actor.get('rank'))
+    if not role or role.get('staff') is not True:
+        return ''
+    username = actor.get('username')
+    return f'{username} ' if isinstance(username, str) and username else ''
 
 
 try:
     msgs = list(colchat.find().sort('timestamp', -1).limit(MAX_MESSAGES))
     msgs.reverse()
     for m in msgs:
-        lastmessages.append({'user': m['user'], 'message': m['message']})
+        if m.get('system') is True:
+            message = {'system': True, 'message': m['message']}
+            if isinstance(m.get('actor'), str):
+                message['actor'] = m['actor']
+        else:
+            message = {'user': m['user'], 'message': m['message']}
+            for key in ('literal_emojis', 'rank', 'rank_color'):
+                if key in m:
+                    message[key] = m[key]
+        lastmessages.append(message)
 except Exception as e:
     logger.error(f"Failed to load chat history: {e}")
 
@@ -1986,6 +2256,14 @@ def registersocketiohandlers(socketio: SocketIO):
                     literal_emojis.append(emoji_name)
             rank = account.get('rank', 'User')
             color = get_rank_color(rank)
+            badge = None
+            if account.get('visible_badge_id') is not None:
+                try:
+                    badge_id = account['visible_badge_id']
+                    badge_id = badge_id if isinstance(badge_id, ObjectId) else ObjectId(str(badge_id))
+                    badge = serialize_badge(colbadges.find_one({'_id': badge_id}))
+                except Exception:
+                    badge = None
             msgobj = {
                 'user': user,
                 'message': message,
@@ -1994,21 +2272,27 @@ def registersocketiohandlers(socketio: SocketIO):
                 'rank_color': color,
                 'timestamp': datetime.now(timezone.utc)
             }
+            if badge:
+                msgobj['badge'] = badge
             try:
                 colchat.insert_one(msgobj)
-                lastmessages.append({
+                public_message = {
                     'user': user,
                     'message': message,
                     'literal_emojis': literal_emojis,
                     'rank': rank,
                     'rank_color': color,
-                })
+                }
+                if badge:
+                    public_message['badge'] = badge
+                lastmessages.append(public_message)
                 socketio.emit('chat_message', {
                     'user': user,
                     'message': message,
                     'literal_emojis': literal_emojis,
                     'rank': rank,
                     'rank_color': color,
+                    **({'badge': badge} if badge else {}),
                 })
             except Exception as e:
                 logger.error(f"Chat save failed: {e}")
@@ -2191,6 +2475,12 @@ def registerroutes(app, socketio: SocketIO):
         )
         if socketio:
             socketio.emit('streaming_status', {'streaming': state['streaming']})
+        was_streaming = bool(previous_state and previous_state.get('streaming') is True)
+        if was_streaming != state['streaming']:
+            emit_chat_activity(
+                socketio,
+                'Stream started.' if state['streaming'] else 'Stream finished.',
+            )
         return jsonify({'streaming': state['streaming']})
 
     @app.route('/auth/lookup', methods=['POST'])
@@ -2237,7 +2527,15 @@ def registerroutes(app, socketio: SocketIO):
             data.get('intent') == 'register'
             or ('email' in data and 'confirmation' in data)
         )
-        if user and user.get('password_reset_token_hash'):
+        if (
+            user
+            and user.get('password_reset_token_hash')
+            and user.get('password_reset_token_type', 'password') == 'password'
+            and not (
+                user.get('password_reset_self_service') is True
+                and user.get('password_hash')
+            )
+        ):
             return jsonify({'message': 'Incorrect username or password'}), 401
         if not is_registration and (not user or not user.get('password_hash')):
             return jsonify({'message': 'Incorrect username or password'}), 401
@@ -2303,27 +2601,15 @@ def registerroutes(app, socketio: SocketIO):
     @app.route('/auth/password-reset', methods=['POST'])
     def authpasswordreset():
         data = request.get_json(silent=True) or {}
-        username = data.get('username')
         reset_token = data.get('reset_token')
         password = data.get('password')
         confirmation = data.get('confirmation')
         action = data.get('action')
-        if username is not None and (
-            not isinstance(username, str) or not username.strip() or len(username.strip()) > 64
-        ):
-            return jsonify({'message': 'Enter a valid username'}), 400
         if action not in (None, 'verify'):
-            return jsonify({'message': 'Invalid password reset request'}), 400
+            return jsonify({'message': 'Invalid account recovery request'}), 400
         verification_only = action == 'verify'
-        if not verification_only and (
-            not isinstance(password, str)
-            or len(password) < 8
-            or len(password) > 256
-            or password != confirmation
-        ):
-            return jsonify({'message': 'Enter matching passwords of at least 8 characters'}), 400
         if not isinstance(reset_token, str) or not reset_token or len(reset_token) > 256:
-            return jsonify({'message': 'Invalid or expired password reset token'}), 401
+            return jsonify({'message': 'Invalid or expired account recovery code'}), 401
 
         token_lookup = hashlib.sha256(reset_token.encode('utf-8')).hexdigest()
         user = colusers.find_one({'password_reset_token_lookup': token_lookup})
@@ -2336,57 +2622,87 @@ def registerroutes(app, socketio: SocketIO):
                 if isinstance(candidate_hash, str) and check_password_hash(candidate_hash, reset_token):
                     user = candidate
                     break
-        if user is None and isinstance(username, str):
-            user = colusers.find_one({'username': username.strip()})
+        recovery_type = user.get('password_reset_token_type', 'password') if user else None
         token_hash = user.get('password_reset_token_hash') if user else None
         expires_at = user.get('password_reset_token_expires_at') if user else None
+        self_service_reset = bool(
+            user
+            and user.get('password_reset_self_service') is True
+            and user.get('password_hash')
+        )
         if isinstance(expires_at, datetime) and expires_at.tzinfo is None:
             expires_at = expires_at.replace(tzinfo=timezone.utc)
         if (
             not user
-            or user.get('password_hash')
+            or recovery_type not in ('password', 'email')
+            or recovery_type == 'password'
+            and bool(user.get('password_hash')) != self_service_reset
             or not isinstance(token_hash, str)
             or not isinstance(expires_at, datetime)
             or expires_at <= datetime.now(timezone.utc)
             or not check_password_hash(token_hash, reset_token)
         ):
-            return jsonify({'message': 'Invalid or expired password reset token'}), 401
+            return jsonify({'message': 'Invalid or expired account recovery code'}), 401
 
         if verification_only:
             return jsonify({
                 'status': 'verified',
                 'username': user['username'],
-                'email': user.get('email'),
+                'recovery_type': recovery_type,
             })
 
-        new_password_hash = generate_password_hash(password)
+        if recovery_type == 'password':
+            if (
+                not isinstance(password, str)
+                or len(password) < 8
+                or len(password) > 256
+                or password != confirmation
+                or 'email' in data
+            ):
+                return jsonify({'message': 'Enter matching passwords of at least 8 characters'}), 400
+            update_fields = {'$set': {'password_hash': generate_password_hash(password)}}
+        else:
+            email = normalize_email(data.get('email'))
+            if email is None or password is not None or confirmation is not None:
+                return jsonify({'message': 'Enter a valid email address'}), 400
+            existing_email = colusers.find_one({'email': email})
+            if existing_email and existing_email.get('_id') != user['_id']:
+                return jsonify({'message': 'That email address is already in use'}), 409
+            update_fields = {'$set': {'email': email}}
+
         reset_query = {
             '_id': user['_id'],
-            'password_hash': None,
             'password_reset_token_hash': token_hash,
             'password_reset_token_expires_at': user['password_reset_token_expires_at'],
         }
+        if recovery_type == 'password':
+            reset_query['password_hash'] = (
+                user.get('password_hash')
+                if self_service_reset
+                else None
+            )
+        if 'password_reset_token_type' in user:
+            reset_query['password_reset_token_type'] = recovery_type
         if user.get('password_reset_token_lookup'):
             reset_query['password_reset_token_lookup'] = token_lookup
         changed = colusers.update_one(
             reset_query,
             {
-                '$set': {'password_hash': new_password_hash},
+                **update_fields,
                 '$unset': {
                     'password_reset_token_hash': '',
                     'password_reset_token_lookup': '',
                     'password_reset_token_expires_at': '',
+                    'password_reset_token_type': '',
+                    'password_reset_self_service': '',
                 },
             },
         )
         if changed.matched_count != 1:
-            return jsonify({'message': 'Invalid or expired password reset token'}), 401
+            return jsonify({'message': 'Invalid or expired account recovery code'}), 401
 
-        user['password_hash'] = new_password_hash
-        user.pop('password_reset_token_hash', None)
-        user.pop('password_reset_token_lookup', None)
-        user.pop('password_reset_token_expires_at', None)
-        return jsonify(complete_authentication(user))
+        session.clear()
+        return jsonify({'status': 'updated'})
 
     @app.route('/auth/session')
     def authsession():
@@ -2501,12 +2817,705 @@ def registerroutes(app, socketio: SocketIO):
                 }},
                 upsert=True,
             )
+            sync_theme_price_fields(pricing)
         except Exception:
             logger.exception('Could not save point pricing')
             return jsonify({'message': 'Pricing could not be saved'}), 503
         if socketio:
             socketio.emit('usage_costs_changed')
+        emit_chat_activity(socketio, 'Point Shop pricing was updated.')
         return jsonify({'pricing': pricing})
+
+    @app.route('/admin/themes', methods=['GET', 'POST'])
+    @require_login
+    def adminthemes():
+        if not get_admin_user('admin_console'):
+            return jsonify({'message': 'Admin login required'}), 403
+        try:
+            pricing = load_point_pricing()
+            if request.method == 'GET':
+                themes = []
+                for theme in colthemes.find({}).sort('name', 1):
+                    item = serialize_asset(theme, 'theme', pricing)
+                    item['price_overridden'] = (
+                        str(theme['_id']) in pricing['catalog']['theme']['items']
+                    )
+                    themes.append(item)
+                return jsonify({'themes': themes})
+
+            if (
+                request.content_length
+                and request.content_length > MAX_THEME_BACKGROUND_REQUEST_BYTES
+            ):
+                return jsonify({'message': 'Theme backgrounds must be no larger than 50 MB'}), 413
+            data = request.form
+            name = data.get('name', '').strip()
+            if not name or len(name) > 80 or any(ord(character) < 32 for character in name):
+                raise ValueError('Theme name must be 1 to 80 characters')
+            name_key = name.casefold()
+            primary_color = normalize_theme_color(data.get('primary_color'), 'Background color')
+            panel_color = normalize_theme_color(data.get('panel_color', '#171717'), 'Panel color')
+            accent_color = normalize_theme_color(data.get('accent_color'), 'Accent color')
+            upload = request.files.get('background')
+            source_url = data.get('background_url', '').strip()
+            if upload and source_url:
+                raise ValueError('Choose a background file or enter a URL, not both')
+            if source_url:
+                upload = fetch_admin_asset_url(
+                    source_url,
+                    'emoji',
+                    maximum_bytes=MAX_THEME_BACKGROUND_BYTES,
+                )
+
+            background_opacity = 0.0
+            temporary_path = None
+            destination = None
+            background_name = None
+            if upload:
+                try:
+                    background_opacity = float(data.get('background_opacity', ''))
+                except (TypeError, ValueError) as error:
+                    raise ValueError('Background opacity must be between 0 and 1') from error
+                if not math.isfinite(background_opacity) or not 0 <= background_opacity <= 1:
+                    raise ValueError('Background opacity must be between 0 and 1')
+
+            price_override = parse_asset_price(data.get('price'))
+            theme_id = ObjectId()
+            if upload:
+                background_directory = os.path.join(PUBLIC_DIR, 'img', 'backgrounds')
+                temporary_path, extension = validate_uploaded_asset(
+                    upload,
+                    'emoji',
+                    background_directory,
+                    maximum=8192,
+                    max_file_size=MAX_THEME_BACKGROUND_BYTES,
+                    max_file_size_message='Theme backgrounds must be no larger than 50 MB',
+                    dimension_label='Theme background',
+                )
+                background_name = f'{normalize_asset_name(name)}.{extension}'
+                destination = os.path.join(background_directory, background_name)
+                if colthemes.find_one({'background_image_name': background_name}):
+                    return jsonify({'message': 'A background with this normalized theme name already exists'}), 409
+                try:
+                    os.link(temporary_path, destination)
+                except FileExistsError as error:
+                    return jsonify({'message': 'A background with this normalized theme name already exists'}), 409
+
+            theme = {
+                '_id': theme_id,
+                'name': name,
+                'name_key': name_key,
+                'price': (
+                    price_override
+                    if price_override is not None
+                    else pricing['catalog']['theme']['default']
+                ),
+                'price_overridden': price_override is not None,
+                'primary_color': primary_color,
+                'panel_color': panel_color,
+                'accent_color': accent_color,
+                'background_image_exists': background_name is not None,
+                'background_opacity': background_opacity,
+                'background_image_name': background_name,
+                'is_standard': False,
+                'created_at': datetime.now(timezone.utc),
+            }
+            try:
+                colthemes.insert_one(theme)
+                if price_override is not None:
+                    pricing['catalog']['theme']['items'][str(theme_id)] = price_override
+                    normalized_pricing = validate_point_pricing(pricing)
+                    colpricing.update_one(
+                        {'_id': POINT_PRICING_ID},
+                        {'$set': {
+                            'schema_version': 1,
+                            'pricing': normalized_pricing,
+                            'updated_at': datetime.now(timezone.utc),
+                        }},
+                        upsert=True,
+                    )
+                    sync_theme_price_fields(normalized_pricing)
+            except DuplicateKeyError:
+                colthemes.delete_one({'_id': theme_id})
+                if destination and os.path.exists(destination):
+                    os.remove(destination)
+                return jsonify({'message': 'A theme with this name already exists'}), 409
+            except Exception:
+                colthemes.delete_one({'_id': theme_id})
+                if destination and os.path.exists(destination):
+                    os.remove(destination)
+                raise
+
+            if socketio:
+                socketio.emit('usage_costs_changed')
+                socketio.emit('asset_catalog_changed', {'asset_type': 'theme'})
+            emit_chat_activity(socketio, f'Added theme: {name}.')
+            return jsonify({
+                'theme': serialize_asset(theme, 'theme', pricing),
+                'price_overridden': price_override is not None,
+            }), 201
+        except ValueError as error:
+            return jsonify({'message': str(error)}), 400
+        except Exception:
+            logger.exception('Could not administer themes')
+            return jsonify({'message': 'Theme could not be saved'}), 503
+        finally:
+            if request.method == 'POST' and 'temporary_path' in locals() and temporary_path:
+                if os.path.exists(temporary_path):
+                    os.remove(temporary_path)
+
+    @app.route('/admin/themes/<theme_id>', methods=['PATCH', 'DELETE'])
+    @require_login
+    def admintheme(theme_id):
+        if not get_admin_user('admin_console'):
+            return jsonify({'message': 'Admin login required'}), 403
+        if not ObjectId.is_valid(theme_id):
+            return jsonify({'message': 'Theme not found'}), 404
+
+        theme_oid = ObjectId(theme_id)
+        existing = colthemes.find_one({'_id': theme_oid})
+        if not existing:
+            return jsonify({'message': 'Theme not found'}), 404
+
+        if request.method == 'DELETE':
+            if existing.get('is_standard') is True:
+                return jsonify({'message': 'The Standard theme cannot be removed'}), 400
+            try:
+                pricing = load_point_pricing()
+                original_pricing = copy.deepcopy(pricing)
+                pricing['catalog']['theme']['items'].pop(str(theme_oid), None)
+                normalized_pricing = validate_point_pricing(pricing)
+                background_name = existing.get('background_image_name')
+                if background_name and os.path.basename(background_name) != background_name:
+                    return jsonify({'message': 'Stored theme background metadata is invalid'}), 503
+                background_path = (
+                    os.path.join(PUBLIC_DIR, 'img', 'backgrounds', background_name)
+                    if background_name
+                    else None
+                )
+                staged_path = None
+                if background_path and os.path.isfile(background_path):
+                    staged_path = os.path.join(
+                        os.path.dirname(background_path),
+                        f'.ats-remove-{uuid.uuid4().hex}',
+                    )
+                    os.replace(background_path, staged_path)
+
+                try:
+                    colpricing.update_one(
+                        {'_id': POINT_PRICING_ID},
+                        {'$set': {
+                            'schema_version': 1,
+                            'pricing': normalized_pricing,
+                            'updated_at': datetime.now(timezone.utc),
+                        }},
+                        upsert=True,
+                    )
+                    deleted = colthemes.delete_one({'_id': theme_oid})
+                    if not getattr(deleted, 'deleted_count', 1):
+                        raise RuntimeError('Theme could not be removed')
+                except Exception:
+                    colthemes.update_one(
+                        {'_id': theme_oid},
+                        {'$set': {key: value for key, value in existing.items() if key != '_id'}},
+                        upsert=True,
+                    )
+                    colpricing.update_one(
+                        {'_id': POINT_PRICING_ID},
+                        {'$set': {
+                            'schema_version': 1,
+                            'pricing': original_pricing,
+                            'updated_at': datetime.now(timezone.utc),
+                        }},
+                        upsert=True,
+                    )
+                    if staged_path and os.path.exists(staged_path):
+                        os.replace(staged_path, background_path)
+                    raise
+
+                colassetownership.delete_many({
+                    'asset_type': 'theme',
+                    'asset_id': theme_oid,
+                })
+                colusers.update_many(
+                    {'theme_id': str(theme_oid)},
+                    {'$set': {'theme_id': str(STANDARD_THEME_ID)}},
+                )
+                if staged_path and os.path.exists(staged_path):
+                    try:
+                        os.remove(staged_path)
+                    except OSError:
+                        logger.warning("Could not remove deleted theme background %s", staged_path)
+                sync_theme_price_fields(normalized_pricing)
+                if socketio:
+                    socketio.emit('usage_costs_changed')
+                    socketio.emit('asset_catalog_changed', {'asset_type': 'theme'})
+                emit_chat_activity(socketio, f"Removed theme: {existing.get('name', theme_id)}.")
+                return jsonify({'status': 'ok'})
+            except Exception:
+                logger.exception("Could not remove theme %s", theme_id)
+                return jsonify({'message': 'Theme could not be removed'}), 503
+
+        temporary_path = None
+        destination = None
+        committed = False
+        old_background_path = None
+        background_changed = False
+        created_destination = False
+        backup_path = None
+        try:
+            if (
+                request.content_length
+                and request.content_length > MAX_THEME_BACKGROUND_REQUEST_BYTES
+            ):
+                return jsonify({'message': 'Theme backgrounds must be no larger than 50 MB'}), 413
+            data = request.form
+            name = data.get('name', '').strip()
+            if not name or len(name) > 80 or any(ord(character) < 32 for character in name):
+                raise ValueError('Theme name must be 1 to 80 characters')
+            name_key = name.casefold()
+            if colthemes.find_one({'name_key': name_key, '_id': {'$ne': theme_oid}}):
+                return jsonify({'message': 'A theme with this name already exists'}), 409
+
+            primary_color = normalize_theme_color(data.get('primary_color'), 'Background color')
+            panel_color = normalize_theme_color(
+                data.get('panel_color', existing.get('panel_color', '#171717')),
+                'Panel color',
+            )
+            accent_color = normalize_theme_color(data.get('accent_color'), 'Accent color')
+            upload = request.files.get('background')
+            source_url = data.get('background_url', '').strip()
+            remove_background = data.get('remove_background') == 'true'
+            if upload and source_url:
+                raise ValueError('Choose a background file or URL')
+            if remove_background and (upload or source_url):
+                raise ValueError('Choose a new background or remove the current one')
+            if source_url:
+                upload = fetch_admin_asset_url(
+                    source_url,
+                    'emoji',
+                    maximum_bytes=MAX_THEME_BACKGROUND_BYTES,
+                )
+
+            background_name = existing.get('background_image_name')
+            background_exists = existing.get('background_image_exists') is True
+            opacity = existing.get('background_opacity', 0.0)
+            old_name = existing.get('background_image_name')
+            if old_name and os.path.basename(old_name) != old_name:
+                raise ValueError('Stored theme background metadata is invalid')
+            if old_name:
+                old_background_path = os.path.join(PUBLIC_DIR, 'img', 'backgrounds', old_name)
+
+            if upload:
+                background_changed = True
+                try:
+                    opacity = float(data.get('background_opacity', ''))
+                except (TypeError, ValueError) as error:
+                    raise ValueError('Background opacity must be between 0 and 1') from error
+                if not math.isfinite(opacity) or not 0 <= opacity <= 1:
+                    raise ValueError('Background opacity must be between 0 and 1')
+                background_directory = os.path.join(PUBLIC_DIR, 'img', 'backgrounds')
+                temporary_path, extension = validate_uploaded_asset(
+                    upload,
+                    'emoji',
+                    background_directory,
+                    maximum=8192,
+                    max_file_size=MAX_THEME_BACKGROUND_BYTES,
+                    max_file_size_message='Theme backgrounds must be no larger than 50 MB',
+                    dimension_label='Theme background',
+                )
+                background_name = f'{normalize_asset_name(name)}.{extension}'
+                destination = os.path.join(background_directory, background_name)
+                if colthemes.find_one({
+                    'background_image_name': background_name,
+                    '_id': {'$ne': theme_oid},
+                }):
+                    return jsonify({'message': 'A background with this normalized theme name already exists'}), 409
+                if destination == old_background_path and os.path.isfile(old_background_path):
+                    backup_path = os.path.join(
+                        background_directory,
+                        f'.ats-theme-backup-{uuid.uuid4().hex}',
+                    )
+                    os.link(old_background_path, backup_path)
+                    os.replace(temporary_path, destination)
+                    temporary_path = None
+                else:
+                    if os.path.exists(destination):
+                        return jsonify({'message': 'A background with this normalized theme name already exists'}), 409
+                    os.link(temporary_path, destination)
+                    created_destination = True
+                background_exists = True
+            elif remove_background:
+                background_changed = True
+                background_name = None
+                background_exists = False
+                opacity = 0.0
+            elif background_exists and 'background_opacity' in data:
+                try:
+                    opacity = float(data['background_opacity'])
+                except (TypeError, ValueError) as error:
+                    raise ValueError('Background opacity must be between 0 and 1') from error
+                if not math.isfinite(opacity) or not 0 <= opacity <= 1:
+                    raise ValueError('Background opacity must be between 0 and 1')
+
+            if (
+                background_exists
+                and old_name
+                and not upload
+                and not remove_background
+                and os.path.isfile(old_background_path)
+            ):
+                extension = os.path.splitext(old_name)[1].lower().lstrip('.')
+                if extension not in {'jpg', 'png', 'gif'}:
+                    raise ValueError('Stored theme background extension is invalid')
+                normalized_name = f'{normalize_asset_name(name)}.{extension}'
+                if normalized_name != old_name:
+                    background_directory = os.path.join(PUBLIC_DIR, 'img', 'backgrounds')
+                    destination = os.path.join(background_directory, normalized_name)
+                    if colthemes.find_one({
+                        'background_image_name': normalized_name,
+                        '_id': {'$ne': theme_oid},
+                    }):
+                        return jsonify({'message': 'A background with this normalized theme name already exists'}), 409
+                    if os.path.exists(destination):
+                        return jsonify({'message': 'A background with this normalized theme name already exists'}), 409
+                    os.link(old_background_path, destination)
+                    created_destination = True
+                    background_name = normalized_name
+                    background_changed = True
+
+            pricing = load_point_pricing()
+            original_pricing = copy.deepcopy(pricing)
+            price_override = parse_asset_price(data.get('price'))
+            theme_prices = pricing['catalog']['theme']['items']
+            if existing.get('is_standard') is True:
+                theme_prices.pop(str(theme_oid), None)
+                price = 0
+                price_overridden = False
+            else:
+                if price_override is None:
+                    theme_prices.pop(str(theme_oid), None)
+                    price = pricing['catalog']['theme']['default']
+                    price_overridden = False
+                else:
+                    theme_prices[str(theme_oid)] = price_override
+                    price = price_override
+                    price_overridden = True
+            normalized_pricing = validate_point_pricing(pricing)
+            updated_theme = {
+                **existing,
+                'name': name,
+                'name_key': name_key,
+                'price': price,
+                'price_overridden': price_overridden,
+                'primary_color': primary_color,
+                'panel_color': panel_color,
+                'accent_color': accent_color,
+                'background_image_exists': background_exists,
+                'background_opacity': opacity,
+                'background_image_name': background_name,
+                'updated_at': datetime.now(timezone.utc),
+            }
+            try:
+                colthemes.update_one(
+                    {'_id': theme_oid},
+                    {'$set': {key: value for key, value in updated_theme.items() if key != '_id'}},
+                )
+                colpricing.update_one(
+                    {'_id': POINT_PRICING_ID},
+                    {'$set': {
+                        'schema_version': 1,
+                        'pricing': normalized_pricing,
+                        'updated_at': datetime.now(timezone.utc),
+                    }},
+                    upsert=True,
+                )
+                sync_theme_price_fields(normalized_pricing)
+            except DuplicateKeyError:
+                return jsonify({'message': 'A theme with this name already exists'}), 409
+            except Exception:
+                colthemes.update_one(
+                    {'_id': theme_oid},
+                    {'$set': {key: value for key, value in existing.items() if key != '_id'}},
+                )
+                colpricing.update_one(
+                    {'_id': POINT_PRICING_ID},
+                    {'$set': {
+                        'schema_version': 1,
+                        'pricing': original_pricing,
+                        'updated_at': datetime.now(timezone.utc),
+                    }},
+                    upsert=True,
+                )
+                raise
+
+            committed = True
+            if background_changed and old_background_path and os.path.isfile(old_background_path):
+                if old_background_path != destination:
+                    try:
+                        os.remove(old_background_path)
+                    except OSError:
+                        logger.warning("Could not remove replaced theme background %s", old_background_path)
+            if backup_path and os.path.exists(backup_path):
+                try:
+                    os.remove(backup_path)
+                except OSError:
+                    logger.warning("Could not remove replaced theme background backup %s", backup_path)
+            if socketio:
+                socketio.emit('usage_costs_changed')
+                socketio.emit('asset_catalog_changed', {'asset_type': 'theme'})
+            updated_theme['price'] = price
+            emit_chat_activity(socketio, f"Updated theme: {name}.")
+            return jsonify({
+                'theme': serialize_asset(updated_theme, 'theme', normalized_pricing),
+                'price_overridden': price_overridden,
+            })
+        except ValueError as error:
+            return jsonify({'message': str(error)}), 400
+        except Exception:
+            logger.exception("Could not update theme %s", theme_id)
+            return jsonify({'message': 'Theme could not be updated'}), 503
+        finally:
+            if temporary_path and os.path.exists(temporary_path):
+                os.remove(temporary_path)
+            if not committed and created_destination and destination and os.path.exists(destination):
+                os.remove(destination)
+            if not committed and backup_path and os.path.exists(backup_path) and old_background_path:
+                os.replace(backup_path, old_background_path)
+
+    @app.route('/admin/badges', methods=['GET', 'POST'])
+    @require_login
+    def adminbadges():
+        if not get_admin_user('admin_console'):
+            return jsonify({'message': 'Admin login required'}), 403
+        if request.method == 'GET':
+            return jsonify({
+                'badges': [
+                    serialize_badge(badge)
+                    for badge in colbadges.find({}).sort('name', 1)
+                ],
+            })
+
+        if request.content_length and request.content_length > 17 * 1024 * 1024:
+            return jsonify({'message': 'Upload is too large'}), 413
+        temporary_path = None
+        destination = None
+        created_destination = False
+        try:
+            data = request.form
+            upload = request.files.get('file')
+            source_url = data.get('source_url')
+            if upload and source_url:
+                raise ValueError('Choose a file or enter a URL, not both')
+            if source_url:
+                upload = fetch_admin_asset_url(source_url, 'emoji')
+            display_name = data.get('name', '').strip()
+            if not display_name or len(display_name) > 120:
+                raise ValueError('Badge name must be 1 to 120 characters')
+            name_key = normalize_asset_name(display_name)
+            if colbadges.find_one({'name_key': name_key}):
+                return jsonify({'message': 'A badge with this name already exists'}), 409
+            temporary_path, extension = validate_uploaded_asset(
+                upload,
+                'emoji',
+                BADGEDIR,
+                maximum=2048,
+                dimension_label='Badge',
+            )
+            filename = f'{name_key}.{extension}'
+            destination = os.path.join(BADGEDIR, filename)
+            try:
+                os.link(temporary_path, destination)
+                created_destination = True
+            except FileExistsError:
+                return jsonify({'message': 'A badge file with this normalized name already exists'}), 409
+            badge = {
+                '_id': ObjectId(),
+                'name': display_name,
+                'name_key': name_key,
+                'file': filename,
+                'created_at': datetime.now(timezone.utc),
+            }
+            colbadges.insert_one(badge)
+            if socketio:
+                socketio.emit('badge_catalog_changed')
+            emit_chat_activity(socketio, f'Added badge: {display_name}.')
+            return jsonify({'badge': serialize_badge(badge)}), 201
+        except ValueError as error:
+            return jsonify({'message': str(error)}), 400
+        except DuplicateKeyError:
+            return jsonify({'message': 'A badge with this name or file already exists'}), 409
+        except Exception:
+            logger.exception('Could not administer badges')
+            return jsonify({'message': 'Badge could not be saved'}), 503
+        finally:
+            if temporary_path and os.path.exists(temporary_path):
+                os.remove(temporary_path)
+            if created_destination and destination and not colbadges.find_one({'file': os.path.basename(destination)}):
+                if os.path.exists(destination):
+                    os.remove(destination)
+
+    @app.route('/admin/badges/<badge_id>', methods=['PATCH', 'DELETE'])
+    @require_login
+    def adminbadge(badge_id):
+        if not get_admin_user('admin_console'):
+            return jsonify({'message': 'Admin login required'}), 403
+        if not ObjectId.is_valid(badge_id):
+            return jsonify({'message': 'Badge not found'}), 404
+        badge_oid = ObjectId(badge_id)
+        badge = colbadges.find_one({'_id': badge_oid})
+        if not badge:
+            return jsonify({'message': 'Badge not found'}), 404
+        filename = badge.get('file')
+        if not isinstance(filename, str) or os.path.basename(filename) != filename:
+            return jsonify({'message': 'Stored badge metadata is invalid'}), 503
+        old_path = os.path.join(BADGEDIR, filename)
+
+        if request.method == 'DELETE':
+            affected_usernames = [
+                user.get('username')
+                for user in colusers.find({'badges': badge_oid}, {'username': 1})
+                if isinstance(user.get('username'), str)
+            ]
+            colbadges.delete_one({'_id': badge_oid})
+            colusers.update_many(
+                {'badges': badge_oid},
+                {'$pull': {'badges': badge_oid}},
+            )
+            colusers.update_many(
+                {'visible_badge_id': str(badge_oid)},
+                {'$unset': {'visible_badge_id': ''}},
+            )
+            if os.path.exists(old_path):
+                os.remove(old_path)
+            if socketio:
+                socketio.emit('badge_catalog_changed')
+                socketio.emit('badge_data_changed', {'usernames': affected_usernames})
+                socketio.emit('chat_history', add_current_ranks(list(lastmessages)))
+            emit_chat_activity(socketio, f"Removed badge: {badge.get('name', 'badge')}.")
+            return jsonify({'status': 'ok'})
+
+        data = request.form if request.mimetype == 'multipart/form-data' else (request.get_json(silent=True) or {})
+        display_name = data.get('name', badge.get('name'))
+        if not isinstance(display_name, str) or not display_name.strip() or len(display_name.strip()) > 120:
+            return jsonify({'message': 'Badge name must be 1 to 120 characters'}), 400
+        display_name = display_name.strip()
+        try:
+            name_key = normalize_asset_name(display_name)
+        except ValueError as error:
+            return jsonify({'message': str(error)}), 400
+        duplicate = colbadges.find_one({'name_key': name_key})
+        if duplicate and duplicate.get('_id') != badge_oid:
+            return jsonify({'message': 'A badge with this name already exists'}), 409
+
+        temporary_path = None
+        destination = None
+        backup_path = None
+        created_destination = False
+        committed = False
+        try:
+            upload = request.files.get('file')
+            source_url = data.get('source_url')
+            if upload and source_url:
+                raise ValueError('Choose a file or enter a URL, not both')
+            if source_url:
+                upload = fetch_admin_asset_url(source_url, 'emoji')
+            extension = os.path.splitext(filename)[1].lower().lstrip('.')
+            if extension not in {'jpg', 'png', 'gif'}:
+                raise ValueError('Stored badge image type is invalid')
+            if upload:
+                temporary_path, extension = validate_uploaded_asset(
+                    upload,
+                    'emoji',
+                    BADGEDIR,
+                    maximum=2048,
+                    dimension_label='Badge',
+                )
+            new_filename = f'{name_key}.{extension}'
+            destination = os.path.join(BADGEDIR, new_filename)
+            if destination != old_path:
+                if os.path.exists(destination):
+                    return jsonify({'message': 'A badge file with this normalized name already exists'}), 409
+                if temporary_path:
+                    os.link(temporary_path, destination)
+                else:
+                    os.link(old_path, destination)
+                created_destination = True
+            elif temporary_path:
+                backup_path = os.path.join(BADGEDIR, f'.ats-badge-backup-{uuid.uuid4().hex}')
+                os.replace(old_path, backup_path)
+                os.link(temporary_path, destination)
+                created_destination = True
+
+            update = colbadges.update_one(
+                {'_id': badge_oid},
+                {'$set': {'name': display_name, 'name_key': name_key, 'file': new_filename}},
+            )
+            if update.matched_count != 1:
+                raise RuntimeError('Badge no longer exists')
+            committed = True
+            if destination != old_path and os.path.exists(old_path):
+                os.remove(old_path)
+            if backup_path and os.path.exists(backup_path):
+                os.remove(backup_path)
+            if socketio:
+                socketio.emit('badge_catalog_changed')
+                affected_usernames = [
+                    user.get('username')
+                    for user in colusers.find({'badges': badge_oid}, {'username': 1})
+                    if isinstance(user.get('username'), str)
+                ]
+                socketio.emit('badge_data_changed', {'usernames': affected_usernames})
+                socketio.emit('chat_history', add_current_ranks(list(lastmessages)))
+            emit_chat_activity(socketio, f'Updated badge: {display_name}.')
+            return jsonify({'badge': serialize_badge({
+                **badge,
+                'name': display_name,
+                'name_key': name_key,
+                'file': new_filename,
+            })})
+        except ValueError as error:
+            return jsonify({'message': str(error)}), 400
+        except DuplicateKeyError:
+            return jsonify({'message': 'A badge with this name or file already exists'}), 409
+        except Exception:
+            logger.exception('Could not update badge %s', badge_id)
+            return jsonify({'message': 'Badge could not be updated'}), 503
+        finally:
+            if temporary_path and os.path.exists(temporary_path):
+                os.remove(temporary_path)
+            if not committed:
+                if created_destination and destination and os.path.exists(destination):
+                    os.remove(destination)
+                if backup_path and os.path.exists(backup_path):
+                    os.replace(backup_path, old_path)
+            elif backup_path and os.path.exists(backup_path):
+                os.remove(backup_path)
+
+    @app.route('/admin/badges/<badge_id>/grant-online', methods=['POST'])
+    @require_login
+    def admingrantbadgeonline(badge_id):
+        if not get_admin_user('admin_console'):
+            return jsonify({'message': 'Admin login required'}), 403
+        if not ObjectId.is_valid(badge_id):
+            return jsonify({'message': 'Badge not found'}), 404
+        badge = colbadges.find_one({'_id': ObjectId(badge_id)})
+        if not badge:
+            return jsonify({'message': 'Badge not found'}), 404
+        usernames = list(onlineusers)
+        if usernames:
+            result = colusers.update_many(
+                {'username': {'$in': usernames}},
+                {'$addToSet': {'badges': badge['_id']}},
+            )
+            granted_count = result.modified_count
+            if granted_count:
+                if socketio:
+                    socketio.emit('badge_data_changed', {'usernames': usernames})
+                emit_chat_activity(socketio, f"Granted badge {badge.get('name', '')} to all online users.")
+        else:
+            granted_count = 0
+        return jsonify({'granted_count': granted_count})
 
     @app.route('/admin/assets/<asset_type>', methods=['GET', 'POST'])
     @require_login
@@ -2607,6 +3616,8 @@ def registerroutes(app, socketio: SocketIO):
             if socketio:
                 socketio.emit('usage_costs_changed')
                 socketio.emit('asset_catalog_changed', {'asset_type': asset_type})
+            label = document.get('display_name') or document.get('name')
+            emit_chat_activity(socketio, f"Added {asset_type}: {label}.")
             return jsonify({'asset': serialize_asset(document, asset_type, load_point_pricing())}), 201
         except ValueError as error:
             return jsonify({'message': str(error)}), 400
@@ -2692,6 +3703,8 @@ def registerroutes(app, socketio: SocketIO):
                     socketio.emit('asset_catalog_changed', {'asset_type': asset_type})
                 if asset_type == 'emoji' and socketio:
                     socketio.emit('chat_history', add_current_ranks(list(lastmessages)))
+                label = asset.get('display_name') or asset.get('name')
+                emit_chat_activity(socketio, f"Removed {asset_type}: {label}.")
                 return jsonify({'status': 'ok'})
 
             data = request.get_json(silent=True)
@@ -2795,6 +3808,8 @@ def registerroutes(app, socketio: SocketIO):
             if socketio:
                 socketio.emit('usage_costs_changed')
             refreshed = collection.find_one({'_id': asset_oid})
+            label = refreshed.get('display_name') or refreshed.get('name')
+            emit_chat_activity(socketio, f"Updated {asset_type}: {label}.")
             return jsonify({'asset': serialize_asset(refreshed, asset_type, load_point_pricing())})
         except ValueError as error:
             if not committed and staged_path and os.path.exists(staged_path):
@@ -2817,6 +3832,89 @@ def registerroutes(app, socketio: SocketIO):
         session.clear()
         return jsonify({'status': 'ok'})
 
+    @app.route('/account/profile')
+    @require_login
+    def accountprofile():
+        user = get_session_user()
+        if not user:
+            return jsonify({'message': 'Login required'}), 401
+        return jsonify({'user': serialize_user_profile(user)})
+
+    @app.route('/account/profile/badge', methods=['PUT'])
+    @require_login
+    def accountprofilebadge():
+        user = get_session_user()
+        if not user:
+            return jsonify({'message': 'Login required'}), 401
+        data = request.get_json(silent=True) or {}
+        badge_id = data.get('badge_id')
+        if badge_id is None or badge_id == '':
+            changed = colusers.update_one(
+                {'_id': user['_id']},
+                {'$unset': {'visible_badge_id': ''}},
+            )
+        else:
+            if not isinstance(badge_id, str) or not ObjectId.is_valid(badge_id):
+                return jsonify({'message': 'Select a badge you own'}), 400
+            badge_oid = ObjectId(badge_id)
+            owned_badges = user.get('badges', [])
+            owned_ids = {str(item) for item in owned_badges} if isinstance(owned_badges, list) else set()
+            if str(badge_oid) not in owned_ids or not colbadges.find_one({'_id': badge_oid}):
+                return jsonify({'message': 'Select a badge you own'}), 403
+            changed = colusers.update_one(
+                {'_id': user['_id']},
+                {'$set': {'visible_badge_id': str(badge_oid)}},
+            )
+        if changed.matched_count != 1:
+            return jsonify({'message': 'Account could not be updated'}), 409
+        updated_user = colusers.find_one({'_id': user['_id']})
+        if socketio:
+            socketio.emit('chat_history', add_current_ranks(list(lastmessages)))
+        return jsonify({'user': serialize_user_profile(updated_user)})
+
+    @app.route('/account/recovery', methods=['POST'])
+    @require_login
+    def accountrecovery():
+        user = get_session_user()
+        if not user:
+            return jsonify({'message': 'Login required'}), 401
+        data = request.get_json(silent=True) or {}
+        recovery_type = data.get('recovery_type')
+        if recovery_type not in ('password', 'email'):
+            return jsonify({'message': 'Select password or email recovery'}), 400
+        if recovery_type == 'email' and not user.get('password_hash'):
+            return jsonify({'message': 'Recover your password before requesting an email reset code'}), 409
+        pending_expiry = user.get('password_reset_token_expires_at')
+        if isinstance(pending_expiry, datetime) and pending_expiry.tzinfo is None:
+            pending_expiry = pending_expiry.replace(tzinfo=timezone.utc)
+        if (
+            user.get('password_reset_token_hash')
+            and user.get('password_reset_token_type', 'password') != recovery_type
+            and isinstance(pending_expiry, datetime)
+            and pending_expiry > datetime.now(timezone.utc)
+        ):
+            return jsonify({'message': 'Complete or wait for the current recovery code to expire'}), 409
+
+        reset_token = secrets.token_urlsafe(32)
+        expires_at = datetime.now(timezone.utc) + PASSWORD_RESET_TOKEN_TTL
+        fields = {
+            'password_reset_token_hash': generate_password_hash(reset_token),
+            'password_reset_token_lookup': hashlib.sha256(reset_token.encode('utf-8')).hexdigest(),
+            'password_reset_token_expires_at': expires_at,
+            'password_reset_token_type': recovery_type,
+            'password_reset_self_service': recovery_type == 'password',
+        }
+        changed = colusers.update_one(
+            {'_id': user['_id']},
+            {'$set': fields},
+        )
+        if changed.matched_count != 1:
+            return jsonify({'message': 'Account could not be updated'}), 409
+        return jsonify({
+            'reset_token': reset_token,
+            'reset_token_expires_at': expires_at.isoformat(),
+        })
+
     @app.route('/admin/users/<username>')
     @require_login
     def admingetuser(username):
@@ -2828,7 +3926,53 @@ def registerroutes(app, socketio: SocketIO):
         user = colusers.find_one({'username': username})
         if not user:
             return jsonify({'message': 'User not found'}), 404
-        return jsonify({'user': serialize_user(user)})
+        return jsonify({'user': serialize_user_profile(user)})
+
+    @app.route('/admin/users/<username>/badges', methods=['POST', 'DELETE'])
+    @require_login
+    def admingrantbadge(username):
+        if not get_admin_user('admin_console'):
+            return jsonify({'message': 'Admin login required'}), 403
+        data = request.get_json(silent=True) or {}
+        badge_id = data.get('badge_id')
+        if not isinstance(badge_id, str) or not ObjectId.is_valid(badge_id):
+            return jsonify({'message': 'Select a badge'}), 400
+        badge = colbadges.find_one({'_id': ObjectId(badge_id)})
+        user = colusers.find_one({'username': username})
+        if not badge or not user:
+            return jsonify({'message': 'User or badge not found'}), 404
+        if request.method == 'DELETE':
+            result = colusers.update_one(
+                {'_id': user['_id']},
+                {'$pull': {'badges': {'$in': [badge['_id'], str(badge['_id'])]}}},
+            )
+            if result.modified_count:
+                colusers.update_one(
+                    {
+                        '_id': user['_id'],
+                        'visible_badge_id': {'$in': [str(badge['_id']), badge['_id']]},
+                    },
+                    {'$unset': {'visible_badge_id': ''}},
+                )
+                if socketio:
+                    socketio.emit('badge_data_changed', {'usernames': [username]})
+                emit_chat_activity(socketio, f"Removed badge {badge.get('name', '')} from {username}.")
+            updated_user = colusers.find_one({'_id': user['_id']})
+            return jsonify({
+                'status': 'ok',
+                'removed': bool(result.modified_count),
+                'user': serialize_user_profile(updated_user),
+            })
+
+        result = colusers.update_one(
+            {'_id': user['_id']},
+            {'$addToSet': {'badges': badge['_id']}},
+        )
+        if result.modified_count:
+            if socketio:
+                socketio.emit('badge_data_changed', {'usernames': [username]})
+            emit_chat_activity(socketio, f"Granted badge {badge.get('name', '')} to {username}.")
+        return jsonify({'status': 'ok', 'granted': bool(result.modified_count)})
 
     @app.route('/admin/users/<username>/points', methods=['POST'])
     @require_login
@@ -2929,6 +4073,11 @@ def registerroutes(app, socketio: SocketIO):
                 }), 503
         if applied:
             emit_points_changed(socketio, user)
+            applied_amount = adjustment.get('amount', amount) if adjustment else amount
+            if isinstance(applied_amount, bool) or not isinstance(applied_amount, int):
+                logger.error("Invalid applied point adjustment amount for %s", request_id)
+                applied_amount = amount
+            emit_chat_activity(socketio, f"{username} {applied_amount:+d}❖")
         return jsonify({'user': serialize_user(user)})
 
     @app.route('/admin/users/<username>/timeout', methods=['POST'])
@@ -2979,6 +4128,12 @@ def registerroutes(app, socketio: SocketIO):
         )
         if not user:
             return jsonify({'message': 'User rank changed; reload and try again'}), 409
+        timeout_message = (
+            f"{moderation_activity_prefix(actor)}unbanned {username}."
+            if data.get('clear') is True
+            else f"{moderation_activity_prefix(actor)}banned {username} for {duration_seconds}s."
+        )
+        emit_chat_activity(socketio, timeout_message)
         return jsonify({'user': serialize_user(user)})
 
     @app.route('/admin/users/<username>/rank', methods=['POST'])
@@ -2990,10 +4145,20 @@ def registerroutes(app, socketio: SocketIO):
         data = request.get_json(silent=True) or {}
         rank = data.get('rank')
         if not isinstance(rank, str):
-            return jsonify({'message': 'Select an available non-staff rank'}), 400
+            return jsonify({'message': 'Select an available rank'}), 400
         destination_role = find_role(rank)
-        if not destination_role or destination_role.get('staff') is not False:
-            return jsonify({'message': 'Select an available non-staff rank'}), 400
+        if not destination_role or not isinstance(destination_role.get('staff'), bool):
+            return jsonify({'message': 'Select an available rank'}), 400
+        destination_permissions = colpermissions.find_one({'rank_id': destination_role['_id']})
+        destination_capabilities = validated_role_capabilities(
+            destination_role,
+            destination_permissions,
+        )
+        if (
+            destination_capabilities is None
+            or destination_capabilities['rank_immutable']
+        ):
+            return jsonify({'message': 'Select an available rank'}), 400
         target = colusers.find_one({'username': username}, {'_id': 1, 'rank': 1})
         if not target:
             return jsonify({'message': 'User not found'}), 404
@@ -3005,10 +4170,15 @@ def registerroutes(app, socketio: SocketIO):
         )
         actor_profile = role_permissions(actor)
         actor_capabilities = actor_profile.get('capabilities', {}) if actor_profile else {}
+        can_assign_destination = (
+            actor_capabilities.get('assign_non_staff_rank') is True
+            if destination_role['staff'] is False
+            else str(destination_role['_id']) in permitted_role_ids(actor, 'edit_staff_role_ids')
+        )
         if (
             not allowed
             or target['_id'] == actor['_id'] and actor_capabilities.get('edit_self') is not True
-            or actor_capabilities.get('assign_non_staff_rank') is not True
+            or not can_assign_destination
         ):
             return jsonify({'message': 'You cannot modify this user rank'}), 403
 
@@ -3028,6 +4198,10 @@ def registerroutes(app, socketio: SocketIO):
             'permissions': public_role_permissions(user),
             **public_usage_cost_fields(user),
         })
+        emit_chat_activity(
+            socketio,
+            f"{moderation_activity_prefix(actor)}changed {username}'s rank to {current_rank}.",
+        )
         return jsonify({'user': serialize_user(user)})
 
     @app.route('/admin/users/<username>/reset-password', methods=['POST'])
@@ -3044,6 +4218,34 @@ def registerroutes(app, socketio: SocketIO):
                 'password_reset_token_hash': generate_password_hash(reset_token),
                 'password_reset_token_lookup': hashlib.sha256(reset_token.encode('utf-8')).hexdigest(),
                 'password_reset_token_expires_at': expires_at,
+                'password_reset_token_type': 'password',
+                'password_reset_self_service': False,
+            }},
+        )
+        if result.matched_count == 0:
+            return jsonify({'message': 'User not found'}), 404
+        user = colusers.find_one({'username': username})
+        return jsonify({
+            'user': serialize_user(user),
+            'reset_token': reset_token,
+            'reset_token_expires_at': expires_at.isoformat(),
+        })
+
+    @app.route('/admin/users/<username>/reset-email', methods=['POST'])
+    @require_login
+    def adminresetemail(username):
+        if not get_admin_user('reset_password'):
+            return jsonify({'message': 'Admin login required'}), 403
+        reset_token = secrets.token_urlsafe(32)
+        expires_at = datetime.now(timezone.utc) + PASSWORD_RESET_TOKEN_TTL
+        result = colusers.update_one(
+            {'username': username},
+            {'$set': {
+                'password_reset_token_hash': generate_password_hash(reset_token),
+                'password_reset_token_lookup': hashlib.sha256(reset_token.encode('utf-8')).hexdigest(),
+                'password_reset_token_expires_at': expires_at,
+                'password_reset_token_type': 'email',
+                'password_reset_self_service': False,
             }},
         )
         if result.matched_count == 0:
@@ -3259,6 +4461,56 @@ def registerroutes(app, socketio: SocketIO):
         except Exception:
             logger.exception("Could not load shop catalog for account %s", account.get('_id'))
             return jsonify({'message': 'Shop catalog could not be loaded'}), 503
+
+    @app.route('/account/theme', methods=['GET', 'PUT'])
+    @require_login
+    def accounttheme():
+        account = get_session_user()
+        if not account:
+            return jsonify({'message': 'Login required'}), 401
+        try:
+            themes = list_shop_assets(account)['theme']
+            if request.method == 'GET':
+                selected_theme_id = str(account.get('theme_id') or STANDARD_THEME_ID)
+                selected = next(
+                    (theme for theme in themes if theme['asset_id'] == selected_theme_id and theme['owned']),
+                    None,
+                )
+                if not selected:
+                    selected_theme_id = str(STANDARD_THEME_ID)
+                return jsonify({
+                    'themes': themes,
+                    'selected_theme_id': selected_theme_id,
+                })
+
+            data = request.get_json(silent=True)
+            theme_id = data.get('theme_id') if isinstance(data, dict) else None
+            if not isinstance(theme_id, str) or not ObjectId.is_valid(theme_id):
+                return jsonify({'message': 'Choose a valid theme'}), 400
+            theme_object_id = ObjectId(theme_id)
+            theme = colthemes.find_one({'_id': theme_object_id})
+            if not theme:
+                return jsonify({'message': 'Theme not found'}), 404
+            if (
+                theme.get('is_standard') is not True
+                and not has_permission(account, 'admin_console')
+                and not colassetownership.find_one({
+                    'user_id': account['_id'],
+                    'asset_type': 'theme',
+                    'asset_id': theme_object_id,
+                })
+            ):
+                return jsonify({'message': 'Purchase this theme before selecting it'}), 403
+            colusers.update_one(
+                {'_id': account['_id']},
+                {'$set': {'theme_id': str(theme_object_id)}},
+            )
+            return jsonify({'selected_theme_id': str(theme_object_id)})
+        except ValueError as error:
+            return jsonify({'message': str(error)}), 503
+        except Exception:
+            logger.exception("Could not load or save theme preference for account %s", account.get('_id'))
+            return jsonify({'message': 'Theme preference could not be saved'}), 503
 
     @app.route('/shop/purchase', methods=['POST'])
     @require_login
@@ -3599,6 +4851,13 @@ def registerroutes(app, socketio: SocketIO):
                 )
             current_user = colusers.find_one({'_id': user_id}) or account
             broadcast_proposed_asset(asset_type, asset, socketio)
+            label = asset.get('display_name') or asset.get('name')
+            article = 'an' if asset_type == 'emoji' else 'a'
+            emit_chat_activity(
+                socketio,
+                f"added {article} {asset_type}: {label}.",
+                actor=account['username'],
+            )
             return jsonify({
                 'status': 'ok',
                 'points': current_user.get('points', balance_after),

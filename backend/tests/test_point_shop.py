@@ -183,6 +183,40 @@ class PointShopTests(unittest.TestCase):
         self.sound_id = ObjectId()
         self.other_sound_id = ObjectId()
         self.emoji_id = ObjectId()
+        self.theme_id = ObjectId()
+        self.unavailable_theme_id = ObjectId()
+        self.themes = MemoryAssetCollection([
+            {
+                '_id': routes.STANDARD_THEME_ID,
+                'name': 'Standard',
+                'primary_color': '#f472b6',
+                'accent_color': '#ec4899',
+                'background_image_exists': False,
+                'background_opacity': 0,
+                'background_image_name': None,
+                'is_standard': True,
+            },
+            {
+                '_id': self.theme_id,
+                'name': 'Ocean',
+                'primary_color': '#38bdf8',
+                'accent_color': '#14b8a6',
+                'background_image_exists': False,
+                'background_opacity': 0,
+                'background_image_name': None,
+                'is_standard': False,
+            },
+            {
+                '_id': self.unavailable_theme_id,
+                'name': 'Unavailable Theme',
+                'primary_color': '#111111',
+                'accent_color': '#eeeeee',
+                'background_image_exists': False,
+                'background_opacity': 0,
+                'background_image_name': None,
+                'is_standard': False,
+            },
+        ])
         self.user = {
             '_id': self.user_id,
             'username': 'shop-user',
@@ -204,12 +238,14 @@ class PointShopTests(unittest.TestCase):
         self.pricing = copy.deepcopy(routes.DEFAULT_POINT_PRICING)
         self.pricing['catalog']['sound']['items']['unavailable'] = -1
         self.pricing['catalog']['emoji']['items']['party'] = 35
+        self.pricing['catalog']['theme']['items'][str(self.unavailable_theme_id)] = -1
         self.ranks = Mock()
         self.permissions = Mock()
         self.patches = [
             patch.object(routes, 'colusers', self.users),
             patch.object(routes, 'colsounds', self.sounds),
             patch.object(routes, 'colemojis', self.emojis),
+            patch.object(routes, 'colthemes', self.themes),
             patch.object(routes, 'colassetownership', self.ownership),
             patch.object(routes, 'colshoppurchases', self.purchases),
             patch.object(routes, 'colsoundfavorites', self.favorites),
@@ -255,6 +291,11 @@ class PointShopTests(unittest.TestCase):
         self.assertEqual(sound_by_name['unavailable']['price'], -1)
         self.assertEqual(sound_by_name['unavailable']['status'], 'unavailable')
         self.assertEqual(catalog['emoji'][0]['price'], 35)
+        theme_by_name = {asset['name']: asset for asset in catalog['theme']}
+        self.assertEqual(theme_by_name['Standard']['status'], 'owned')
+        self.assertEqual(theme_by_name['Ocean']['price'], 10000)
+        self.assertEqual(theme_by_name['Ocean']['status'], 'available')
+        self.assertEqual(theme_by_name['Unavailable Theme']['status'], 'unavailable')
 
     def test_catalog_groups_purchasable_owned_then_unavailable_alphabetically(self):
         available_sound_id = ObjectId()
@@ -323,6 +364,79 @@ class PointShopTests(unittest.TestCase):
         self.assertEqual(
             next(asset for asset in catalog['sound'] if asset['asset_id'] == str(self.sound_id))['status'],
             'owned',
+        )
+
+    def test_theme_purchase_uses_stable_id_ownership_and_debits_once(self):
+        self.users.update_one(
+            {'_id': self.user_id},
+            {'$set': {'points': 20000}},
+        )
+        request_id = '70ce68ad-d1f7-4d18-a9f4-7458a6d8ed4a'
+
+        first, first_status = self.buy(
+            'theme',
+            self.theme_id,
+            request_id=request_id,
+            expected_price=10000,
+        )
+        duplicate, duplicate_status = self.buy(
+            'theme',
+            self.theme_id,
+            request_id=request_id,
+            expected_price=10000,
+        )
+
+        self.assertEqual((first_status, duplicate_status), (200, 200))
+        self.assertEqual(first['points'], 10000)
+        self.assertTrue(duplicate['duplicate'])
+        self.assertEqual(self.users.find_one({'_id': self.user_id})['points'], 10000)
+        self.assertEqual(len(self.ownership.documents), 1)
+        self.assertEqual(self.ownership.documents[0]['asset_type'], 'theme')
+        self.assertEqual(self.ownership.documents[0]['asset_id'], self.theme_id)
+        self.assertEqual(len(self.transactions.documents), 1)
+
+    def test_unavailable_theme_is_visible_but_cannot_be_purchased(self):
+        catalog = routes.list_shop_assets(self.user)
+        unavailable = next(
+            asset for asset in catalog['theme']
+            if asset['asset_id'] == str(self.unavailable_theme_id)
+        )
+
+        result, status = self.buy(
+            'theme',
+            self.unavailable_theme_id,
+            request_id='80ce68ad-d1f7-4d18-a9f4-7458a6d8ed4a',
+        )
+
+        self.assertEqual(unavailable['status'], 'unavailable')
+        self.assertEqual(unavailable['price'], -1)
+        self.assertEqual(status, 403)
+        self.assertEqual(result['code'], 'asset_unavailable')
+        self.assertEqual(self.users.find_one({'_id': self.user_id})['points'], 250)
+        self.assertEqual(self.ownership.documents, [])
+
+    def test_theme_preference_requires_ownership_and_persists(self):
+        with self.client.session_transaction() as session:
+            session['user_id'] = str(self.user_id)
+
+        initial = self.client.get('/account/theme')
+        denied = self.client.put('/account/theme', json={'theme_id': str(self.theme_id)})
+        self.ownership.insert_one({
+            'user_id': self.user_id,
+            'asset_type': 'theme',
+            'asset_id': self.theme_id,
+        })
+        saved = self.client.put('/account/theme', json={'theme_id': str(self.theme_id)})
+        retrieved = self.client.get('/account/theme')
+
+        self.assertEqual(initial.status_code, 200)
+        self.assertEqual(initial.get_json()['selected_theme_id'], str(routes.STANDARD_THEME_ID))
+        self.assertEqual(denied.status_code, 403)
+        self.assertEqual(saved.status_code, 200)
+        self.assertEqual(retrieved.get_json()['selected_theme_id'], str(self.theme_id))
+        self.assertEqual(
+            self.users.find_one({'_id': self.user_id})['theme_id'],
+            str(self.theme_id),
         )
 
     def test_concurrent_purchase_requests_for_same_asset_charge_once(self):
@@ -455,6 +569,7 @@ class PointShopTests(unittest.TestCase):
 
         self.assertEqual(catalog.status_code, 200)
         self.assertEqual(len(catalog.get_json()['sound']), 2)
+        self.assertEqual(len(catalog.get_json()['theme']), 3)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.ownership.documents[0]['user_id'], self.user_id)
         self.assertEqual(self.users.find_one({'_id': self.user_id})['points'], 150)

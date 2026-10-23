@@ -287,6 +287,66 @@ class AssetOwnershipTests(unittest.TestCase):
             [],
         )
 
+    def test_client_cannot_forge_system_message_or_sender(self):
+        events = EventRegistry()
+        routes.registersocketiohandlers(events)
+        routes.lastmessages.clear()
+        self.addCleanup(routes.lastmessages.clear)
+        with (
+            patch.object(routes, 'socket_users', {
+                'socket-id': {'user_id': str(self.user_id), 'username': self.user['username']},
+            }),
+            patch.object(routes, 'request', SimpleNamespace(sid='socket-id')),
+        ):
+            events.handlers['chat_message']({
+                'user': 'forged-admin',
+                'message': 'Forged system activity',
+                'system': True,
+                'actor': 'forged-admin',
+                'rank_color': '#ff0000',
+            })
+
+        saved_message = self.chat.insert_one.call_args.args[0]
+        self.assertEqual(saved_message['user'], self.user['username'])
+        self.assertEqual(saved_message['message'], 'Forged system activity')
+        self.assertNotIn('system', saved_message)
+        self.assertNotIn('actor', saved_message)
+        self.assertEqual(saved_message['rank'], self.user['rank'])
+        self.assertNotEqual(saved_message['rank_color'], '#ff0000')
+        emitted_message = next(
+            call.args[1]
+            for call in events.emit.call_args_list
+            if call.args[0] == 'chat_message'
+        )
+        self.assertEqual(emitted_message['user'], self.user['username'])
+        self.assertNotIn('system', emitted_message)
+        self.assertNotIn('actor', emitted_message)
+
+    def test_activity_actor_is_not_treated_as_a_chat_sender(self):
+        routes.lastmessages.clear()
+        self.addCleanup(routes.lastmessages.clear)
+        socketio = Mock()
+
+        self.assertTrue(routes.emit_chat_activity(
+            socketio,
+            'added a sound: demo.',
+            actor=self.user['username'],
+        ))
+
+        saved_activity = self.chat.insert_one.call_args.args[0]
+        self.assertTrue(saved_activity['system'])
+        self.assertEqual(saved_activity['actor'], self.user['username'])
+        self.assertNotIn('user', saved_activity)
+        socketio.emit.assert_called_once_with(
+            'chat_message',
+            {
+                'system': True,
+                'actor': self.user['username'],
+                'message': 'added a sound: demo.',
+            },
+        )
+        self.assertNotIn('user', routes.lastmessages[-1])
+
     def test_chat_history_keeps_another_senders_emoji_rendering_metadata(self):
         routes.lastmessages.clear()
         self.addCleanup(routes.lastmessages.clear)
@@ -295,6 +355,11 @@ class AssetOwnershipTests(unittest.TestCase):
             'message': 'Hello :party:',
             'literal_emojis': [],
         })
+        routes.lastmessages.append({
+            'system': True,
+            'actor': 'asset-owner',
+            'message': 'added an emoji: party.',
+        })
         with patch.object(routes, 'add_current_ranks', side_effect=lambda messages: messages):
             response = self.client.get('/chathistory')
 
@@ -302,6 +367,9 @@ class AssetOwnershipTests(unittest.TestCase):
         history = json.loads(response.data)
         self.assertEqual(history[0]['message'], 'Hello :party:')
         self.assertEqual(history[0]['literal_emojis'], [])
+        self.assertEqual(history[1]['system'], True)
+        self.assertEqual(history[1]['actor'], 'asset-owner')
+        self.assertNotIn('user', history[1])
 
     def test_unregistered_public_emoji_is_sent_as_literal_for_non_owner(self):
         events = EventRegistry()

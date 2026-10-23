@@ -33,7 +33,7 @@ class PasswordResetTests(unittest.TestCase):
             "email": "existing@example.com",
             "rank": "User",
             "points": 375,
-            "password_hash": "previous-password-hash",
+            "password_hash": routes.generate_password_hash("current-password"),
             "registered_at": datetime.now(timezone.utc),
         }
         self.accounts = [self.admin, self.user]
@@ -143,7 +143,7 @@ class PasswordResetTests(unittest.TestCase):
             {
                 "status": "verified",
                 "username": "existing-user",
-                "email": "existing@example.com",
+                "recovery_type": "password",
             },
         )
         self.users.update_one.assert_not_called()
@@ -158,8 +158,7 @@ class PasswordResetTests(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.get_json()["username"], "existing-user")
-        self.assertEqual(response.get_json()["points"], 375)
+        self.assertEqual(response.get_json(), {"status": "updated"})
         self.assertTrue(check_password_hash(self.user["password_hash"], "replacement-password"))
         self.assertNotIn("password_reset_token_hash", self.user)
         self.assertNotIn("password_reset_token_lookup", self.user)
@@ -176,6 +175,8 @@ class PasswordResetTests(unittest.TestCase):
         reset_query = self.users.update_one.call_args.args[0]
         self.assertEqual(reset_query["_id"], self.user["_id"])
         self.assertIsNone(reset_query["password_hash"])
+        with self.client.session_transaction() as session:
+            self.assertNotIn("user_id", session)
         retry = self.client.post(
             "/auth/password-reset",
             json={
@@ -185,6 +186,12 @@ class PasswordResetTests(unittest.TestCase):
             },
         )
         self.assertEqual(retry.status_code, 401)
+        login = self.client.post(
+            "/auth/login",
+            json={"username": "existing-user", "password": "replacement-password"},
+        )
+        self.assertEqual(login.status_code, 200)
+        self.assertEqual(login.get_json()["username"], "existing-user")
         self.assertEqual(self.users.update_one.call_count, 1)
 
     def test_token_alone_resets_legacy_token_without_username(self):
@@ -205,7 +212,7 @@ class PasswordResetTests(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.get_json()["username"], "existing-user")
+        self.assertEqual(response.get_json(), {"status": "updated"})
         self.assertTrue(check_password_hash(self.user["password_hash"], "replacement-password"))
         self.assertNotIn("password_reset_token_hash", self.user)
         self.assertNotIn("password_reset_token_lookup", self.user)
@@ -276,6 +283,122 @@ class PasswordResetTests(unittest.TestCase):
         self.assertEqual(self.users.update_one.call_count, 0)
         self.users.insert_one.assert_not_called()
         self.transactions.update_one.assert_not_called()
+
+    def issue_email_reset_token(self):
+        self.login_as_admin()
+        with patch.object(routes.secrets, "token_urlsafe", return_value="admin-issued-email-code"):
+            response = self.client.post(
+                "/admin/users/existing-user/reset-email",
+                json={},
+            )
+        self.assertEqual(response.status_code, 200)
+        return response.get_json()["reset_token"]
+
+    def test_admin_issues_email_recovery_code_without_disabling_login(self):
+        original_password_hash = self.user["password_hash"]
+        token = self.issue_email_reset_token()
+
+        self.assertEqual(token, "admin-issued-email-code")
+        self.assertEqual(self.user["password_hash"], original_password_hash)
+        self.assertEqual(self.user["password_reset_token_type"], "email")
+        self.assertTrue(check_password_hash(self.user["password_reset_token_hash"], token))
+        self.assertTrue(self.user["password_reset_token_lookup"])
+        login = self.client.post(
+            "/auth/login",
+            json={"username": "existing-user", "password": "current-password"},
+        )
+        self.assertEqual(login.status_code, 200)
+
+    def test_email_recovery_verifies_purpose_and_changes_normalized_email(self):
+        original_password_hash = self.user["password_hash"]
+        token = self.issue_email_reset_token()
+        with self.client.session_transaction() as session:
+            session.clear()
+
+        verification = self.client.post(
+            "/auth/password-reset",
+            json={"action": "verify", "reset_token": token},
+        )
+        self.assertEqual(verification.status_code, 200)
+        self.assertEqual(
+            verification.get_json(),
+            {
+                "status": "verified",
+                "username": "existing-user",
+                "recovery_type": "email",
+            },
+        )
+        self.assertNotIn("email", verification.get_json())
+
+        wrong_purpose = self.client.post(
+            "/auth/password-reset",
+            json={
+                "reset_token": token,
+                "password": "replacement-password",
+                "confirmation": "replacement-password",
+            },
+        )
+        self.assertEqual(wrong_purpose.status_code, 400)
+        self.assertEqual(self.user["email"], "existing@example.com")
+
+        response = self.client.post(
+            "/auth/password-reset",
+            json={"reset_token": token, "email": "  New.Address@Example.COM  "},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), {"status": "updated"})
+        self.assertEqual(self.user["email"], "new.address@example.com")
+        self.assertEqual(self.user["password_hash"], original_password_hash)
+        self.assertNotIn("password_reset_token_hash", self.user)
+        self.assertNotIn("password_reset_token_lookup", self.user)
+        self.assertNotIn("password_reset_token_expires_at", self.user)
+        self.assertNotIn("password_reset_token_type", self.user)
+        with self.client.session_transaction() as session:
+            self.assertNotIn("user_id", session)
+
+        retry = self.client.post(
+            "/auth/password-reset",
+            json={"reset_token": token, "email": "another@example.com"},
+        )
+        self.assertEqual(retry.status_code, 401)
+        login = self.client.post(
+            "/auth/login",
+            json={"username": "existing-user", "password": "current-password"},
+        )
+        self.assertEqual(login.status_code, 200)
+        self.assertEqual(login.get_json()["username"], "existing-user")
+        self.assertNotIn("email", login.get_json())
+
+    def test_email_recovery_rejects_invalid_or_duplicate_email(self):
+        token = self.issue_email_reset_token()
+        with self.client.session_transaction() as session:
+            session.clear()
+
+        invalid = self.client.post(
+            "/auth/password-reset",
+            json={"reset_token": token, "email": "not-an-email"},
+        )
+        self.assertEqual(invalid.status_code, 400)
+        self.assertEqual(self.user["email"], "existing@example.com")
+
+        self.admin["email"] = "taken@example.com"
+        duplicate = self.client.post(
+            "/auth/password-reset",
+            json={"reset_token": token, "email": "taken@example.com"},
+        )
+        self.assertEqual(duplicate.status_code, 409)
+        self.assertEqual(self.user["email"], "existing@example.com")
+
+    def test_email_recovery_code_issuance_requires_admin_permission(self):
+        with self.client.session_transaction() as session:
+            session["user_id"] = str(self.user["_id"])
+            session["admin_user_id"] = str(self.user["_id"])
+        response = self.client.post(
+            "/admin/users/existing-user/reset-email",
+            json={},
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertNotIn("password_reset_token_hash", self.user)
 
 
 if __name__ == "__main__":

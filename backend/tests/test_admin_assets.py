@@ -43,6 +43,8 @@ class MemoryCollection:
             if isinstance(value, dict):
                 if '$ne' in value and actual == value['$ne']:
                     return False
+                if '$in' in value and actual not in value['$in']:
+                    return False
                 if '$regex' in value and not __import__('re').search(value['$regex'], actual or ''):
                     return False
                 if '$exists' in value and ((key in document) != value['$exists']):
@@ -60,6 +62,9 @@ class MemoryCollection:
     def find(self, query=None, *_args, **_kwargs):
         query = query or {}
         return MemoryCursor(item for item in self.documents if self.matches(item, query))
+
+    def count_documents(self, query):
+        return sum(1 for item in self.documents if self.matches(item, query))
 
     def insert_one(self, document):
         self.documents.append(copy.deepcopy(document))
@@ -83,6 +88,16 @@ class MemoryCollection:
                 document.update(copy.deepcopy(update['$setOnInsert']))
             for key, value in update.get('$inc', {}).items():
                 document[key] = document.get(key, 0) + value
+            for key, value in update.get('$addToSet', {}).items():
+                existing = document.setdefault(key, [])
+                if value not in existing:
+                    existing.append(copy.deepcopy(value))
+            for key, value in update.get('$pull', {}).items():
+                if isinstance(document.get(key), list):
+                    if isinstance(value, dict) and '$in' in value:
+                        document[key] = [item for item in document[key] if item not in value['$in']]
+                    else:
+                        document[key] = [item for item in document[key] if item != value]
             for key in update.get('$unset', {}):
                 document.pop(key, None)
         return SimpleNamespace(matched_count=1, modified_count=1)
@@ -105,10 +120,24 @@ class MemoryCollection:
         for document in self.documents:
             if self.matches(document, query):
                 matched += 1
+                for key, value in update.get('$set', {}).items():
+                    document[key] = copy.deepcopy(value)
                 for key, value in update.get('$pull', {}).items():
                     if isinstance(document.get(key), list):
                         document[key] = [item for item in document[key] if item != value]
+                for key, value in update.get('$addToSet', {}).items():
+                    existing = document.setdefault(key, [])
+                    if value not in existing:
+                        existing.append(copy.deepcopy(value))
+                for key in update.get('$unset', {}):
+                    document.pop(key, None)
         return SimpleNamespace(matched_count=matched, modified_count=matched)
+
+    def delete_many(self, query):
+        matches = [item for item in self.documents if self.matches(item, query)]
+        for item in matches:
+            self.documents.remove(item)
+        return SimpleNamespace(deleted_count=len(matches))
 
 
 class AdminAssetTests(unittest.TestCase):
@@ -118,39 +147,48 @@ class AdminAssetTests(unittest.TestCase):
         self.socketio = Mock()
         routes.registerroutes(self.app, self.socketio)
         self.client = self.app.test_client()
-        self.admin = {'_id': ObjectId(), 'username': 'asset-admin', 'rank': 'Admin', 'points': 250_000}
-        self.user = {'_id': ObjectId(), 'username': 'asset-user', 'rank': 'User', 'points': 250_000}
+        self.admin = {'_id': ObjectId(), 'username': 'asset-admin', 'rank': 'Admin', 'points': 250_000, 'email': 'admin@example.com', 'password_hash': 'admin-hash'}
+        self.user = {'_id': ObjectId(), 'username': 'asset-user', 'rank': 'User', 'points': 250_000, 'email': 'user@example.com', 'password_hash': 'user-hash'}
         self.users = MemoryCollection([self.admin, self.user])
         self.ranks = Mock()
         self.permissions = Mock()
         self.sounds = MemoryCollection()
         self.emojis = MemoryCollection()
+        self.themes = MemoryCollection()
         self.ownership = MemoryCollection()
         self.point_transactions = MemoryCollection()
         self.shop_purchases = MemoryCollection()
         self.chat = MemoryCollection()
+        self.badges = MemoryCollection()
         self.pricing = MemoryCollection([{
             '_id': routes.POINT_PRICING_ID,
             'schema_version': 1,
             'pricing': copy.deepcopy(routes.DEFAULT_POINT_PRICING),
         }])
         self.temporary_directory = tempfile.TemporaryDirectory()
+        self.public_dir = Path(self.temporary_directory.name) / 'public'
         self.sound_dir = Path(self.temporary_directory.name) / 'sounds'
         self.emoji_dir = Path(self.temporary_directory.name) / 'emojis'
+        self.badge_dir = Path(self.temporary_directory.name) / 'badges'
         self.patches = [
             patch.object(routes, 'colusers', self.users),
             patch.object(routes, 'colranks', self.ranks),
             patch.object(routes, 'colpermissions', self.permissions),
             patch.object(routes, 'colsounds', self.sounds),
             patch.object(routes, 'colemojis', self.emojis),
+            patch.object(routes, 'colbadges', self.badges),
+            patch.object(routes, 'colthemes', self.themes),
             patch.object(routes, 'colassetownership', self.ownership),
             patch.object(routes, 'colpointtransactions', self.point_transactions),
             patch.object(routes, 'colshoppurchases', self.shop_purchases),
             patch.object(routes, 'colchat', self.chat),
             patch.object(routes, 'colpricing', self.pricing),
+            patch.object(routes, 'PUBLIC_DIR', str(self.public_dir)),
             patch.object(routes, 'SOUNDDIR', str(self.sound_dir)),
             patch.object(routes, 'EMOJIDIR', str(self.emoji_dir)),
+            patch.object(routes, 'BADGEDIR', str(self.badge_dir)),
             patch.object(routes, 'lastmessages', []),
+            patch.object(routes, 'onlineusers', set()),
         ]
         for active_patch in self.patches:
             active_patch.start()
@@ -189,6 +227,14 @@ class AdminAssetTests(unittest.TestCase):
             content_type='multipart/form-data',
         )
         self.assertEqual(response.status_code, 201)
+        activity = self.chat.documents[-1]
+        self.assertTrue(activity['system'])
+        self.assertNotIn('user', activity)
+        self.assertEqual(activity['message'], 'Added emoji: partyemoji.')
+        self.socketio.emit.assert_any_call(
+            'chat_message',
+            {'system': True, 'message': 'Added emoji: partyemoji.'},
+        )
         asset_listing = self.client.get('/admin/assets/emoji')
         self.assertEqual(asset_listing.get_json()['default_price'], 100)
         self.assertEqual(asset_listing.get_json()['assets'][0]['price_exception'], -1)
@@ -224,7 +270,14 @@ class AdminAssetTests(unittest.TestCase):
         self.assertEqual(self.ownership.documents[0]['asset_id'], updated['_id'])
         self.assertFalse((self.emoji_dir / 'partyemoji.png').exists())
         self.assertTrue((self.emoji_dir / 'newparty.png').is_file())
-        self.assertEqual(self.chat.documents[0]['message'], 'Hello :newparty:')
+        self.assertEqual(
+            next(
+                message['message']
+                for message in self.chat.documents
+                if message.get('message', '').startswith('Hello ')
+            ),
+            'Hello :newparty:',
+        )
         self.assertEqual(
             self.pricing.find_one({'_id': routes.POINT_PRICING_ID})['pricing']['catalog']['emoji']['items']['newparty'],
             -1,
@@ -259,6 +312,608 @@ class AdminAssetTests(unittest.TestCase):
         )
         self.assertEqual(invalid_dimensions.status_code, 400)
         self.assertEqual(self.emojis.documents, [])
+
+    def create_badge(self, name='Community Badge'):
+        return self.client.post(
+            '/admin/badges',
+            data={
+                'name': name,
+                'file': (io.BytesIO(self.png_bytes()), 'badge.png'),
+            },
+            content_type='multipart/form-data',
+        )
+
+    def test_badge_management_grants_and_visible_badge_are_admin_authorized(self):
+        self.login_as(self.admin, admin_session=True)
+        created = self.create_badge()
+        self.assertEqual(created.status_code, 201)
+        badge = created.get_json()['badge']
+        self.assertEqual(badge['name'], 'Community Badge')
+        self.assertEqual(badge['file'], 'communitybadge.png')
+        self.assertTrue((self.badge_dir / 'communitybadge.png').is_file())
+        badge_id = badge['asset_id']
+        renamed = self.client.patch(f'/admin/badges/{badge_id}', json={'name': 'Community Icon'})
+        self.assertEqual(renamed.status_code, 200)
+        badge = renamed.get_json()['badge']
+        self.assertEqual(badge['file'], 'communityicon.png')
+        self.assertFalse((self.badge_dir / 'communitybadge.png').exists())
+        self.assertTrue((self.badge_dir / 'communityicon.png').is_file())
+        duplicate = self.create_badge('Community Icon')
+        self.assertEqual(duplicate.status_code, 409)
+
+        self.login_as(self.user, admin_session=True)
+        self.assertEqual(self.client.get('/admin/badges').status_code, 403)
+        denied = self.client.post(
+            f"/admin/users/{self.user['username']}/badges",
+            json={'badge_id': badge['asset_id']},
+        )
+        self.assertEqual(denied.status_code, 403)
+        denied_removal = self.client.delete(
+            f"/admin/users/{self.user['username']}/badges",
+            json={'badge_id': badge['asset_id']},
+        )
+        self.assertEqual(denied_removal.status_code, 403)
+
+        self.login_as(self.admin, admin_session=True)
+        granted = self.client.post(
+            f"/admin/users/{self.user['username']}/badges",
+            json={'badge_id': badge['asset_id']},
+        )
+        self.assertEqual(granted.status_code, 200)
+        self.assertEqual(
+            self.users.find_one({'_id': self.user['_id']})['badges'],
+            [ObjectId(badge['asset_id'])],
+        )
+
+        self.login_as(self.user)
+        profile = self.client.get('/account/profile').get_json()['user']
+        self.assertEqual(profile['email'], self.user['email'])
+        self.assertEqual(profile['badges'][0]['asset_id'], badge['asset_id'])
+        selected = self.client.put(
+            '/account/profile/badge',
+            json={'badge_id': badge['asset_id']},
+        )
+        self.assertEqual(selected.status_code, 200)
+        self.assertEqual(selected.get_json()['user']['visible_badge_id'], badge['asset_id'])
+        chat_message = routes.add_current_ranks([{'user': self.user['username'], 'message': 'Hello'}])[0]
+        self.assertEqual(chat_message['badge']['asset_id'], badge['asset_id'])
+        self.assertEqual(chat_message['badge']['name'], badge['name'])
+        self.assertTrue(any(
+            call.args[0] == 'chat_history'
+            for call in self.socketio.emit.call_args_list
+        ))
+
+        self.login_as(self.admin, admin_session=True)
+        removed_from_user = self.client.delete(
+            f"/admin/users/{self.user['username']}/badges",
+            json={'badge_id': badge['asset_id']},
+        )
+        self.assertEqual(removed_from_user.status_code, 200)
+        self.assertTrue(removed_from_user.get_json()['removed'])
+        updated_user = self.users.find_one({'_id': self.user['_id']})
+        self.assertEqual(updated_user.get('badges'), [])
+        self.assertNotIn('visible_badge_id', updated_user)
+
+        granted_again = self.client.post(
+            f"/admin/users/{self.user['username']}/badges",
+            json={'badge_id': badge['asset_id']},
+        )
+        self.assertTrue(granted_again.get_json()['granted'])
+        unrelated_visible_badge = str(ObjectId())
+        self.users.update_one(
+            {'_id': self.user['_id']},
+            {'$set': {'visible_badge_id': unrelated_visible_badge}},
+        )
+        removed_with_other_badge_visible = self.client.delete(
+            f"/admin/users/{self.user['username']}/badges",
+            json={'badge_id': badge['asset_id']},
+        )
+        self.assertTrue(removed_with_other_badge_visible.get_json()['removed'])
+        self.assertEqual(
+            self.users.find_one({'_id': self.user['_id']})['visible_badge_id'],
+            unrelated_visible_badge,
+        )
+        self.users.update_one(
+            {'_id': self.user['_id']},
+            {'$unset': {'visible_badge_id': ''}},
+        )
+        removed = self.client.delete(f"/admin/badges/{badge['asset_id']}")
+        self.assertEqual(removed.status_code, 200)
+        self.assertEqual(self.users.find_one({'_id': self.user['_id']}).get('badges'), [])
+        self.assertNotIn('visible_badge_id', self.users.find_one({'_id': self.user['_id']}))
+        self.assertFalse((self.badge_dir / 'communityicon.png').exists())
+
+    def test_badge_can_be_granted_to_current_online_users_only(self):
+        self.login_as(self.admin, admin_session=True)
+        created = self.create_badge()
+        badge_id = created.get_json()['badge']['asset_id']
+        routes.onlineusers.add(self.user['username'])
+        response = self.client.post(f'/admin/badges/{badge_id}/grant-online')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()['granted_count'], 1)
+        self.assertEqual(
+            self.users.find_one({'_id': self.user['_id']})['badges'],
+            [ObjectId(badge_id)],
+        )
+
+    def test_profile_private_data_and_self_service_recovery(self):
+        self.login_as(self.user)
+        own_profile = self.client.get('/admin/users/asset-user')
+        self.assertEqual(own_profile.status_code, 200)
+        self.assertEqual(own_profile.get_json()['user']['email'], self.user['email'])
+        denied = self.client.get('/admin/users/asset-admin')
+        self.assertEqual(denied.status_code, 403)
+        self.login_as(self.admin, admin_session=True)
+        inspected_profile = self.client.get('/admin/users/asset-user')
+        self.assertEqual(inspected_profile.status_code, 200)
+        self.assertEqual(inspected_profile.get_json()['user']['email'], self.user['email'])
+
+        self.login_as(self.user)
+        issued = self.client.post('/account/recovery', json={'recovery_type': 'password'})
+        self.assertEqual(issued.status_code, 200)
+        token = issued.get_json()['reset_token']
+        self.assertEqual(self.users.find_one({'_id': self.user['_id']})['password_hash'], 'user-hash')
+        self.assertEqual(self.client.get('/account/profile').status_code, 200)
+        verified = self.client.post('/auth/password-reset', json={
+            'reset_token': token,
+            'action': 'verify',
+        })
+        self.assertEqual(verified.status_code, 200)
+        self.assertEqual(verified.get_json()['recovery_type'], 'password')
+        email_reset = self.client.post('/account/recovery', json={'recovery_type': 'email'})
+        self.assertEqual(email_reset.status_code, 409)
+        completed_password = self.client.post('/auth/password-reset', json={
+            'reset_token': token,
+            'password': 'new-password',
+            'confirmation': 'new-password',
+        })
+        self.assertEqual(completed_password.status_code, 200)
+
+        self.login_as(self.user)
+        issued_email = self.client.post('/account/recovery', json={'recovery_type': 'email'})
+        self.assertEqual(issued_email.status_code, 200)
+        email_token = issued_email.get_json()['reset_token']
+        completed_email = self.client.post('/auth/password-reset', json={
+            'reset_token': email_token,
+            'email': 'updated@example.com',
+        })
+        self.assertEqual(completed_email.status_code, 200)
+        self.assertEqual(self.users.find_one({'_id': self.user['_id']})['email'], 'updated@example.com')
+
+    def test_theme_creation_validates_background_and_uses_default_price(self):
+        self.login_as(self.admin, admin_session=True)
+
+        response = self.client.post(
+            '/admin/themes',
+            data={
+                'name': 'Uploaded Theme',
+                'primary_color': '#112233',
+                'panel_color': '#223344',
+                'accent_color': '#aabbcc',
+                'background_opacity': '0.35',
+                'background': (io.BytesIO(self.png_bytes()), 'background.png'),
+            },
+            content_type='multipart/form-data',
+        )
+
+        self.assertEqual(response.status_code, 201)
+        result = response.get_json()['theme']
+        theme = self.themes.find_one({'_id': ObjectId(result['asset_id'])})
+        self.assertEqual(theme['price'], 10000)
+        self.assertFalse(theme['price_overridden'])
+        self.assertEqual(theme['primary_color'], '#112233')
+        self.assertEqual(theme['panel_color'], '#223344')
+        self.assertEqual(theme['accent_color'], '#aabbcc')
+        self.assertEqual(result['panel_color'], '#223344')
+        self.assertEqual(theme['background_opacity'], 0.35)
+        self.assertTrue(theme['background_image_exists'])
+        self.assertTrue((self.public_dir / 'img' / 'backgrounds' / theme['background_image_name']).is_file())
+        self.assertEqual(theme['background_image_name'], 'uploadedtheme.png')
+        self.assertEqual(result['url'], f"/img/backgrounds/{theme['background_image_name']}")
+        self.assertEqual(self.chat.documents[-1]['message'], 'Added theme: Uploaded Theme.')
+        self.assertTrue(self.chat.documents[-1]['system'])
+        self.assertNotIn('user', self.chat.documents[-1])
+        self.socketio.emit.assert_any_call(
+            'asset_catalog_changed',
+            {'asset_type': 'theme'},
+        )
+        self.socketio.emit.assert_any_call(
+            'chat_message',
+            {'system': True, 'message': 'Added theme: Uploaded Theme.'},
+        )
+
+    def test_theme_background_upload_accepts_17_mib_and_uses_normalized_name(self):
+        self.login_as(self.admin, admin_session=True)
+        image = self.png_bytes(4097, 4097) + (b'\x00' * (17 * 1024 * 1024))
+
+        response = self.client.post(
+            '/admin/themes',
+            data={
+                'name': 'X mas!',
+                'primary_color': '#112233',
+                'panel_color': '#223344',
+                'accent_color': '#aabbcc',
+                'background_opacity': '0.35',
+                'background': (io.BytesIO(image), 'background.png'),
+            },
+            content_type='multipart/form-data',
+        )
+
+        self.assertEqual(response.status_code, 201)
+        theme = self.themes.find_one({'_id': ObjectId(response.get_json()['theme']['asset_id'])})
+        self.assertEqual(theme['background_image_name'], 'xmas.png')
+        self.assertTrue((self.public_dir / 'img' / 'backgrounds' / 'xmas.png').is_file())
+
+    def test_theme_background_upload_rejects_files_over_50_mib(self):
+        self.login_as(self.admin, admin_session=True)
+        image = self.png_bytes() + (b'\x00' * (50 * 1024 * 1024))
+
+        response = self.client.post(
+            '/admin/themes',
+            data={
+                'name': 'Oversized Theme',
+                'primary_color': '#112233',
+                'panel_color': '#223344',
+                'accent_color': '#aabbcc',
+                'background_opacity': '0.35',
+                'background': (io.BytesIO(image), 'background.png'),
+            },
+            content_type='multipart/form-data',
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.get_json()['message'],
+            'Theme backgrounds must be no larger than 50 MB',
+        )
+        self.assertEqual(self.themes.documents, [])
+
+    def test_theme_background_upload_rejects_dimensions_over_8192_pixels(self):
+        self.login_as(self.admin, admin_session=True)
+
+        response = self.client.post(
+            '/admin/themes',
+            data={
+                'name': 'Oversized Dimensions',
+                'primary_color': '#112233',
+                'panel_color': '#223344',
+                'accent_color': '#aabbcc',
+                'background_opacity': '0.35',
+                'background': (io.BytesIO(self.png_bytes(8193, 1)), 'background.png'),
+            },
+            content_type='multipart/form-data',
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.get_json()['message'],
+            'Theme background dimensions must not exceed 8192 by 8192 pixels',
+        )
+        self.assertEqual(self.themes.documents, [])
+
+    def test_duplicate_normalized_theme_background_filename_is_rejected(self):
+        self.login_as(self.admin, admin_session=True)
+
+        first = self.client.post(
+            '/admin/themes',
+            data={
+                'name': 'Gierek',
+                'primary_color': '#112233',
+                'panel_color': '#223344',
+                'accent_color': '#aabbcc',
+                'background_opacity': '0.35',
+                'background': (io.BytesIO(self.png_bytes()), 'first.png'),
+            },
+            content_type='multipart/form-data',
+        )
+        self.assertEqual(first.status_code, 201)
+        first_theme_id = first.get_json()['theme']['asset_id']
+        self.assertEqual(
+            self.themes.find_one({'_id': ObjectId(first_theme_id)})['background_image_name'],
+            'gierek.png',
+        )
+
+        duplicate = self.client.post(
+            '/admin/themes',
+            data={
+                'name': 'GIEREK!',
+                'primary_color': '#112233',
+                'panel_color': '#223344',
+                'accent_color': '#aabbcc',
+                'background_opacity': '0.35',
+                'background': (io.BytesIO(self.png_bytes()), 'second.png'),
+            },
+            content_type='multipart/form-data',
+        )
+
+        self.assertEqual(duplicate.status_code, 409)
+        self.assertIn('normalized theme name', duplicate.get_json()['message'])
+        self.assertEqual(len(self.themes.documents), 1)
+        self.assertTrue((self.public_dir / 'img' / 'backgrounds' / 'gierek.png').is_file())
+
+    def test_theme_rename_rejects_background_filename_used_by_another_theme(self):
+        self.login_as(self.admin, admin_session=True)
+        existing_background = self.client.post(
+            '/admin/themes',
+            data={
+                'name': 'Gierek',
+                'primary_color': '#112233',
+                'panel_color': '#223344',
+                'accent_color': '#aabbcc',
+                'background_opacity': '0.35',
+                'background': (io.BytesIO(self.png_bytes()), 'first.png'),
+            },
+            content_type='multipart/form-data',
+        ).get_json()['theme']
+        other_theme = self.client.post(
+            '/admin/themes',
+            data={
+                'name': 'Other Theme',
+                'primary_color': '#112233',
+                'panel_color': '#223344',
+                'accent_color': '#aabbcc',
+                'background_opacity': '0.35',
+                'background': (io.BytesIO(self.png_bytes()), 'second.png'),
+            },
+            content_type='multipart/form-data',
+        ).get_json()['theme']
+        other_theme_id = ObjectId(other_theme['asset_id'])
+
+        response = self.client.patch(
+            f"/admin/themes/{other_theme_id}",
+            data={
+                'name': 'GIEREK!',
+                'primary_color': '#112233',
+                'panel_color': '#223344',
+                'accent_color': '#aabbcc',
+            },
+            content_type='multipart/form-data',
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn('normalized theme name', response.get_json()['message'])
+        self.assertEqual(
+            self.themes.find_one({'_id': ObjectId(existing_background['asset_id'])})['background_image_name'],
+            'gierek.png',
+        )
+        self.assertEqual(self.themes.find_one({'_id': other_theme_id})['name'], 'Other Theme')
+
+    def test_theme_rename_renames_existing_background_file(self):
+        self.login_as(self.admin, admin_session=True)
+        created = self.client.post(
+            '/admin/themes',
+            data={
+                'name': 'Old Name',
+                'primary_color': '#112233',
+                'panel_color': '#223344',
+                'accent_color': '#aabbcc',
+                'background_opacity': '0.35',
+                'background': (io.BytesIO(self.png_bytes()), 'background.png'),
+            },
+            content_type='multipart/form-data',
+        )
+        theme = created.get_json()['theme']
+
+        updated = self.client.patch(
+            f"/admin/themes/{theme['asset_id']}",
+            data={
+                'name': 'New Name!',
+                'primary_color': '#112233',
+                'panel_color': '#223344',
+                'accent_color': '#aabbcc',
+            },
+            content_type='multipart/form-data',
+        )
+
+        self.assertEqual(updated.status_code, 200)
+        saved = self.themes.find_one({'_id': ObjectId(theme['asset_id'])})
+        self.assertEqual(saved['background_image_name'], 'newname.png')
+        self.assertFalse((self.public_dir / 'img' / 'backgrounds' / 'oldname.png').exists())
+        self.assertTrue((self.public_dir / 'img' / 'backgrounds' / 'newname.png').is_file())
+
+    def test_theme_price_override_is_saved_in_shared_catalog_pricing(self):
+        self.login_as(self.admin, admin_session=True)
+
+        response = self.client.post(
+            '/admin/themes',
+            data={
+                'name': 'Priced Theme',
+                'primary_color': '#112233',
+                'panel_color': '#223344',
+                'accent_color': '#aabbcc',
+                'price': '2500',
+            },
+            content_type='multipart/form-data',
+        )
+
+        self.assertEqual(response.status_code, 201)
+        theme_id = response.get_json()['theme']['asset_id']
+        theme = self.themes.find_one({'_id': ObjectId(theme_id)})
+        saved_pricing = self.pricing.find_one({'_id': routes.POINT_PRICING_ID})['pricing']
+        self.assertEqual(saved_pricing['catalog']['theme']['items'][theme_id], 2500)
+        self.assertEqual(theme['price'], 2500)
+        self.assertTrue(theme['price_overridden'])
+
+    def test_admin_can_search_and_edit_theme_fields_background_and_price(self):
+        self.login_as(self.admin, admin_session=True)
+        theme_id = ObjectId()
+        self.themes.insert_one({
+            '_id': theme_id,
+            'name': 'Editable Theme',
+            'name_key': 'editable theme',
+            'price': 10000,
+            'price_overridden': False,
+            'primary_color': '#000000',
+            'panel_color': '#171717',
+            'accent_color': '#f9a8d4',
+            'background_image_exists': False,
+            'background_opacity': 0.0,
+            'background_image_name': None,
+            'is_standard': False,
+        })
+
+        updated = self.client.patch(
+            f'/admin/themes/{theme_id}',
+            data={
+                'name': 'Updated Theme',
+                'primary_color': '#111111',
+                'panel_color': '#222222',
+                'accent_color': '#f9a8d4',
+                'price': '2500',
+                'background_opacity': '0.4',
+                'background': (io.BytesIO(self.png_bytes()), 'background.png'),
+            },
+            content_type='multipart/form-data',
+        )
+        updated_theme = self.themes.find_one({'_id': theme_id})
+        background_path = self.public_dir / 'img' / 'backgrounds' / updated_theme['background_image_name']
+
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(updated_theme['name'], 'Updated Theme')
+        self.assertEqual(updated_theme['primary_color'], '#111111')
+        self.assertEqual(updated_theme['panel_color'], '#222222')
+        self.assertEqual(updated.get_json()['theme']['panel_color'], '#222222')
+        self.assertEqual(updated_theme['price'], 2500)
+        self.assertTrue(background_path.is_file())
+        self.assertEqual(updated_theme['background_image_name'], 'updatedtheme.png')
+        self.assertEqual(self.chat.documents[-1]['message'], 'Updated theme: Updated Theme.')
+        self.assertNotIn('user', self.chat.documents[-1])
+        self.socketio.emit.assert_any_call(
+            'chat_message',
+            {'system': True, 'message': 'Updated theme: Updated Theme.'},
+        )
+        self.assertEqual(
+            self.pricing.find_one({'_id': routes.POINT_PRICING_ID})['pricing']['catalog']['theme']['items'][str(theme_id)],
+            2500,
+        )
+
+        removed_background = self.client.patch(
+            f'/admin/themes/{theme_id}',
+            data={
+                'name': 'Updated Theme',
+                'primary_color': '#111111',
+                'panel_color': '#222222',
+                'accent_color': '#f9a8d4',
+                'price': '',
+                'background_opacity': '0.4',
+                'remove_background': 'true',
+            },
+            content_type='multipart/form-data',
+        )
+        updated_theme = self.themes.find_one({'_id': theme_id})
+
+        self.assertEqual(removed_background.status_code, 200)
+        self.assertFalse(updated_theme['background_image_exists'])
+        self.assertIsNone(updated_theme['background_image_name'])
+        self.assertFalse(background_path.exists())
+        self.assertNotIn(
+            str(theme_id),
+            self.pricing.find_one({'_id': routes.POINT_PRICING_ID})['pricing']['catalog']['theme']['items'],
+        )
+
+    def test_admin_can_remove_theme_and_clear_ownership_and_selected_theme(self):
+        self.login_as(self.admin, admin_session=True)
+        theme_id = ObjectId()
+        background_directory = self.public_dir / 'img' / 'backgrounds'
+        background_directory.mkdir(parents=True)
+        background_path = background_directory / f'{theme_id}.png'
+        background_path.write_bytes(self.png_bytes())
+        theme = {
+            '_id': theme_id,
+            'name': 'Removable Theme',
+            'name_key': 'removable theme',
+            'price': 500,
+            'price_overridden': True,
+            'primary_color': '#111111',
+            'panel_color': '#222222',
+            'accent_color': '#f9a8d4',
+            'background_image_exists': True,
+            'background_opacity': 0.4,
+            'background_image_name': background_path.name,
+            'is_standard': False,
+        }
+        self.themes.insert_one(theme)
+        pricing = copy.deepcopy(self.pricing.find_one({'_id': routes.POINT_PRICING_ID})['pricing'])
+        pricing['catalog']['theme']['items'][str(theme_id)] = 500
+        self.pricing.update_one(
+            {'_id': routes.POINT_PRICING_ID},
+            {'$set': {'pricing': pricing}},
+        )
+        self.ownership.insert_one({
+            'user_id': self.user['_id'],
+            'asset_type': 'theme',
+            'asset_id': theme_id,
+        })
+        self.users.update_one({'_id': self.user['_id']}, {'$set': {'theme_id': str(theme_id)}})
+
+        response = self.client.delete(f'/admin/themes/{theme_id}')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(self.themes.find_one({'_id': theme_id}))
+        self.assertEqual(self.ownership.documents, [])
+        self.assertEqual(self.users.find_one({'_id': self.user['_id']})['theme_id'], str(routes.STANDARD_THEME_ID))
+        self.assertFalse(background_path.exists())
+        self.assertEqual(self.pricing.find_one({'_id': routes.POINT_PRICING_ID})['pricing']['catalog']['theme']['items'], {})
+        self.assertEqual(self.chat.documents[-1]['message'], 'Removed theme: Removable Theme.')
+        self.socketio.emit.assert_any_call('asset_catalog_changed', {'asset_type': 'theme'})
+
+    def test_theme_creation_rejects_non_admin_invalid_images_and_private_urls(self):
+        self.login_as(self.user, admin_session=True)
+        base_form = {
+            'name': 'Blocked Theme',
+            'primary_color': '#112233',
+            'accent_color': '#aabbcc',
+        }
+        denied_edit = self.client.patch(
+            f"/admin/themes/{ObjectId()}",
+            data=base_form,
+            content_type='multipart/form-data',
+        )
+        denied_delete = self.client.delete(f"/admin/themes/{ObjectId()}")
+        denied = self.client.post(
+            '/admin/themes',
+            data={**base_form, 'background': (io.BytesIO(self.png_bytes()), 'background.png')},
+            content_type='multipart/form-data',
+        )
+        self.assertEqual(denied_edit.status_code, 403)
+        self.assertEqual(denied_delete.status_code, 403)
+        self.assertEqual(denied.status_code, 403)
+
+        self.login_as(self.admin, admin_session=True)
+        invalid_image = self.client.post(
+            '/admin/themes',
+            data={
+                **base_form,
+                'background_opacity': '0.5',
+                'background': (io.BytesIO(b'not an image'), 'background.png'),
+            },
+            content_type='multipart/form-data',
+        )
+        invalid_opacity = self.client.post(
+            '/admin/themes',
+            data={
+                **base_form,
+                'name': 'Invalid Opacity Theme',
+                'background_opacity': '1.2',
+                'background': (io.BytesIO(self.png_bytes()), 'background.png'),
+            },
+            content_type='multipart/form-data',
+        )
+        private_url = self.client.post(
+            '/admin/themes',
+            data={
+                **base_form,
+                'name': 'Private URL Theme',
+                'background_opacity': '0.5',
+                'background_url': 'https://127.0.0.1/background.png',
+            },
+            content_type='multipart/form-data',
+        )
+
+        self.assertEqual(invalid_image.status_code, 400)
+        self.assertEqual(invalid_opacity.status_code, 400)
+        self.assertEqual(private_url.status_code, 400)
+        self.assertEqual(self.themes.documents, [])
 
     def test_duplicate_normalized_emoji_names_are_rejected(self):
         self.login_as(self.admin, admin_session=True)
@@ -321,6 +976,36 @@ class AdminAssetTests(unittest.TestCase):
             self.assertTrue(Path(temporary_path).is_file())
         finally:
             Path(temporary_path).unlink(missing_ok=True)
+
+    def test_blank_managed_sound_prices_clear_exceptions_to_use_defaults(self):
+        self.login_as(self.admin, admin_session=True)
+        sound_id = ObjectId()
+        self.sounds.insert_one({
+            '_id': sound_id,
+            'name': 'defaultsound',
+            'pricing_name': 'defaultsound',
+            'display_name': 'Defaultsound',
+            'loudness': 1.0,
+            'file': 'defaultsound.mp3',
+        })
+        pricing = self.pricing.documents[0]['pricing']
+        pricing['catalog']['sound']['items']['defaultsound.mp3'] = 25
+        pricing['catalog']['sound']['play_items']['defaultsound.mp3'] = 5
+
+        response = self.client.patch(
+            f'/admin/assets/sound/{sound_id}',
+            json={
+                'display_name': 'Defaultsound',
+                'loudness': 1.0,
+                'price': None,
+                'play_price': None,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        saved_pricing = routes.load_point_pricing()['catalog']['sound']
+        self.assertNotIn('defaultsound.mp3', saved_pricing['items'])
+        self.assertNotIn('defaultsound.mp3', saved_pricing['play_items'])
 
     def test_sound_upload_defaults_empty_loudness_and_accepts_two_times_gain(self):
         self.login_as(self.admin, admin_session=True)

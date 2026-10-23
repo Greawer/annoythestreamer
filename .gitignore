@@ -41,21 +41,7 @@ env/
 .pytest_cache/
 .coverage*
 
-# User-provided emoji images
-/public/img/emoji/*.png
-/public/img/emoji/*.jpg
-/public/img/emoji/*.jpeg
-!/public/img/emoji/.gitkeep
-
-# User-provided soundboard audio
-/public/sounds/soundboard/*.[mM][pP]3
-/public/sounds/soundboard/*.[mM]4[aA]
-/public/sounds/soundboard/*.[wW][aA][vV]
-
-# Local legacy soundboard configuration
-/public/sounds/soundboard/_sound-list.txt
-
-# Runtime-generated TTS audio and temporary output
-/public/sounds/tts/*.mp3
-/public/sounds/tts/*.tmp
-/public/sounds/tts/*.part
+# Public assets are local-only; keep directory structure without asset files
+/public/**
+!/public/**/
+!/public/**/.gitkeep

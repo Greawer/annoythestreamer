@@ -54,11 +54,14 @@ class PointPricingTests(unittest.TestCase):
         self.ranks = Mock()
         self.permissions = Mock()
         self.pricing = InMemoryPricing()
+        self.themes = Mock()
+        self.themes.find.return_value = []
         self.patches = [
             patch.object(routes, 'colusers', self.users),
             patch.object(routes, 'colranks', self.ranks),
             patch.object(routes, 'colpermissions', self.permissions),
             patch.object(routes, 'colpricing', self.pricing),
+            patch.object(routes, 'colthemes', self.themes),
         ]
         for active_patch in self.patches:
             active_patch.start()
@@ -92,6 +95,11 @@ class PointPricingTests(unittest.TestCase):
                         'super_rare_golden_emoji': 10000,
                         'unavailable_emoji': -1,
                     },
+                },
+                'theme': {
+                    'default': 10000,
+                    'categories': {},
+                    'items': {},
                 },
                 'sound': {
                     'default': 100,
@@ -130,7 +138,11 @@ class PointPricingTests(unittest.TestCase):
         self.assertEqual(retrieved.get_json()['pricing'], self.admin_payload())
         self.assertEqual(self.pricing.document['_id'], routes.POINT_PRICING_ID)
         self.assertEqual(self.pricing.document['pricing'], self.admin_payload())
-        self.socketio.emit.assert_called_once_with('usage_costs_changed')
+        self.socketio.emit.assert_any_call('usage_costs_changed')
+        self.socketio.emit.assert_any_call(
+            'chat_message',
+            {'system': True, 'message': 'Point Shop pricing was updated.'},
+        )
 
     def test_admin_play_prices_persist_separately_from_sound_purchase_prices(self):
         self.login_as(self.admin)
@@ -179,6 +191,24 @@ class PointPricingTests(unittest.TestCase):
         self.assertEqual(routes.resolve_sound_play_price(sound, pricing), 7)
         self.assertEqual(routes.resolve_catalog_asset_price('sound', sound, pricing), 100)
 
+    def test_theme_default_and_stable_id_price_overrides_are_validated(self):
+        pricing = self.admin_payload()
+        theme_id = str(ObjectId())
+        pricing['catalog']['theme']['items'][theme_id] = -1
+        normalized = routes.validate_point_pricing(pricing)
+        theme = {'_id': ObjectId(theme_id), 'name': 'Ocean'}
+
+        self.assertEqual(normalized['catalog']['theme']['default'], 10000)
+        self.assertEqual(
+            routes.resolve_catalog_asset_price('theme', theme, normalized),
+            -1,
+        )
+        del normalized['catalog']['theme']['items'][theme_id]
+        self.assertEqual(
+            routes.resolve_catalog_asset_price('theme', theme, normalized),
+            10000,
+        )
+
     def test_vip_discount_applies_to_default_and_exception_play_prices(self):
         pricing = routes.validate_point_pricing(self.admin_payload())
         pricing['catalog']['sound']['play_default'] = 11
@@ -195,6 +225,19 @@ class PointPricingTests(unittest.TestCase):
             with self.subTest(default=invalid):
                 payload = self.admin_payload()
                 payload['catalog']['sound']['play_default'] = invalid
+                with self.assertRaises(ValueError):
+                    routes.validate_point_pricing(payload)
+
+    def test_invalid_theme_prices_are_rejected(self):
+        for invalid in (-2, 1.5, True, '5'):
+            with self.subTest(default=invalid):
+                payload = self.admin_payload()
+                payload['catalog']['theme']['default'] = invalid
+                with self.assertRaises(ValueError):
+                    routes.validate_point_pricing(payload)
+            with self.subTest(exception=invalid):
+                payload = self.admin_payload()
+                payload['catalog']['theme']['items'][str(ObjectId())] = invalid
                 with self.assertRaises(ValueError):
                     routes.validate_point_pricing(payload)
             with self.subTest(exception=invalid):
