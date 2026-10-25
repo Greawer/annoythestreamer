@@ -41,7 +41,15 @@ env/
 .pytest_cache/
 .coverage*
 
-# Public assets are local-only; keep directory structure without asset files
+# Local external Stream Deck tool
+/ulanzi-d200/
+
+# Local archive output and reference material
+/archive/
+
+# Public assets are local-only except the facememe placeholder
 /public/**
 !/public/**/
 !/public/**/.gitkeep
+/public/reference/
+!/public/img/meme/facememe/facememe-template-placeholder.png

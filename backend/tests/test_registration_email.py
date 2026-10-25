@@ -139,7 +139,9 @@ class RegistrationEmailTests(unittest.TestCase):
             "streaming": True,
             "stream_started_at": started_at,
         }
-        self.users.find_one.side_effect = [None, account]
+        account["last_stream_award_started_at"] = started_at
+        account["last_stream_award_interval"] = 3
+        self.users.find_one.side_effect = [None, account, account]
         self.users.insert_one.return_value = SimpleNamespace(inserted_id=user_id)
         self.users.find_one_and_update.return_value = None
         self.ranks.find_one.return_value = {"rank": "User"}

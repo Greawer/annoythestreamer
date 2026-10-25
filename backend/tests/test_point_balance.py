@@ -24,27 +24,37 @@ class AtomicStreamUser:
         }
         self.lock = threading.Lock()
 
-    def find_one_and_update(self, _query, update, return_document=None):
+    def find_one(self, _query, *_args, **_kwargs):
+        with self.lock:
+            return dict(self.account)
+
+    def find_one_and_update(self, query, update, return_document=None):
         with self.lock:
             fields = update[0]["$set"]
-            started_at = fields["last_stream_award_started_at"]
+            started_at = query["last_stream_award_started_at"]
             interval = fields["last_stream_award_interval"]
             previous_started_at = self.account.get("last_stream_award_started_at")
+            if previous_started_at and previous_started_at.tzinfo is None:
+                previous_started_at = previous_started_at.replace(tzinfo=timezone.utc)
             previous_interval = self.account.get("last_stream_award_interval", 0)
             if self.account["banned"]:
                 return None
-            if previous_started_at == started_at and previous_interval >= interval:
+            if (
+                previous_started_at != started_at
+                or previous_interval != interval - 1
+            ):
                 return None
+            amount = fields["points"]["$add"][1]
             if previous_started_at and previous_started_at > started_at:
                 return None
-            self.account["points"] += 100
+            self.account["points"] += amount
             self.account["last_stream_award_started_at"] = started_at
             self.account["last_stream_award_interval"] = interval
             self.account["pending_point_transactions"] = [
                 {
                     "request_id": f"stream:{started_at.isoformat()}:{interval}:online-user",
                     "action_type": "stream_award",
-                    "amount": 100,
+                    "amount": amount,
                     "balance_after": self.account["points"],
                 }
             ]
@@ -91,6 +101,18 @@ class PointBalanceTests(unittest.TestCase):
         for active_patch in reversed(self.patches):
             active_patch.stop()
 
+    def test_stream_restart_clears_active_state_and_keeps_saved_settings(self):
+        routes.reset_stream_points_state()
+
+        query, update = self.settings.update_one.call_args.args[:2]
+        self.assertEqual(query, {"_id": "stream_points"})
+        self.assertEqual(update["$set"], {"streaming": False})
+        self.assertIn("stream_started_at", update["$unset"])
+        self.assertIn("active_points_per_interval", update["$unset"])
+        self.assertIn("active_interval_seconds", update["$unset"])
+        self.assertNotIn("points_per_interval", update["$unset"])
+        self.assertNotIn("interval_seconds", update["$unset"])
+
     def test_session_returns_current_server_balance(self):
         user_id = ObjectId()
         self.users.find_one.return_value = {
@@ -136,6 +158,8 @@ class PointBalanceTests(unittest.TestCase):
             "_id": user_id,
             "username": "online-user",
             "points": 1100,
+            "last_stream_award_started_at": None,
+            "last_stream_award_interval": 0,
             "pending_point_transactions": [{
                 "request_id": "stream:stream-started:1:online-user",
                 "action_type": "stream_award",
@@ -143,11 +167,16 @@ class PointBalanceTests(unittest.TestCase):
                 "balance_after": 1100,
             }],
         }
+        started_at = datetime.now(timezone.utc) - timedelta(seconds=61)
+        account["last_stream_award_started_at"] = started_at.replace(tzinfo=None)
         self.settings.find_one.return_value = {
             "_id": "stream_points",
             "streaming": True,
-            "stream_started_at": datetime.now(timezone.utc) - timedelta(minutes=1),
+            "stream_started_at": started_at,
+            "active_points_per_interval": 100,
+            "active_interval_seconds": 60,
         }
+        self.users.find_one.return_value = account
         self.users.find_one_and_update.return_value = account
 
         with (
@@ -202,11 +231,18 @@ class PointBalanceTests(unittest.TestCase):
         user_id = ObjectId()
         users = AtomicStreamUser(user_id)
         settings = Mock()
+        started_at = datetime.now(timezone.utc) - timedelta(seconds=61)
         settings.find_one.return_value = {
             "_id": "stream_points",
             "streaming": True,
-            "stream_started_at": datetime.now(timezone.utc) - timedelta(minutes=2),
+            "stream_started_at": started_at,
+            "active_points_per_interval": 25,
+            "active_interval_seconds": 30,
         }
+        users.account.update({
+            "last_stream_award_started_at": started_at.replace(tzinfo=None),
+            "last_stream_award_interval": 0,
+        })
         with (
             patch.object(routes, "colusers", users),
             patch.object(routes, "colsettings", settings),
@@ -215,8 +251,43 @@ class PointBalanceTests(unittest.TestCase):
             with ThreadPoolExecutor(max_workers=2) as pool:
                 awarded = list(pool.map(lambda _index: routes.award_stream_points(), range(2)))
 
-        self.assertEqual(sum(awarded), 1)
-        self.assertEqual(users.account["points"], 100)
+        self.assertEqual(sum(awarded), 2)
+        self.assertEqual(users.account["points"], 50)
+        self.assertEqual(users.account["last_stream_award_interval"], 2)
+
+    def test_stream_award_waits_for_complete_configured_interval(self):
+        user_id = ObjectId()
+        user = AtomicStreamUser(user_id)
+        started_at = datetime.now(timezone.utc)
+        user.account.update({
+            "last_stream_award_started_at": started_at.replace(tzinfo=None),
+            "last_stream_award_interval": 0,
+        })
+        settings = Mock()
+        settings.find_one.return_value = {
+            "_id": "stream_points",
+            "streaming": True,
+            "stream_started_at": started_at,
+            "active_points_per_interval": 25,
+            "active_interval_seconds": 30,
+        }
+        with (
+            patch.object(routes, "colusers", user),
+            patch.object(routes, "colsettings", settings),
+            patch.object(routes, "onlineusers", {"online-user"}),
+        ):
+            self.assertEqual(
+                routes.award_stream_points(now=started_at + timedelta(seconds=29)),
+                0,
+            )
+            self.assertEqual(user.account["points"], 0)
+            self.assertEqual(
+                routes.award_stream_points(now=started_at + timedelta(seconds=30)),
+                1,
+            )
+
+        self.assertEqual(user.account["points"], 25)
+        self.assertEqual(user.account["last_stream_award_interval"], 1)
 
     def test_admin_adjustment_notifies_the_target_account(self):
         user_id = ObjectId()

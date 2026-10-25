@@ -10,6 +10,8 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Badge } from "@/components/ui/badge"
+import { FaceMemeArtwork } from "@/components/facememe-artwork"
+import { NormalMemeArtwork } from "@/components/normalmeme-artwork"
 import {
   MessageSquare,
   ImageIcon,
@@ -77,6 +79,11 @@ interface RolePermissions {
   rank_id: string
   staff: boolean | null
   capabilities: Record<string, unknown>
+}
+
+interface StreamPointSettings {
+  points_per_interval: string
+  interval_seconds: string
 }
 
 interface PointPricing {
@@ -253,6 +260,23 @@ function contrastingTextColor(color: string): "#000000" | "#ffffff" {
   })
   const luminance = 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
   return luminance > 0.179 ? "#000000" : "#ffffff"
+}
+
+function formatBanUntil(value: string) {
+  const date = new Date(value)
+  if (!Number.isFinite(date.getTime())) return "Unknown"
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    day: "2-digit",
+    month: "2-digit",
+    year: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(date)
+  const part = (type: Intl.DateTimeFormatPartTypes) =>
+    parts.find((item) => item.type === type)?.value ?? ""
+  return `${part("day")}.${part("month")}.${part("year")} ${part("hour")}:${part("minute")}:${part("second")}`
 }
 
 export default function AnnoyTheStreamer() {
@@ -521,6 +545,12 @@ export default function AnnoyTheStreamer() {
     }
   }, [showOnlineList])
   const [isStreaming, setIsStreaming] = useState(false)
+  const [streamPointSettings, setStreamPointSettings] = useState<StreamPointSettings>({
+    points_per_interval: "100",
+    interval_seconds: "60",
+  })
+  const [streamSettingsLoading, setStreamSettingsLoading] = useState(false)
+  const [streamSettingsSaving, setStreamSettingsSaving] = useState(false)
   const isActiveTimeout = (timeoutUntil: string | null) => {
     if (!timeoutUntil) return false
     const expiresAt = Date.parse(timeoutUntil)
@@ -1702,6 +1732,34 @@ export default function AnnoyTheStreamer() {
   }, [])
 
   useEffect(() => {
+    if (!isAdmin) return
+    let cancelled = false
+    setStreamSettingsLoading(true)
+    fetch("/api/admin/streaming/settings")
+      .then(async (response) => {
+        const result = await response.json()
+        if (!response.ok) throw new Error(result.message || "Could not load stream settings")
+        if (!cancelled) {
+          setStreamPointSettings({
+            points_per_interval: String(result.points_per_interval),
+            interval_seconds: String(result.interval_seconds),
+          })
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setAdminError(error instanceof Error ? error.message : "Could not load stream settings")
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setStreamSettingsLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [isAdmin])
+
+  useEffect(() => {
     if (!username) {
       setCurrentModerationStatus(null)
       return
@@ -1792,10 +1850,62 @@ useEffect(() => {
 	  socket.emit('getusers');
 	});
 
-  socket.on('points_changed', () => {
-    void refreshCurrentPoints()
-    void refreshVisibleUserInfo(username)
-  });
+	const localAudioContext = isAdmin ? new AudioContext() : null
+	const localAudioElements = new Set<HTMLAudioElement>()
+	const playLocalAudio = (src: string, loudness = 1) => {
+	  if (!localAudioContext) return
+	  const audio = new Audio(src)
+	  const source = localAudioContext.createMediaElementSource(audio)
+	  const gain = localAudioContext.createGain()
+	  gain.gain.value = Math.max(0, Math.min(2, loudness))
+	  source.connect(gain)
+	  gain.connect(localAudioContext.destination)
+	  localAudioElements.add(audio)
+	  audio.addEventListener("ended", () => localAudioElements.delete(audio), { once: true })
+	  audio.addEventListener("error", () => {
+	    localAudioElements.delete(audio)
+	    console.error("Local audio playback failed:", audio.error)
+	  }, { once: true })
+	  if (localAudioContext.state === "suspended") {
+	    void localAudioContext.resume().catch((error: unknown) => {
+	      console.error("Local audio context could not be resumed:", error)
+	    })
+	  }
+	  void audio.play().catch((error: unknown) => {
+	    localAudioElements.delete(audio)
+	    if (error instanceof Error && error.name === "NotAllowedError") {
+	      console.error("Local audio playback was blocked; allow audio playback for this site.")
+	    } else {
+	      console.error("Local audio playback failed:", error)
+	    }
+	  })
+	}
+
+	if (isAdmin) {
+	  socket.on('playsound', (event: { file?: unknown; loudness?: unknown }) => {
+	    if (
+	      typeof event?.file !== "string"
+	      || !event.file
+	      || event.file === "."
+	      || event.file === ".."
+	      || /[\\/]/.test(event.file)
+	    ) return
+	    const loudness = typeof event.loudness === "number" && Number.isFinite(event.loudness)
+	      ? event.loudness
+	      : 1
+	    playLocalAudio(`/static/sounds/soundboard/${encodeURIComponent(event.file)}.mp3`, loudness)
+	  })
+
+	  socket.on('tts_generated', (event: { _id?: unknown }) => {
+	    if (typeof event?._id !== "string" || !/^[a-f\d]{24}$/i.test(event._id)) return
+	    playLocalAudio(`/static/sounds/tts/${event._id}_tts.mp3`)
+	  })
+	}
+
+	socket.on('points_changed', () => {
+	  void refreshCurrentPoints()
+	  void refreshVisibleUserInfo(username)
+	});
 
   socket.on('usage_costs_changed', () => {
     void refreshOwnedAssetLists().catch((error) => {
@@ -1930,6 +2040,12 @@ useEffect(() => {
 
   return () => {
     socket.disconnect();
+    localAudioElements.forEach((audio) => {
+      audio.pause()
+      audio.removeAttribute("src")
+      audio.load()
+    })
+    if (localAudioContext) void localAudioContext.close()
   };
 }, [username, isAdmin, fetchShopCatalog, refreshAccountThemes, refreshCurrentPoints, refreshPublicEmojiUrls, refreshOwnedAssetLists, loadAdminBadges]);
 
@@ -2114,6 +2230,7 @@ useEffect(() => {
   const [faceMemeBottom, setFaceMemeBottom] = useState("")
   const [normalMemeImage, setNormalMemeImage] = useState("")
   const [normalMemeFile, setNormalMemeFile] = useState<File | null>(null)
+  const [normalMemeFileData, setNormalMemeFileData] = useState<string | null>(null)
   const [normalMemeTop, setNormalMemeTop] = useState("")
   const [normalMemeBottom, setNormalMemeBottom] = useState("")
   const [ttsText, setTtsText] = useState("")
@@ -2667,16 +2784,52 @@ useEffect(() => {
 
   const toggleStreaming = async () => {
     try {
-      const response = await fetch("/api/admin/streaming", {
+      const response = await fetch("/api/stream-control", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ streaming: !isStreaming }),
+        body: JSON.stringify({ action: isStreaming ? "stop" : "start" }),
       })
       const result = await response.json()
       if (!response.ok) throw new Error(result.message || "Could not update streaming status")
       setIsStreaming(result.streaming === true)
     } catch (error) {
       setAdminError(error instanceof Error ? error.message : "Could not update streaming status")
+    }
+  }
+
+  const saveStreamPointSettings = async () => {
+    const points = Number(streamPointSettings.points_per_interval)
+    const interval = Number(streamPointSettings.interval_seconds)
+    if (
+      !Number.isInteger(points) || points < 1 || points > 1_000_000
+      || !Number.isInteger(interval) || interval < 1 || interval > 86_400
+    ) {
+      setAdminError("Points must be 1–1,000,000 and interval must be 1–86,400 seconds.")
+      return
+    }
+    setStreamSettingsSaving(true)
+    setAdminError("")
+    setAdminNotice("")
+    try {
+      const response = await fetch("/api/admin/streaming/settings", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          points_per_interval: points,
+          interval_seconds: interval,
+        }),
+      })
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.message || "Could not save stream settings")
+      setStreamPointSettings({
+        points_per_interval: String(result.points_per_interval),
+        interval_seconds: String(result.interval_seconds),
+      })
+      setAdminNotice("Stream point settings saved. Changes apply when the next stream starts.")
+    } catch (error) {
+      setAdminError(error instanceof Error ? error.message : "Could not save stream settings")
+    } finally {
+      setStreamSettingsSaving(false)
     }
   }
 
@@ -3096,7 +3249,8 @@ useEffect(() => {
     setActionError("")
     try {
       const response = await fetch("/api/handle_post", { method: "POST", body: formData })
-      const result = await response.json()
+      const result = await response.json().catch(() => null)
+      if (!result) throw new Error(`Action could not be sent (server error ${response.status})`)
       if (!response.ok || result.status !== "ok") {
         if (
           response.status === 400
@@ -3136,14 +3290,19 @@ useEffect(() => {
 	  e.preventDefault()
     if (isChatRestricted) return
     setActionError("")
+    if (normalMemeFile && !normalMemeFileData) {
+      setActionError("Wait for the selected image to finish loading")
+      return
+    }
 	  const formData = new FormData()
 	  formData.append("user", username)
-    formData.append("image_normalmeme", normalMemeImage)
+    formData.append("image_normalmeme", normalMemeFileData || normalMemeImage)
 	  formData.append("top_text_normalmeme", normalMemeTop)
 	  formData.append("bottom_text_normalmeme", normalMemeBottom)
     if (!await submitPaidUse("normalmeme", formData)) return
 	  setNormalMemeImage("")
 	  setNormalMemeFile(null)
+    setNormalMemeFileData(null)
 	  setNormalMemeTop("")
 	  setNormalMemeBottom("")
 	}
@@ -3167,10 +3326,21 @@ useEffect(() => {
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (isChatRestricted) return
     const file = e.target.files?.[0]
+    e.currentTarget.value = ""
     if (!file) return
     setNormalMemeFile(file)
+    setNormalMemeFileData(null)
+    setNormalMemeImage("")
     const reader = new FileReader()
-    reader.onload = (ev) => setNormalMemeImage(ev.target?.result as string)
+    reader.onload = (event) => {
+      if (typeof event.target?.result === "string") {
+        setNormalMemeFileData(event.target.result)
+      }
+    }
+    reader.onerror = () => {
+      setNormalMemeFileData(null)
+      setActionError("The selected image could not be read")
+    }
     reader.readAsDataURL(file)
   }
 
@@ -3794,7 +3964,7 @@ if (!username) {
         <div data-chat-layout className="relative flex flex-col md:grid md:grid-cols-1 lg:grid lg:grid-cols-[repeat(auto-fit,320px)] gap-3 sm:gap-4 lg:items-start lg:justify-center">
           {/* --- Left Column: Send Chaos --- */}
           <div className="relative z-10 order-1 md:order-1 lg:order-3">
-            <Card className={`card-hover flex flex-col h-auto max-h-[80dvh] overflow-hidden lg:h-[calc(100dvh_-_18rem)] lg:max-h-none lg:overflow-visible lg:!transition-[transform,box-shadow] ${isChatRestricted ? "opacity-60 grayscale" : ""}`}>
+            <Card className={`card-hover relative flex flex-col h-auto max-h-[80dvh] overflow-hidden lg:h-[calc(100dvh_-_18rem)] lg:max-h-none lg:overflow-visible lg:!transition-[transform,box-shadow] ${isChatRestricted ? "opacity-60 grayscale" : ""}`}>
               <CardHeader className="pb-2 sm:pb-3 flex-shrink-0">
                 <CardTitle className="text-base sm:text-lg">Send Your Chaos</CardTitle>
                 <CardDescription className="text-xs">Choose your weapon</CardDescription>
@@ -3803,7 +3973,6 @@ if (!username) {
                 disabled={isChatRestricted}
                 className="min-h-0 min-w-0 flex-1 overflow-y-auto border-0 p-3 sm:p-6 lg:overflow-hidden disabled:pointer-events-none"
               >
-                {actionError && <p role="alert" className="mb-2 text-xs text-destructive">{actionError}</p>}
                 <Tabs value={activeTab} onValueChange={setActiveTab} className="flex flex-col lg:h-full">
                   <TabsList data-columns="4" className="joined-tabs grid w-full grid-cols-4 mb-3 sm:mb-4 h-8 sm:h-10 flex-shrink-0">
                     <TabsTrigger value="facememe" className="gap-1 text-[10px] sm:text-xs px-1">
@@ -3842,6 +4011,32 @@ if (!username) {
                             className="h-7 sm:h-8 text-xs sm:text-sm"
                           />
                         </div>
+                        {(faceMemeTop || faceMemeBottom) && (
+                          <div className="space-y-1">
+                            <div className="flex items-center justify-between">
+                              <label className="text-xs font-medium">Preview</label>
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                className="h-7 px-2"
+                                onClick={() => {
+                                  setFaceMemeTop("")
+                                  setFaceMemeBottom("")
+                                }}
+                              >
+                                Clear meme
+                              </Button>
+                            </div>
+                            <div className="w-full max-w-[400px] mx-auto aspect-[4/3] overflow-hidden border rounded">
+                              <FaceMemeArtwork
+                                preview
+                                toptext={faceMemeTop}
+                                bottomtext={faceMemeBottom}
+                              />
+                            </div>
+                          </div>
+                        )}
                       </div>
                       <Button type="submit" disabled={!canAffordAction("facemememe")} className="w-full h-7 sm:h-8 text-xs sm:text-sm mt-3 md:mt-3 lg:mt-auto disabled:grayscale">
                         {actionButtonText("Send Face Meme", "facemememe")}
@@ -3852,15 +4047,23 @@ if (!username) {
                   {/* --- Normal Meme Tab --- */}
                   <TabsContent value="normalmeme" className="space-y-2 sm:space-y-3 mt-0 flex flex-col lg:flex-1 lg:min-h-0">
                     <form autoComplete="off" onSubmit={handleNormalMemeSubmit} className="flex flex-col lg:h-full">
-                      <div className="flex-1 space-y-2 sm:space-y-3">
+                      <div className="min-h-0 flex-1 space-y-2 sm:space-y-3">
                         <div>
                           <label className="text-xs font-medium mb-1 block">Image</label>
                           <div className="flex gap-2">
                             <Input
+                              type="url"
                               value={normalMemeImage}
-                              onChange={(e) => setNormalMemeImage(e.target.value)}
+                              onChange={(e) => {
+                                setNormalMemeImage(e.target.value)
+                                if (e.target.value) {
+                                  setNormalMemeFile(null)
+                                  setNormalMemeFileData(null)
+                                }
+                              }}
                               placeholder="URL..."
                               className="h-7 sm:h-8 text-xs sm:text-sm flex-1"
+                              aria-label="Normal meme image URL"
                             />
                             <div className="relative">
                               <Input
@@ -3887,9 +4090,23 @@ if (!username) {
                             </div>
                           </div>
                           {normalMemeFile && (
-                            <p className="text-[10px] sm:text-xs text-muted-foreground mt-1 truncate">
-                              {normalMemeFile.name}
-                            </p>
+                            <div className="mt-1 flex min-w-0 items-center gap-2 text-xs">
+                              <p className="min-w-0 flex-1 truncate text-muted-foreground">
+                                {normalMemeFile.name}
+                              </p>
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                className="h-7 shrink-0 px-2 sm:h-8"
+                                onClick={() => {
+                                  setNormalMemeFile(null)
+                                  setNormalMemeFileData(null)
+                                }}
+                              >
+                                Clear file
+                              </Button>
+                            </div>
                           )}
                         </div>
                         <div>
@@ -3910,6 +4127,36 @@ if (!username) {
                             className="h-7 sm:h-8 text-xs sm:text-sm"
                           />
                         </div>
+                        {(normalMemeImage || normalMemeFileData || normalMemeTop || normalMemeBottom) && (
+                          <div className="space-y-1">
+                            <div className="flex items-center justify-between">
+                              <label className="text-xs font-medium">Preview</label>
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                className="h-7 px-2"
+                                onClick={() => {
+                                  setNormalMemeImage("")
+                                  setNormalMemeFile(null)
+                                  setNormalMemeFileData(null)
+                                  setNormalMemeTop("")
+                                  setNormalMemeBottom("")
+                                }}
+                              >
+                                Clear meme
+                              </Button>
+                            </div>
+                            <div className="w-full max-w-[400px] mx-auto aspect-[4/3] overflow-hidden border rounded">
+                              <NormalMemeArtwork
+                                preview
+                                image={normalMemeFileData || normalMemeImage}
+                                toptext={normalMemeTop}
+                                bottomtext={normalMemeBottom}
+                              />
+                            </div>
+                          </div>
+                        )}
                       </div>
                       <Button type="submit" disabled={!canAffordAction("normalmeme")} className="w-full h-7 sm:h-8 text-xs sm:text-sm mt-3 md:mt-3 lg:mt-auto disabled:grayscale">
                         {actionButtonText("Send Image Meme", "normalmeme")}
@@ -4019,6 +4266,15 @@ if (!username) {
 
                 </Tabs>
               </fieldset>
+              {actionError && (
+                <p
+                  role="alert"
+                  title={actionError}
+                  className="pointer-events-none absolute inset-x-3 bottom-0.5 truncate text-[10px] leading-3 text-destructive sm:inset-x-6 sm:bottom-1.5"
+                >
+                  {actionError}
+                </p>
+              )}
             </Card>
           </div>
 
@@ -4327,11 +4583,58 @@ if (!username) {
                     )}
                   </TabsContent>
                   {permission("admin_console") && <TabsContent value="admin" className="mt-0 lg:flex-1 lg:min-h-0 lg:overflow-y-auto">
-                    <div className="flex items-center gap-3">
-                      <Button variant={isStreaming ? "destructive" : "default"} onClick={() => void toggleStreaming()}>
-                        {isStreaming ? "Stop streaming" : "Start streaming"}
+                    <div className="space-y-4">
+                      <div className="flex items-center gap-3">
+                        <Button variant={isStreaming ? "destructive" : "default"} onClick={() => void toggleStreaming()}>
+                          {isStreaming ? "Stop streaming" : "Start streaming"}
+                        </Button>
+                        <span className="text-sm text-muted-foreground">
+                          {isStreaming
+                            ? "Point awards are on. Saved settings apply next stream."
+                            : "Point awards are off."}
+                        </span>
+                      </div>
+                      <div className="grid max-w-md grid-cols-2 gap-3">
+                        <label className="space-y-1 text-xs">
+                          <span>Points per interval</span>
+                          <Input
+                            aria-label="Points per stream interval"
+                            type="number"
+                            min={1}
+                            max={1_000_000}
+                            step={1}
+                            disabled={streamSettingsLoading || streamSettingsSaving}
+                            value={streamPointSettings.points_per_interval}
+                            onChange={(event) => setStreamPointSettings((current) => ({
+                              ...current,
+                              points_per_interval: event.target.value,
+                            }))}
+                          />
+                        </label>
+                        <label className="space-y-1 text-xs">
+                          <span>Interval (seconds)</span>
+                          <Input
+                            aria-label="Stream point interval in seconds"
+                            type="number"
+                            min={1}
+                            max={86_400}
+                            step={1}
+                            disabled={streamSettingsLoading || streamSettingsSaving}
+                            value={streamPointSettings.interval_seconds}
+                            onChange={(event) => setStreamPointSettings((current) => ({
+                              ...current,
+                              interval_seconds: event.target.value,
+                            }))}
+                          />
+                        </label>
+                      </div>
+                      <Button
+                        variant="outline"
+                        disabled={streamSettingsLoading || streamSettingsSaving}
+                        onClick={() => void saveStreamPointSettings()}
+                      >
+                        {streamSettingsSaving ? "Saving..." : "Save point settings"}
                       </Button>
-                      <span className="text-sm text-muted-foreground">{isStreaming ? "Points accrue every 60 seconds." : "Point awards are off."}</span>
                     </div>
                   </TabsContent>}
                   {permission("admin_console") && <TabsContent value="pricing" className="mt-0 lg:flex-1 lg:min-h-0 lg:overflow-y-auto">
@@ -6128,10 +6431,13 @@ if (!username) {
                       Account information
                     </CardTitle>
                   </div>
-                  <span className="flex h-5 w-5 items-center justify-center sm:h-6 sm:w-6" aria-hidden="true">
+                  <span
+                    className="inline-flex h-5 w-5 items-center justify-center rounded-md transition-all hover:bg-accent hover:text-accent-foreground dark:hover:bg-accent/50 sm:h-6 sm:w-6"
+                    aria-hidden="true"
+                  >
                     {showUserInfoPanel
-                      ? <ChevronDown className="h-2.5 w-2.5 sm:h-3 sm:w-3" />
-                      : <ChevronUp className="h-2.5 w-2.5 sm:h-3 sm:w-3" />}
+                      ? <ChevronDown className="size-4" />
+                      : <ChevronUp className="size-4" />}
                   </span>
                 </CardHeader>
                 <div
@@ -6164,13 +6470,11 @@ if (!username) {
                             <dd>{userInfo.message_count}</dd>
                             <dt className="text-muted-foreground">Email</dt>
                             <dd className="break-all">{userInfo.email || "Not set"}</dd>
-                            <dt className="text-muted-foreground">Ban status</dt>
-                            <dd>{userInfo.banned ? "Banned" : "Not banned"}</dd>
-                            <dt className="text-muted-foreground">Chat timeout</dt>
+                            <dt className="text-muted-foreground">Ban</dt>
                             <dd>
                               {userInfo.chat_timeout_until && isActiveTimeout(userInfo.chat_timeout_until)
-                                ? new Date(userInfo.chat_timeout_until).toLocaleString()
-                                : "None"}
+                                ? `Until ${formatBanUntil(userInfo.chat_timeout_until)}`
+                                : userInfo.banned ? "Banned" : "Not banned"}
                             </dd>
                             <dt className="text-muted-foreground">Points</dt>
                             <dd>{userInfo.points}❖</dd>

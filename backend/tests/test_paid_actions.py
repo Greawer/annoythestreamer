@@ -1,5 +1,8 @@
 import copy
+import base64
+import io
 import sys
+import tempfile
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -10,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from bson import ObjectId
+from PIL import Image
 from pymongo.errors import DuplicateKeyError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -387,10 +391,25 @@ class PaidActionRouteTests(unittest.TestCase):
         self.pricing.find_one.return_value = None
         self.ranks = Mock()
         self.permissions = Mock()
-        self.app = Flask(__name__)
+        self.app = Flask(__name__, static_folder=None)
         self.app.secret_key = 'test-only-secret'
         routes.registerroutes(self.app, None)
         self.client = self.app.test_client()
+        self.media_temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.media_temp_dir.cleanup)
+        self.public_dir = Path(self.media_temp_dir.name) / 'public'
+        self.public_dir.mkdir()
+        self.archive_dir = Path(self.media_temp_dir.name) / 'archive' / 'normalmeme'
+        self.public_dir_patch = patch.object(routes, 'PUBLIC_DIR', str(self.public_dir))
+        self.archive_dir_patch = patch.object(
+            routes,
+            'NORMALMEME_ARCHIVE_DIR',
+            str(self.archive_dir),
+        )
+        self.public_dir_patch.start()
+        self.archive_dir_patch.start()
+        self.addCleanup(self.public_dir_patch.stop)
+        self.addCleanup(self.archive_dir_patch.stop)
         self.patches = [
             patch.object(routes, 'colusers', self.users),
             patch.object(routes, 'colranks', self.ranks),
@@ -433,12 +452,33 @@ class PaidActionRouteTests(unittest.TestCase):
         self.assertEqual(action['user_id'], self.user_id)
 
     def test_normalmeme_and_tts_retries_charge_five_points_once_each(self):
+        image = Image.new('RGB', (640, 480), (25, 130, 210))
+        source_image_path = Path(self.media_temp_dir.name) / 'representative.png'
+        image.save(source_image_path, format='PNG')
+        image_url = (
+            'data:image/png;base64'
+            + ','
+            + base64.b64encode(source_image_path.read_bytes()).decode('ascii')
+        )
         normal_request = {
             'request_id': '90ce68ad-d1f7-4d18-a9f4-7458a6d8ed4a',
-            'image_normalmeme': 'https://example.test/meme.png',
+            'image_normalmeme': image_url,
         }
         first_normal = self.client.post('/handle_post', data=normal_request)
         duplicate_normal = self.client.post('/handle_post', data=normal_request)
+        changed_image = Image.new('RGB', (640, 480), (210, 45, 20))
+        changed_image_data = io.BytesIO()
+        changed_image.save(changed_image_data, format='PNG')
+        conflicting_normal = self.client.post(
+            '/handle_post',
+            data={
+                **normal_request,
+                'image_normalmeme': (
+                    'data:image/png;base64,'
+                    + base64.b64encode(changed_image_data.getvalue()).decode('ascii')
+                ),
+            },
+        )
         tts = self.client.post(
             '/handle_post',
             data={
@@ -452,6 +492,7 @@ class PaidActionRouteTests(unittest.TestCase):
         self.assertEqual(first_normal.get_json()['points'], 5)
         self.assertTrue(duplicate_normal.get_json()['duplicate'])
         self.assertEqual(duplicate_normal.get_json()['points'], 5)
+        self.assertEqual(conflicting_normal.status_code, 409)
         self.assertEqual(tts.status_code, 200)
         self.assertEqual(tts.get_json()['points'], 0)
         self.assertEqual(self.users.account['points'], 0)
@@ -461,6 +502,84 @@ class PaidActionRouteTests(unittest.TestCase):
             [transaction['amount'] for transaction in self.transactions.documents.values()],
             [-5, -5],
         )
+        archive_files = list(self.archive_dir.glob('*.jpg'))
+        self.assertEqual(len(archive_files), 1)
+
+    def test_normalmeme_local_images_are_archived_and_previous_active_file_is_deleted(self):
+        image = Image.new('RGB', (640, 480), (25, 130, 210))
+        source_image_path = Path(self.media_temp_dir.name) / 'representative.png'
+        image.save(source_image_path, format='PNG')
+        image_url = (
+            'data:image/png;base64'
+            + ','
+            + base64.b64encode(source_image_path.read_bytes()).decode('ascii')
+        )
+        request_ids = [
+            '10ce68ad-d1f7-4d18-a9f4-7458a6d8ed4a',
+            '20ce68ad-d1f7-4d18-a9f4-7458a6d8ed4a',
+            '30ce68ad-d1f7-4d18-a9f4-7458a6d8ed4a',
+        ]
+        active_dir = self.public_dir / 'img' / 'meme' / 'normalmeme'
+
+        with patch.object(routes, 'get_action_cost', return_value=0):
+            for request_id in request_ids:
+                response = self.client.post(
+                    '/handle_post',
+                    data={
+                        'request_id': request_id,
+                        'image_normalmeme': image_url,
+                        'top_text_normalmeme': 'local test',
+                    },
+                )
+                self.assertEqual(response.status_code, 200, response.get_json())
+                self.assertEqual(
+                    {path.name for path in active_dir.glob('*.jpg')},
+                    {f'{request_id.replace("-", "")}.jpg'},
+                )
+
+        latest_action = self.normal_actions.find_one({
+            'request_id': request_ids[-1],
+            'user_id': self.user_id,
+        })
+        self.assertEqual(
+            latest_action['image'],
+            f"/img/meme/normalmeme/{request_ids[-1].replace('-', '')}.jpg",
+        )
+        with self.client.get('/static' + latest_action['image']) as response:
+            self.assertEqual(response.status_code, 200)
+            with Image.open(io.BytesIO(response.data)) as active_image:
+                self.assertEqual(active_image.format, 'JPEG')
+                self.assertEqual(active_image.size, (400, 300))
+
+        text_only = self.client.post(
+            '/handle_post',
+            data={
+                'request_id': '40ce68ad-d1f7-4d18-a9f4-7458a6d8ed4a',
+                'top_text_normalmeme': 'text-only test',
+            },
+        )
+        self.assertEqual(text_only.status_code, 200, text_only.get_json())
+        self.assertEqual(list(active_dir.glob('*.jpg')), [])
+        archive_files = list(self.archive_dir.glob('*.jpg'))
+        self.assertEqual(len(archive_files), 4)
+        for path in archive_files:
+            with Image.open(path) as archived:
+                self.assertEqual(archived.format, 'JPEG')
+                self.assertEqual(archived.size, (400, 300))
+
+    def test_normalmeme_rejects_unsafe_paths_without_charging_or_writing(self):
+        response = self.client.post(
+            '/handle_post',
+            data={
+                'request_id': '40ce68ad-d1f7-4d18-a9f4-7458a6d8ed4a',
+                'image_normalmeme': '../../outside.jpg',
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(self.users.account['points'], 10)
+        self.assertEqual(self.normal_actions.documents, {})
+        self.assertEqual(list(Path(self.media_temp_dir.name).rglob('*.jpg')), [])
 
     def test_paid_form_requires_authenticated_session(self):
         with self.client.session_transaction() as session:

@@ -28,6 +28,15 @@ from client import (
     lastfacememe,
     lastnormalmeme,
 )
+from normalmeme_files import (
+    archive_normalmeme_image,
+    create_active_normalmeme_image,
+    normalmeme_archive_exists,
+    normalmeme_image_digest,
+    prepare_normalmeme_image,
+    prune_active_normalmeme_images,
+    remove_active_normalmeme_image,
+)
 from datetime import datetime, timedelta, timezone
 import math
 import os
@@ -36,6 +45,7 @@ import re
 import uuid
 import copy
 import hashlib
+import hmac
 import secrets
 import tempfile
 import ipaddress
@@ -58,6 +68,10 @@ ACTION_COSTS = {
     'tts': 5,
 }
 MAX_POINT_PRICE = 9_007_199_254_740_991
+DEFAULT_STREAM_POINTS = 100
+DEFAULT_STREAM_INTERVAL_SECONDS = 60
+MAX_STREAM_POINTS = 1_000_000
+MAX_STREAM_INTERVAL_SECONDS = 86_400
 MAX_THEME_BACKGROUND_BYTES = 50 * 1024 * 1024
 MAX_THEME_BACKGROUND_REQUEST_BYTES = MAX_THEME_BACKGROUND_BYTES + 1024 * 1024
 PASSWORD_RESET_TOKEN_TTL = timedelta(minutes=30)
@@ -133,6 +147,7 @@ DEFAULT_POINT_PRICING = {
 lastmessages = deque(maxlen=MAX_MESSAGES)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PUBLIC_DIR = os.path.abspath(os.path.join(BASE_DIR, '..', 'public'))
+NORMALMEME_ARCHIVE_DIR = os.path.abspath(os.path.join(BASE_DIR, '..', 'archive', 'normalmeme'))
 SOUNDDIR = os.path.join(PUBLIC_DIR, 'sounds', 'soundboard')
 EMOJIDIR = os.path.join(PUBLIC_DIR, 'img', 'emoji')
 BADGEDIR = os.path.join(PUBLIC_DIR, 'img', 'badges')
@@ -169,13 +184,13 @@ def normalize_email(value):
 def serialize_user(user):
     registered_at = user.get('registered_at')
     timeout_until = active_chat_timeout_until(user)
-    role = find_role(user.get('rank'))
+    role = get_user_role(user)
     permission_document = colpermissions.find_one({'rank_id': role['_id']}) if role else None
     capabilities = permission_document.get('capabilities', {}) if isinstance(permission_document, dict) else {}
     permissions_valid = role_permissions(user) is not None
     return {
         'username': user.get('username', ''),
-        'rank': user.get('rank', 'user'),
+        'rank': role.get('rank', 'User') if role else 'User',
         'rank_id': str(role['_id']) if role else None,
         'staff': role.get('staff') if role and isinstance(role.get('staff'), bool) else None,
         'rank_immutable': not permissions_valid or capabilities.get('rank_immutable') is not False,
@@ -323,6 +338,100 @@ def find_role(rank_name):
     )
 
 
+def get_rank_role_maps():
+    roles = list(colranks.find({}, {'rank': 1, 'color': 1, 'staff': 1}))
+    return (
+        {role['_id']: role for role in roles if isinstance(role.get('_id'), ObjectId)},
+        {
+            role['rank'].casefold(): role
+            for role in roles
+            if isinstance(role.get('rank'), str)
+        },
+    )
+
+
+def get_user_role(account, roles_by_id=None, roles_by_name=None):
+    if not isinstance(account, dict):
+        return None
+    rank_id = account.get('rank_id')
+    if isinstance(rank_id, str) and ObjectId.is_valid(rank_id):
+        rank_id = ObjectId(rank_id)
+    if isinstance(rank_id, ObjectId):
+        role = (
+            roles_by_id.get(rank_id)
+            if roles_by_id is not None
+            else colranks.find_one({'_id': rank_id})
+        )
+        if role:
+            return role
+    legacy_rank = account.get('rank')
+    if isinstance(legacy_rank, str) and roles_by_name is not None:
+        return roles_by_name.get(legacy_rank.casefold())
+    return find_role(legacy_rank) if isinstance(legacy_rank, str) else None
+
+
+def get_user_rank(account, default='User', roles_by_id=None, roles_by_name=None):
+    role = get_user_role(account, roles_by_id, roles_by_name)
+    return role.get('rank', default) if role else default
+
+
+def migrate_user_rank_references():
+    roles = list(colranks.find({}, {'rank': 1}))
+    roles_by_name = {}
+    for role in roles:
+        name = role.get('rank')
+        if isinstance(name, str):
+            roles_by_name.setdefault(name.casefold(), []).append(role)
+    default_roles = roles_by_name.get('user', [])
+    users = colusers.find({
+        '$or': [
+            {'rank': {'$exists': True}},
+            {'rank_id': {'$exists': False}},
+        ],
+    })
+    migrated = 0
+    unresolved = 0
+    for user in users:
+        rank_id = user.get('rank_id')
+        if isinstance(rank_id, str) and ObjectId.is_valid(rank_id):
+            rank_id = ObjectId(rank_id)
+        role = (
+            colranks.find_one({'_id': rank_id})
+            if isinstance(rank_id, ObjectId)
+            else None
+        )
+        if not role:
+            legacy_rank = user.get('rank')
+            candidates = (
+                roles_by_name.get(legacy_rank.casefold(), [])
+                if isinstance(legacy_rank, str)
+                else default_roles if 'rank_id' not in user else []
+            )
+            if len(candidates) == 1:
+                role = candidates[0]
+        if not role or not isinstance(role.get('_id'), ObjectId):
+            unresolved += 1
+            logger.error(
+                "Could not migrate user rank reference for account %s",
+                user.get('_id'),
+            )
+            continue
+        update = {'$set': {'rank_id': role['_id']}}
+        if 'rank' in user:
+            update['$unset'] = {'rank': ''}
+        result = colusers.update_one({'_id': user['_id']}, update)
+        if result.matched_count != 1:
+            raise RuntimeError(
+                f"Could not migrate rank reference for account {user.get('_id')}"
+            )
+        migrated += 1
+    if unresolved:
+        raise RuntimeError(
+            f"Could not resolve rank references for {unresolved} user account(s)"
+        )
+    logger.info("Migrated rank references for %s user account(s)", migrated)
+
+
 def validated_role_capabilities(role, document):
     capabilities = document.get('capabilities') if isinstance(document, dict) else None
     if not isinstance(capabilities, dict) or not isinstance(role.get('staff'), bool):
@@ -354,7 +463,7 @@ def validated_role_capabilities(role, document):
 
 
 def role_permissions(account):
-    role = find_role(account.get('rank')) if isinstance(account, dict) else None
+    role = get_user_role(account)
     if not role or not isinstance(role.get('_id'), ObjectId):
         return None
     document = colpermissions.find_one({'rank_id': role['_id']})
@@ -1538,7 +1647,7 @@ def is_price_available(price):
 
 
 def can_manage_target_role(actor, target, capability, non_staff_capability):
-    target_role = find_role(target.get('rank')) if isinstance(target, dict) else None
+    target_role = get_user_role(target)
     if not target_role or not isinstance(target_role.get('_id'), ObjectId):
         return False, None
     target_permissions = colpermissions.find_one({'rank_id': target_role['_id']})
@@ -1990,19 +2099,18 @@ def get_rank_color(rank):
 def get_online_user_ranks():
     users = colusers.find(
         {'username': {'$in': list(onlineusers)}},
-        {'username': 1, 'rank': 1},
+        {'username': 1, 'rank_id': 1, 'rank': 1},
     )
-    rank_colors = {
-        item['rank'].casefold(): item.get('color')
-        for item in colranks.find({}, {'rank': 1, 'color': 1})
-    }
-    return {
-        user['username']: {
-            'rank': user.get('rank', 'User'),
-            'rank_color': rank_colors.get(user.get('rank', 'User').casefold()),
+    roles_by_id, roles_by_name = get_rank_role_maps()
+    result = {}
+    for user in users:
+        role = get_user_role(user, roles_by_id, roles_by_name)
+        rank = role.get('rank', 'User') if role else 'User'
+        result[user['username']] = {
+            'rank': rank,
+            'rank_color': role.get('color') if role else None,
         }
-        for user in users
-    }
+    return result
 
 
 def add_current_ranks(messages):
@@ -2015,13 +2123,10 @@ def add_current_ranks(messages):
         user['username']: user
         for user in colusers.find(
             {'username': {'$in': list(usernames)}},
-            {'username': 1, 'rank': 1, 'visible_badge_id': 1},
+            {'username': 1, 'rank_id': 1, 'rank': 1, 'visible_badge_id': 1},
         )
     }
-    rank_colors = {
-        rank['rank'].casefold(): rank.get('color')
-        for rank in colranks.find({}, {'rank': 1, 'color': 1})
-    }
+    roles_by_id, roles_by_name = get_rank_role_maps()
     enriched = []
     for message in messages:
         if message.get('system') is True:
@@ -2033,7 +2138,8 @@ def add_current_ranks(messages):
             continue
 
         user = users.get(message.get('user'))
-        rank = user.get('rank', 'User') if user else None
+        role = get_user_role(user, roles_by_id, roles_by_name) if user else None
+        rank = role.get('rank', 'User') if role else None
         badge = None
         if user and user.get('visible_badge_id') is not None:
             try:
@@ -2045,7 +2151,7 @@ def add_current_ranks(messages):
         enriched_message = {
             **message,
             'rank': rank,
-            'rank_color': rank_colors.get(rank.casefold()) if rank else None,
+            'rank_color': role.get('color') if role else None,
         }
         if badge:
             enriched_message['badge'] = badge
@@ -2092,7 +2198,7 @@ def emit_chat_activity(socketio, message, actor=None):
 def moderation_activity_prefix(actor):
     if not isinstance(actor, dict) or has_permission(actor, 'admin_console'):
         return ''
-    role = find_role(actor.get('rank'))
+    role = get_user_role(actor)
     if not role or role.get('staff') is not True:
         return ''
     username = actor.get('username')
@@ -2254,7 +2360,7 @@ def registersocketiohandlers(socketio: SocketIO):
                     or (is_unregistered_asset and not has_permission(account, 'admin_console'))
                 ):
                     literal_emojis.append(emoji_name)
-            rank = account.get('rank', 'User')
+            rank = get_user_rank(account)
             color = get_rank_color(rank)
             badge = None
             if account.get('visible_badge_id') is not None:
@@ -2301,6 +2407,11 @@ def registersocketiohandlers(socketio: SocketIO):
     def handleconnect():
         account = get_session_user()
         if account:
+            if account['username'] not in onlineusers:
+                mark_stream_join_baseline(
+                    account,
+                    colsettings.find_one({'_id': 'stream_points'}),
+                )
             socket_users[request.sid] = {'user_id': str(account['_id']), 'username': account['username']}
             onlineusers.add(account['username'])
             emit_points_changed(socketio, account)
@@ -2327,82 +2438,236 @@ def registersocketiohandlers(socketio: SocketIO):
         socketio.emit('online_user_ranks', get_online_user_ranks(), to=request.sid)
 
 
-def award_stream_points(socketio=None):
+def stream_point_settings(state, active=False):
+    points_key = 'active_points_per_interval' if active else 'points_per_interval'
+    interval_key = 'active_interval_seconds' if active else 'interval_seconds'
+    points = state.get(points_key, state.get('points_per_interval', DEFAULT_STREAM_POINTS))
+    interval = state.get(
+        interval_key,
+        state.get('interval_seconds', DEFAULT_STREAM_INTERVAL_SECONDS),
+    )
+    if (
+        isinstance(points, bool)
+        or not isinstance(points, int)
+        or points < 1
+        or points > MAX_STREAM_POINTS
+        or isinstance(interval, bool)
+        or not isinstance(interval, int)
+        or interval < 1
+        or interval > MAX_STREAM_INTERVAL_SECONDS
+    ):
+        raise ValueError('Streaming point settings are invalid')
+    return points, interval
+
+
+def as_utc_datetime(value):
+    if isinstance(value, datetime) and value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+def reset_stream_points_state():
+    colsettings.update_one(
+        {'_id': 'stream_points'},
+        {
+            '$set': {'streaming': False},
+            '$unset': {
+                'stream_started_at': '',
+                'active_points_per_interval': '',
+                'active_interval_seconds': '',
+            },
+        },
+        upsert=True,
+    )
+
+
+def mark_stream_award_baseline(user, started_at, interval):
+    if not user or not isinstance(user.get('_id'), ObjectId):
+        return
+    colusers.update_one(
+        {
+            '_id': user['_id'],
+            '$or': [
+                {'last_stream_award_started_at': {'$ne': started_at}},
+                {'last_stream_award_interval': {'$exists': False}},
+                {'last_stream_award_interval': {'$lt': interval}},
+            ],
+        },
+        {'$set': {
+            'last_stream_award_started_at': started_at,
+            'last_stream_award_interval': interval,
+        }},
+    )
+
+
+def mark_online_stream_award_baselines(started_at):
+    for username in tuple(onlineusers):
+        user = colusers.find_one({'username': username}, {'_id': 1})
+        mark_stream_award_baseline(user, started_at, 0)
+
+
+def mark_stream_join_baseline(user, state, now=None):
+    if not state or state.get('streaming') is not True:
+        return
+    started_at = state.get('stream_started_at')
+    if not isinstance(started_at, datetime):
+        return
+    started_at = as_utc_datetime(started_at)
+    current_time = now or datetime.now(timezone.utc)
+    current_time = as_utc_datetime(current_time)
+    try:
+        _points, interval_seconds = stream_point_settings(state, active=True)
+    except ValueError:
+        logger.exception('Could not establish stream-award baseline for joining user')
+        return
+    interval = max(0, int((current_time - started_at).total_seconds() // interval_seconds))
+    mark_stream_award_baseline(user, started_at, interval)
+
+
+def award_stream_points(socketio=None, now=None):
     state = colsettings.find_one({'_id': 'stream_points'})
     if not state or state.get('streaming') is not True:
         return 0
-    now = datetime.now(timezone.utc)
     started_at = state.get('stream_started_at')
     if not isinstance(started_at, datetime):
         return 0
-    if started_at.tzinfo is None:
-        started_at = started_at.replace(tzinfo=timezone.utc)
-    interval = int((now - started_at).total_seconds() // 60)
-    if interval <= 0:
+    started_at = as_utc_datetime(started_at)
+    current_time = now or datetime.now(timezone.utc)
+    current_time = as_utc_datetime(current_time)
+    try:
+        points_per_interval, interval_seconds = stream_point_settings(state, active=True)
+    except ValueError:
+        logger.exception('Stream point worker found invalid point settings')
+        return 0
+    completed_intervals = int((current_time - started_at).total_seconds() // interval_seconds)
+    if completed_intervals <= 0:
         return 0
 
     awarded = 0
     for username in tuple(onlineusers):
-        user = colusers.find_one_and_update(
+        user = colusers.find_one(
+            {'username': username},
             {
-                'username': username,
-                'banned': {'$ne': True},
-                '$or': [
-                    {'chat_timeout_until': {'$exists': False}},
-                    {'chat_timeout_until': {'$lte': now}},
-                ],
-                '$and': [{
-                    '$or': [
-                        {'last_stream_award_started_at': {'$exists': False}},
-                        {'last_stream_award_started_at': {'$lt': started_at}},
-                        {
-                            '$and': [
-                                {'last_stream_award_started_at': started_at},
-                                {
-                                    '$or': [
-                                        {'last_stream_award_interval': {'$exists': False}},
-                                        {'last_stream_award_interval': {'$lt': interval}},
-                                    ],
-                                },
-                            ],
-                        },
-                    ],
-                }],
+                '_id': 1,
+                'banned': 1,
+                'chat_timeout_until': 1,
+                'last_stream_award_started_at': 1,
+                'last_stream_award_interval': 1,
             },
-            [{
-                '$set': {
-                    'points': {'$add': [{'$ifNull': ['$points', 0]}, 100]},
-                    'last_stream_award_started_at': started_at,
-                    'last_stream_award_interval': interval,
-                    'pending_point_transactions': {
-                        '$concatArrays': [
-                            {'$ifNull': ['$pending_point_transactions', []]},
-                            [{
-                                'request_id': f"stream:{started_at.isoformat()}:{interval}:{username}",
-                                'action_type': 'stream_award',
-                                'amount': 100,
-                                'balance_after': {'$add': [{'$ifNull': ['$points', 0]}, 100]},
-                                'stream_started_at': started_at,
-                                'stream_interval': interval,
-                                'timestamp': now,
-                            }],
+        )
+        if (
+            not user
+            or as_utc_datetime(user.get('last_stream_award_started_at')) != started_at
+            or isinstance(user.get('last_stream_award_interval'), bool)
+            or not isinstance(user.get('last_stream_award_interval'), int)
+        ):
+            continue
+        last_interval = user['last_stream_award_interval']
+        for interval in range(last_interval + 1, completed_intervals + 1):
+            if username not in onlineusers:
+                break
+            current_state = colsettings.find_one({'_id': 'stream_points'})
+            if (
+                not current_state
+                or current_state.get('streaming') is not True
+                or as_utc_datetime(current_state.get('stream_started_at')) != started_at
+            ):
+                break
+            current_time = now or datetime.now(timezone.utc)
+            current_time = as_utc_datetime(current_time)
+            ineligible = (
+                user.get('banned') is True
+                or active_chat_timeout_until(user, current_time) is not None
+            )
+            if ineligible:
+                colusers.update_one(
+                    {
+                        '_id': user['_id'],
+                        'last_stream_award_started_at': started_at,
+                        'last_stream_award_interval': interval - 1,
+                        '$or': [
+                            {'banned': True},
+                            {'chat_timeout_until': {'$gt': current_time}},
                         ],
                     },
-                },
-            }],
-            return_document=ReturnDocument.AFTER,
-        )
-        if user:
-            awarded += 1
-            try:
-                flush_pending_point_transactions(user)
-            except Exception:
-                logger.exception(
-                    "Stream award transaction remains pending for user %s and interval %s",
-                    user['_id'],
-                    interval,
+                    {'$set': {'last_stream_award_interval': interval}},
                 )
-            emit_points_changed(socketio, user)
+                user['last_stream_award_interval'] = interval
+                continue
+
+            updated_user = colusers.find_one_and_update(
+                {
+                    '_id': user['_id'],
+                    'banned': {'$ne': True},
+                    '$or': [
+                        {'chat_timeout_until': {'$exists': False}},
+                        {'chat_timeout_until': {'$lte': current_time}},
+                    ],
+                    'last_stream_award_started_at': started_at,
+                    'last_stream_award_interval': interval - 1,
+                },
+                [{
+                    '$set': {
+                        'points': {'$add': [{'$ifNull': ['$points', 0]}, points_per_interval]},
+                        'last_stream_award_interval': interval,
+                        'pending_point_transactions': {
+                            '$concatArrays': [
+                                {'$ifNull': ['$pending_point_transactions', []]},
+                                [{
+                                    'request_id': f"stream:{started_at.isoformat()}:{interval}:{username}",
+                                    'action_type': 'stream_award',
+                                    'amount': points_per_interval,
+                                    'balance_after': {
+                                        '$add': [
+                                            {'$ifNull': ['$points', 0]},
+                                            points_per_interval,
+                                        ],
+                                    },
+                                    'stream_started_at': started_at,
+                                    'stream_interval': interval,
+                                    'timestamp': current_time,
+                                }],
+                            ],
+                        },
+                    },
+                }],
+                return_document=ReturnDocument.AFTER,
+            )
+            if updated_user:
+                awarded += 1
+                user = updated_user
+                try:
+                    flush_pending_point_transactions(user)
+                except Exception:
+                    logger.exception(
+                        "Stream award transaction remains pending for user %s and interval %s",
+                        user['_id'],
+                        interval,
+                    )
+                emit_points_changed(socketio, user)
+            else:
+                user = colusers.find_one(
+                    {'_id': user['_id']},
+                    {
+                        '_id': 1,
+                        'banned': 1,
+                        'chat_timeout_until': 1,
+                        'last_stream_award_started_at': 1,
+                        'last_stream_award_interval': 1,
+                    },
+                )
+                if (
+                    not user
+                    or as_utc_datetime(user.get('last_stream_award_started_at')) != started_at
+                    or isinstance(user.get('last_stream_award_interval'), bool)
+                    or not isinstance(user.get('last_stream_award_interval'), int)
+                ):
+                    break
+                last_interval = user['last_stream_award_interval']
+                if last_interval >= interval:
+                    continue
+                if last_interval != interval - 1:
+                    break
     return awarded
 
 
@@ -2415,73 +2680,270 @@ def start_stream_points_worker(socketio: SocketIO):
                 state = colsettings.find_one({'_id': 'stream_points'})
                 if not state or state.get('streaming') is not True:
                     continue
-                started_at = state.get('stream_started_at')
-                if not isinstance(started_at, datetime):
-                    started_at = datetime.now(timezone.utc)
-                    state = colsettings.find_one_and_update(
-                        {
-                            '_id': 'stream_points',
-                            'streaming': True,
-                            'stream_started_at': {'$exists': False},
-                        },
-                        {'$set': {'stream_started_at': started_at}},
-                        return_document=ReturnDocument.AFTER,
-                    ) or state
-                    started_at = state.get('stream_started_at', started_at)
-                if started_at.tzinfo is None:
-                    started_at = started_at.replace(tzinfo=timezone.utc)
-                interval = int((datetime.now(timezone.utc) - started_at).total_seconds() // 60)
-                if interval > 0:
-                    awarded = award_stream_points(socketio)
-                    logger.info("Stream minute %s awarded 100 points to %s active users", interval, awarded)
+                awarded = award_stream_points(socketio)
+                if awarded:
+                    logger.info("Applied %s stream interval point awards", awarded)
             except Exception as e:
                 logger.error("Stream point worker failed: %s", e)
 
     socketio.start_background_task(worker)
 
 
+def ensure_stream_points_state():
+    return colsettings.find_one_and_update(
+        {'_id': 'stream_points'},
+        {'$setOnInsert': {
+            'streaming': False,
+            'points_per_interval': DEFAULT_STREAM_POINTS,
+            'interval_seconds': DEFAULT_STREAM_INTERVAL_SECONDS,
+        }},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+
+
+def stream_control_authorized():
+    if get_admin_user('stream_control'):
+        return True
+    expected_token = os.getenv('ATS_STREAM_CONTROL_TOKEN', '')
+    authorization = request.headers.get('Authorization', '')
+    try:
+        loopback_request = ipaddress.ip_address(request.remote_addr).is_loopback
+    except (TypeError, ValueError):
+        loopback_request = False
+    if (
+        len(expected_token) < 32
+        or not authorization.startswith('Bearer ')
+        or not (request.is_secure or loopback_request)
+    ):
+        return False
+    supplied_token = authorization[7:]
+    if len(supplied_token) != len(expected_token):
+        return False
+    return hmac.compare_digest(
+        supplied_token.encode('utf-8'),
+        expected_token.encode('utf-8'),
+    )
+
+
+def change_streaming_state(streaming):
+    previous_state = ensure_stream_points_state()
+    if previous_state.get('streaming') is streaming:
+        return previous_state, False
+    if streaming:
+        points, interval = stream_point_settings(previous_state)
+        started_at = datetime.now(timezone.utc)
+        state = colsettings.find_one_and_update(
+            {'_id': 'stream_points', 'streaming': {'$ne': True}},
+            {'$set': {
+                'streaming': True,
+                'stream_started_at': started_at,
+                'active_points_per_interval': points,
+                'active_interval_seconds': interval,
+            }},
+            return_document=ReturnDocument.AFTER,
+        )
+        if state:
+            mark_online_stream_award_baselines(started_at)
+            return state, True
+    else:
+        state = colsettings.find_one_and_update(
+            {'_id': 'stream_points', 'streaming': True},
+            {
+                '$set': {'streaming': False},
+                '$unset': {
+                    'stream_started_at': '',
+                    'active_points_per_interval': '',
+                    'active_interval_seconds': '',
+                },
+            },
+            return_document=ReturnDocument.AFTER,
+        )
+        if state:
+            return state, True
+    return colsettings.find_one({'_id': 'stream_points'}) or ensure_stream_points_state(), False
+
+
+def toggle_streaming_state(request_id):
+    state = ensure_stream_points_state()
+    for _attempt in range(8):
+        if request_id in state.get('toggle_request_ids', []):
+            return state, False
+
+        if state.get('streaming') is True:
+            query = {
+                '_id': 'stream_points',
+                'streaming': True,
+                'toggle_request_ids': {'$ne': request_id},
+            }
+            if 'stream_started_at' in state:
+                query['stream_started_at'] = state['stream_started_at']
+            else:
+                query['stream_started_at'] = {'$exists': False}
+            updated_state = colsettings.find_one_and_update(
+                query,
+                {
+                    '$set': {'streaming': False},
+                    '$unset': {
+                        'stream_started_at': '',
+                        'active_points_per_interval': '',
+                        'active_interval_seconds': '',
+                    },
+                    '$addToSet': {'toggle_request_ids': request_id},
+                },
+                return_document=ReturnDocument.AFTER,
+            )
+        else:
+            points, interval = stream_point_settings(state)
+            started_at = datetime.now(timezone.utc)
+            updated_state = colsettings.find_one_and_update(
+                {
+                    '_id': 'stream_points',
+                    'streaming': {'$ne': True},
+                    'toggle_request_ids': {'$ne': request_id},
+                },
+                {
+                    '$set': {
+                        'streaming': True,
+                        'stream_started_at': started_at,
+                        'active_points_per_interval': points,
+                        'active_interval_seconds': interval,
+                    },
+                    '$addToSet': {'toggle_request_ids': request_id},
+                },
+                return_document=ReturnDocument.AFTER,
+            )
+            if updated_state:
+                mark_online_stream_award_baselines(started_at)
+
+        if updated_state:
+            return updated_state, True
+        state = colsettings.find_one({'_id': 'stream_points'})
+        if not state:
+            state = ensure_stream_points_state()
+
+    raise RuntimeError('Streaming state changed too frequently; please retry.')
+
+
+def publish_streaming_state(socketio, state, changed):
+    if not changed:
+        return
+    if socketio:
+        socketio.emit('streaming_status', {'streaming': state['streaming']})
+    emit_chat_activity(
+        socketio,
+        'Stream started.' if state['streaming'] else 'Stream finished.',
+    )
+
+
 def registerroutes(app, socketio: SocketIO):
     @app.route('/admin/streaming', methods=['GET', 'POST'])
     def streamingstatus():
         if request.method == 'GET':
-            state = colsettings.find_one_and_update(
-                {'_id': 'stream_points'},
-                {'$setOnInsert': {'streaming': False}},
-                upsert=True,
-                return_document=ReturnDocument.AFTER,
-            )
+            state = ensure_stream_points_state()
             return jsonify({'streaming': state.get('streaming') is True})
-        if request.method == 'POST' and not get_admin_user('stream_control'):
+        if not get_admin_user('stream_control'):
             return jsonify({'message': 'Admin login required'}), 403
 
         data = request.get_json(silent=True) or {}
         streaming = data.get('streaming')
         if not isinstance(streaming, bool):
             return jsonify({'message': 'Streaming must be true or false'}), 400
-        previous_state = colsettings.find_one({'_id': 'stream_points'})
-        changes = {'streaming': streaming}
-        if streaming and not (previous_state and previous_state.get('streaming', False)):
-            changes['stream_started_at'] = datetime.now(timezone.utc)
-        elif not streaming:
-            colsettings.update_one(
-                {'_id': 'stream_points'},
-                {'$unset': {'stream_started_at': ''}},
-            )
-        state = colsettings.find_one_and_update(
-            {'_id': 'stream_points'},
-            {'$set': changes},
-            upsert=True,
-            return_document=ReturnDocument.AFTER,
-        )
-        if socketio:
-            socketio.emit('streaming_status', {'streaming': state['streaming']})
-        was_streaming = bool(previous_state and previous_state.get('streaming') is True)
-        if was_streaming != state['streaming']:
-            emit_chat_activity(
-                socketio,
-                'Stream started.' if state['streaming'] else 'Stream finished.',
-            )
+        try:
+            state, changed = change_streaming_state(streaming)
+        except ValueError as error:
+            return jsonify({'message': str(error)}), 503
+        publish_streaming_state(socketio, state, changed)
         return jsonify({'streaming': state['streaming']})
+
+    @app.route('/stream-control', methods=['GET', 'POST'])
+    def streamcontrol():
+        if not stream_control_authorized():
+            return jsonify({'message': 'Stream control authentication required'}), 401
+        if request.method == 'GET':
+            state = ensure_stream_points_state()
+            try:
+                points, interval = stream_point_settings(
+                    state,
+                    active=state.get('streaming') is True,
+                )
+            except ValueError as error:
+                return jsonify({'message': str(error)}), 503
+            return jsonify({
+                'streaming': state.get('streaming') is True,
+                'points_per_interval': points,
+                'interval_seconds': interval,
+            })
+
+        data = request.get_json(silent=True)
+        action = data.get('action') if isinstance(data, dict) else None
+        if action not in ('start', 'stop', 'toggle'):
+            return jsonify({'message': 'Action must be start, stop, or toggle'}), 400
+        toggle_request_id = None
+        if action == 'toggle':
+            toggle_request_id = normalize_request_id(data.get('request_id'))
+            if not toggle_request_id:
+                return jsonify({'message': 'Toggle requires a valid request_id'}), 400
+        try:
+            if action == 'toggle':
+                state, changed = toggle_streaming_state(toggle_request_id)
+            else:
+                state, changed = change_streaming_state(action == 'start')
+        except ValueError as error:
+            return jsonify({'message': str(error)}), 503
+        except RuntimeError as error:
+            return jsonify({'message': str(error)}), 503
+        publish_streaming_state(socketio, state, changed)
+        return jsonify({'streaming': state['streaming']})
+
+    @app.route('/admin/streaming/settings', methods=['GET', 'PUT'])
+    def streaming_settings():
+        if not get_admin_user('stream_control'):
+            return jsonify({'message': 'Admin login required'}), 403
+        state = ensure_stream_points_state()
+        if request.method == 'GET':
+            try:
+                points, interval = stream_point_settings(state)
+            except ValueError as error:
+                return jsonify({'message': str(error)}), 503
+            return jsonify({
+                'points_per_interval': points,
+                'interval_seconds': interval,
+            })
+
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({'message': 'Request body must be an object'}), 400
+        points = data.get('points_per_interval')
+        interval = data.get('interval_seconds')
+        if (
+            isinstance(points, bool)
+            or not isinstance(points, int)
+            or points < 1
+            or points > MAX_STREAM_POINTS
+            or isinstance(interval, bool)
+            or not isinstance(interval, int)
+            or interval < 1
+            or interval > MAX_STREAM_INTERVAL_SECONDS
+        ):
+            return jsonify({
+                'message': (
+                    f'Points must be 1-{MAX_STREAM_POINTS} and interval must be '
+                    f'1-{MAX_STREAM_INTERVAL_SECONDS} seconds'
+                ),
+            }), 400
+        colsettings.update_one(
+            {'_id': 'stream_points'},
+            {'$set': {
+                'points_per_interval': points,
+                'interval_seconds': interval,
+            }},
+            upsert=True,
+        )
+        return jsonify({
+            'points_per_interval': points,
+            'interval_seconds': interval,
+        })
 
     @app.route('/auth/lookup', methods=['POST'])
     def authlookup():
@@ -2505,7 +2967,7 @@ def registerroutes(app, socketio: SocketIO):
         return {
             'status': 'ok',
             'username': user['username'],
-            'rank': user.get('rank', 'User'),
+            'rank': get_user_rank(user),
             'points': user.get('points', 0),
             'permissions': permissions,
             **public_usage_cost_fields(user),
@@ -2548,14 +3010,15 @@ def registerroutes(app, socketio: SocketIO):
             email = normalize_email(data.get('email'))
             if not email:
                 return jsonify({'message': 'Enter a valid email address'}), 400
-            if not colranks.find_one({'rank': 'User'}):
+            default_role = find_role('User')
+            if not default_role:
                 return jsonify({'message': 'Default User rank is not configured'}), 503
             if not user:
                 document = {
                     'username': username,
                     'email': email,
                     'password_hash': generate_password_hash(password),
-                    'rank': 'User',
+                    'rank_id': default_role['_id'],
                     'points': 1000,
                     'banned': False,
                     'registered_at': datetime.now(timezone.utc),
@@ -2565,7 +3028,17 @@ def registerroutes(app, socketio: SocketIO):
                 if stream_state and stream_state.get('streaming') is True and isinstance(started_at, datetime):
                     if started_at.tzinfo is None:
                         started_at = started_at.replace(tzinfo=timezone.utc)
-                    interval = max(0, int((datetime.now(timezone.utc) - started_at).total_seconds() // 60))
+                    _points, interval_seconds = stream_point_settings(
+                        stream_state,
+                        active=True,
+                    )
+                    interval = max(
+                        0,
+                        int(
+                            (datetime.now(timezone.utc) - started_at).total_seconds()
+                            // interval_seconds
+                        ),
+                    )
                     document['last_stream_award_started_at'] = started_at
                     document['last_stream_award_interval'] = interval
                 try:
@@ -2717,7 +3190,7 @@ def registerroutes(app, socketio: SocketIO):
         response = {
             'authenticated': True,
             'username': user['username'],
-            'rank': user.get('rank', 'User'),
+            'rank': get_user_rank(user),
             'points': user.get('points', 0),
             'permissions': public_role_permissions(user),
             **public_usage_cost_fields(user),
@@ -2764,7 +3237,7 @@ def registerroutes(app, socketio: SocketIO):
         return jsonify({
             'status': 'ok',
             'username': username,
-            'rank': user.get('rank', 'User'),
+            'rank': get_user_rank(user),
             'permissions': public_role_permissions(user),
             **public_usage_cost_fields(user),
         })
@@ -2784,7 +3257,7 @@ def registerroutes(app, socketio: SocketIO):
         return jsonify({
             'authenticated': True,
             'username': admin['username'],
-            'rank': admin.get('rank', 'User'),
+            'rank': get_user_rank(admin),
             'permissions': public_role_permissions(admin),
             **public_usage_cost_fields(admin),
         })
@@ -4109,7 +4582,7 @@ def registerroutes(app, socketio: SocketIO):
                 return jsonify({'message': 'Duration is too large'}), 400
             update = {'$set': {'chat_timeout_until': timeout_until}}
 
-        target = colusers.find_one({'username': username}, {'_id': 1, 'rank': 1})
+        target = colusers.find_one({'username': username}, {'_id': 1, 'rank_id': 1})
         if not target:
             return jsonify({'message': 'User not found'}), 404
         allowed, target_role = can_manage_target_role(
@@ -4122,7 +4595,7 @@ def registerroutes(app, socketio: SocketIO):
             return jsonify({'message': 'You cannot timeout this staff rank'}), 403
 
         user = colusers.find_one_and_update(
-            {'_id': target['_id'], 'rank': target.get('rank')},
+            {'_id': target['_id'], 'rank_id': target.get('rank_id')},
             update,
             return_document=ReturnDocument.AFTER,
         )
@@ -4159,7 +4632,7 @@ def registerroutes(app, socketio: SocketIO):
             or destination_capabilities['rank_immutable']
         ):
             return jsonify({'message': 'Select an available rank'}), 400
-        target = colusers.find_one({'username': username}, {'_id': 1, 'rank': 1})
+        target = colusers.find_one({'username': username}, {'_id': 1, 'rank_id': 1})
         if not target:
             return jsonify({'message': 'User not found'}), 404
         allowed, target_role = can_manage_target_role(
@@ -4183,13 +4656,16 @@ def registerroutes(app, socketio: SocketIO):
             return jsonify({'message': 'You cannot modify this user rank'}), 403
 
         user = colusers.find_one_and_update(
-            {'_id': target['_id'], 'rank': target.get('rank')},
-            {'$set': {'rank': rank}},
+            {'_id': target['_id'], 'rank_id': target.get('rank_id')},
+            {
+                '$set': {'rank_id': destination_role['_id']},
+                '$unset': {'rank': ''},
+            },
             return_document=ReturnDocument.AFTER,
         )
         if not user:
             return jsonify({'message': 'User rank changed; reload and try again'}), 409
-        current_rank = user.get('rank', 'User')
+        current_rank = get_user_rank(user)
         color = get_rank_color(current_rank)
         socketio.emit('rank_changed', {
             'username': user['username'],
@@ -4357,6 +4833,50 @@ def registerroutes(app, socketio: SocketIO):
         action_collection, action_type, document = actions[0]
         if action_type != 'tts':
             document['action_type'] = action_type
+        normalmeme_prepared = None
+        normalmeme_active_created = False
+        normalmeme_archive_required = False
+        normalmeme_input = document.get('image') or ''
+        if action_type == 'normalmeme':
+            try:
+                existing_normalmeme = action_collection.find_one({
+                    'user_id': account['_id'],
+                    'request_id': request_id,
+                })
+                if existing_normalmeme and 'image_sha256' in existing_normalmeme:
+                    image_digest = normalmeme_image_digest(normalmeme_input)
+                    document['image_sha256'] = image_digest
+                    if existing_normalmeme.get('image_sha256') == image_digest:
+                        document['image'] = existing_normalmeme.get('image') or ''
+                        normalmeme_archive_required = True
+                        if not normalmeme_archive_exists(request_id, NORMALMEME_ARCHIVE_DIR):
+                            normalmeme_prepared = prepare_normalmeme_image(
+                                existing_normalmeme.get('image') or normalmeme_input,
+                                request_id,
+                                PUBLIC_DIR,
+                            )
+                elif not existing_normalmeme:
+                    normalmeme_prepared = prepare_normalmeme_image(
+                        normalmeme_input,
+                        request_id,
+                        PUBLIC_DIR,
+                    )
+                    document['image'] = normalmeme_prepared.active_url or ''
+                    document['image_sha256'] = normalmeme_image_digest(normalmeme_input)
+                    normalmeme_archive_required = True
+                    normalmeme_active_created = create_active_normalmeme_image(
+                        normalmeme_prepared,
+                        request_id,
+                        PUBLIC_DIR,
+                    )
+            except ValueError as error:
+                return jsonify({'message': str(error)}), 400
+            except Exception:
+                logger.exception("Could not prepare Normalmeme request %s", request_id)
+                return jsonify({
+                    'status': 'error',
+                    'message': 'Normalmeme image could not be prepared. Retry the request.',
+                }), 503
         try:
             result, status = accept_paid_action(
                 action_collection,
@@ -4366,13 +4886,48 @@ def registerroutes(app, socketio: SocketIO):
                 socketio,
             )
         except Exception:
+            if normalmeme_active_created:
+                try:
+                    remove_active_normalmeme_image(request_id, PUBLIC_DIR)
+                except Exception:
+                    logger.exception("Could not remove failed Normalmeme image %s", request_id)
             logger.exception("Could not accept %s request %s", action_type, request_id)
             return jsonify({
                 'status': 'error',
                 'message': 'Action could not be confirmed. Retry the same request or check your balance.',
             }), 503
         if status != 200:
+            if normalmeme_active_created:
+                try:
+                    remove_active_normalmeme_image(request_id, PUBLIC_DIR)
+                except Exception:
+                    logger.exception("Could not remove rejected Normalmeme image %s", request_id)
             return jsonify(result), status
+        if action_type == 'normalmeme' and normalmeme_archive_required:
+            try:
+                if not normalmeme_archive_exists(request_id, NORMALMEME_ARCHIVE_DIR):
+                    if normalmeme_prepared is None:
+                        normalmeme_prepared = prepare_normalmeme_image(
+                            document.get('image') or normalmeme_input,
+                            request_id,
+                            PUBLIC_DIR,
+                        )
+                    archive_normalmeme_image(
+                        normalmeme_prepared,
+                        request_id,
+                        NORMALMEME_ARCHIVE_DIR,
+                    )
+                if not result.get('duplicate'):
+                    prune_active_normalmeme_images(
+                        PUBLIC_DIR,
+                        request_id if document.get('image') else None,
+                    )
+            except Exception:
+                logger.exception("Could not archive Normalmeme request %s", request_id)
+                return jsonify({
+                    'status': 'error',
+                    'message': 'Normalmeme was accepted but its archive could not be saved. Retry the same request.',
+                }), 503
         return jsonify(result)
 
     @app.route('/chathistory')

@@ -1,6 +1,7 @@
 "use client"
 
 import { useEffect, useState, useRef } from 'react'
+import { NormalMemeArtwork } from '@/components/normalmeme-artwork'
 
 interface NormalMeme {
   _id: string
@@ -64,78 +65,11 @@ export default function NormalMeme() {
           height: '100vh'
         }}
       >
-        {/* Image - full viewport stretch */}
-        {meme.image ? (
-          <img
-            src={meme.image}
-            alt="Normal meme"
-            style={{
-              position: 'absolute',
-              inset: 0,
-              width: '100%',
-              height: '100%',
-              objectFit: 'fill',
-              objectPosition: 'center'
-            }}
-          />
-        ) : (
-          /* Fallback background for text-only */
-          <div
-            style={{
-              position: 'absolute',
-              inset: 0,
-              background: 'linear-gradient(45deg, #333, #666)',
-              width: '100%',
-              height: '100%'
-            }}
-          />
-        )}
-
-        {/* Top text - FaceMeme style */}
-        {meme.toptext ? (
-          <div
-            style={{
-              position: 'absolute',
-              top: 0,
-              left: 0,
-              right: 0,
-              color: 'white',
-              padding: '2rem 1rem 1rem',
-              fontSize: 'clamp(2rem, 8vw, 5rem)',
-              fontWeight: 'bold',
-              textShadow: '2px 2px 4px black',
-              textAlign: 'center',
-              fontFamily: '"Impact", "Arial Black", sans-serif',
-              letterSpacing: '1px',
-              lineHeight: 1.1
-            }}
-          >
-            {meme.toptext.toUpperCase()}
-          </div>
-        ) : null}
-
-        {/* Bottom text - FaceMeme style */}
-        {meme.bottomtext ? (
-          <div
-            style={{
-              position: 'absolute',
-              bottom: 0,
-              left: 0,
-              right: 0,
-              color: 'white',
-              padding: '1rem 1rem 2rem',
-              fontSize: 'clamp(2rem, 8vw, 5rem)',
-              fontWeight: 'bold',
-              textShadow: '2px 2px 4px black',
-              textAlign: 'center',
-              fontFamily: '"Impact", "Arial Black", sans-serif',
-              letterSpacing: '1px',
-              lineHeight: 1.1
-            }}
-          >
-            {meme.bottomtext.toUpperCase()}
-          </div>
-        ) : null}
+        <NormalMemeArtwork
+          image={meme.image}
+          toptext={meme.toptext}
+          bottomtext={meme.bottomtext}
+        />
       </div>
     </div>
   )

@@ -10,6 +10,12 @@ def configure_role_permissions(routes, ranks, permissions):
     ranks.find.return_value = roles
 
     def find_role(query, *_args, **_kwargs):
+        requested_id = query.get("_id")
+        if requested_id is not None:
+            return next(
+                (role for role in roles if role["_id"] == requested_id),
+                None,
+            )
         requested = query.get("rank")
         if isinstance(requested, str):
             return next(

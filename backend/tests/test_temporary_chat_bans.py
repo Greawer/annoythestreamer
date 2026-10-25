@@ -243,11 +243,20 @@ class TemporaryChatBanTests(unittest.TestCase):
                 self.assertEqual(self.chat.insert_one.called, should_send)
 
     def test_stream_points_query_excludes_timed_out_users_only(self):
+        started_at = datetime.now(timezone.utc) - timedelta(seconds=61)
         settings = Mock()
         settings.find_one.return_value = {
             "_id": "stream_points",
             "streaming": True,
-            "stream_started_at": datetime.now(timezone.utc) - timedelta(minutes=1),
+            "stream_started_at": started_at,
+            "active_points_per_interval": 100,
+            "active_interval_seconds": 60,
+        }
+        self.users.find_one.return_value = {
+            "_id": ObjectId(),
+            "last_stream_award_started_at": started_at,
+            "last_stream_award_interval": 0,
+            "banned": False,
         }
         self.users.find_one_and_update.return_value = None
         with (

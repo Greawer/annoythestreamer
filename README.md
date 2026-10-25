@@ -59,9 +59,12 @@ Next.js serves these files directly. Flask's `/static/<path>` compatibility
 route serves from the same `public/` tree for its APIs and existing media
 clients. Website pages, including OBS browser views, are implemented in the
 Next.js `app/` directory; Flask no longer renders legacy HTML templates.
-Git excludes all files under `public/`; only empty-directory `.gitkeep` markers
-are tracked. Restore any required local assets separately before using
-features that depend on them.
+Git excludes local assets under `public/` while retaining `.gitkeep` markers
+for the directory structure. The only image asset included is
+`public/img/meme/facememe/facememe-template-placeholder.png`; the private
+`facememe-template.png` remains local and is not used by the website. The
+`public/reference/` folder is local-only. Restore other required assets
+separately before using features that depend on them.
 
 Put user-provided soundboard audio (`.mp3`, `.m4a`, or `.wav`) in
 `public/sounds/soundboard/`; keep generated TTS audio in
@@ -76,11 +79,24 @@ output are local runtime assets and are not versioned.
 The current soundboard obtains its list and titles from Flask's file scan and
 audio metadata; it does not read this text file.
 
+## Meme actions and audio
+
+Normalmeme accepts an uploaded image or supported image URL. Flask prepares a
+locally served JPEG for active use. The Send Your Chaos panel previews normal
+and face memes in the same 4:3 frame before submission. The face-meme template
+used by the app is the tracked placeholder image; private media files are not
+included.
+
+When an Admin is signed in to the main site, soundboard requests and generated
+TTS audio also play in that browser locally, in addition to existing stream
+playback. Browser audio permissions may need to allow playback.
+
 ## Pricing, asset catalog, and Point Shop
 
 Pricing is stored in MongoDB and edited from the capability-guarded Admin
 panel. It controls Send Your Chaos/TTS costs, catalog purchase prices and
-named exceptions, proposal rewards, upload limits, and sound play costs.
+named exceptions, theme prices, proposal rewards, upload limits, and sound play
+costs.
 Price `-1` makes an item unavailable for purchase; the backend enforces prices,
 balances, ownership, and idempotency.
 
@@ -91,6 +107,17 @@ stable asset ID; uploaded, available, purchased, and usable states remain
 separate. Sound favorites are per account, and sound play pricing is separate
 from purchase pricing. These settings and records are database-backed; no
 additional local setup or pricing file is required.
+
+## Accounts and interface
+
+Account recovery supports password and email changes using one-time recovery
+codes. Users can choose and save an owned visual theme and one visible owned
+badge. Non-standard themes are Point Shop rewards with an initial default
+price of 10,000 points; Admins can adjust theme pricing. Themes and badges are
+managed in the Admin interface, and the theme picker previews a selection
+before it is saved. Authorized user inspection shows account and moderation
+details, including badges and points. The emoji picker, account information
+panel, and online-user section use animated transitions.
 
 ## Run locally
 

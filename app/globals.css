@@ -283,5 +283,5 @@
 
 .card-hover:hover {
   transform: translateY(-2px);
-  box-shadow: 0 8px 24px oklch(0.65 0.15 350 / 0.2);
+  box-shadow: 0 8px 24px color-mix(in srgb, var(--accent) 20%, transparent);
 }

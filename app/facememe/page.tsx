@@ -1,6 +1,7 @@
 "use client"
 
 import { useEffect, useState, useRef } from 'react'
+import { FaceMemeArtwork } from '@/components/facememe-artwork'
 
 interface FaceMeme {
   _id: string
@@ -30,20 +31,5 @@ export default function FaceMeme() {
 
   if (!meme) return null
 
-  return (
-    <div className="fixed inset-0 pointer-events-none z-50 flex flex-col justify-between p-8 sm:p-12 md:p-16 lg:p-24 xl:p-32 bg-black/70">
-      {/* Top text - pinned top, centered */}
-      <div className="flex justify-center">
-        <h1 className="text-4xl sm:text-5xl md:text-6xl lg:text-7xl xl:text-8xl font-black text-white uppercase tracking-wider drop-shadow-[0_4px_12px_rgba(0,0,0,0.9)] leading-tight break-words max-w-full overflow-hidden text-center">
-          {meme.toptext}
-        </h1>
-      </div>
-      {/* Bottom text - pinned bottom, centered */}
-      <div className="flex justify-center">
-        <h1 className="text-4xl sm:text-5xl md:text-6xl lg:text-7xl xl:text-8xl font-black text-white uppercase tracking-wider drop-shadow-[0_4px_12px_rgba(0,0,0,0.9)] leading-tight break-words max-w-full overflow-hidden text-center">
-          {meme.bottomtext}
-        </h1>
-      </div>
-    </div>
-  )
+  return <FaceMemeArtwork toptext={meme.toptext} bottomtext={meme.bottomtext} />
 }

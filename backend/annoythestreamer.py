@@ -15,6 +15,8 @@ from routes import (
     register_default_themes,
     seed_role_permissions,
     start_stream_points_worker,
+    migrate_user_rank_references,
+    reset_stream_points_state,
 )
 from background import start_tts_worker
 
@@ -26,6 +28,7 @@ logging.getLogger("engineio").setLevel(logging.WARNING)
 app = Flask(__name__, static_folder=None)
 app.secret_key = os.getenv("ATS_SECRET_KEY") or secrets.token_hex(32)
 app.config.update(
+    MAX_FORM_MEMORY_SIZE=24 * 1024 * 1024,
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
     SESSION_COOKIE_SECURE=os.getenv("ATS_COOKIE_SECURE", "false").lower() == "true",
@@ -45,11 +48,13 @@ socketio = SocketIO(
 registersocketiohandlers(socketio)
 registerroutes(app, socketio)
 seed_role_permissions()
+migrate_user_rank_references()
 
 if __name__ == "__main__":
     migrate_legacy_sound_actions()
     register_legacy_assets()
     register_default_themes()
+    reset_stream_points_state()
     start_tts_worker(socketio)
     start_stream_points_worker(socketio)
     host = os.getenv("ATS_BACKEND_HOST", "127.0.0.1")
